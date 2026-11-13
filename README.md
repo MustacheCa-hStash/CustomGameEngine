@@ -22,13 +22,35 @@ The Scene Inspector opens on the left. Use its **Scene** menu to switch between 
 
 ### Inspect a scene
 
-- **Scene controls** has camera presets, sun direction, wind, MSAA, and the grove tree count. Each scene keeps its sun and wind settings for the session.
+- **Scene controls** has camera presets, sun direction, wind, MSAA, and the grove tree count.
 - **Outliner** lets you select the model, ground, or a particular tree placement in the grove. In **Object**, choose Bark or Foliage to open its **Mesh** details. Follow its assigned **Material**, then open the **Texture** preview to see the bound image and mip count.
-- **Material** changes are live previews for this session. Oak and Grove share their loaded asset, so a foliage cutoff edit in Oak applies to every tree in Grove, including its shadow. The preview cutoff uses the existing texture mips, whose alpha coverage was built using the source material cutoff.
+- **Material** changes apply live. Oak and Grove share their oak materials, so a foliage cutoff edit in Oak applies to every tree in Grove, including its shadow. The cutoff uses the existing texture mips, whose alpha coverage was built using the source material cutoff.
+
+### Saved viewer settings
+
+The viewer reads and writes `viewer-settings.ini` in the project root beside `CMakeLists.txt`. Debug and Release builds from the same source directory share this file. The viewer saves after a short pause in edits and flushes pending changes on close.
+
+The file is UTF-8 INI with `key = value` entries, decimal numbers, `true` or `false`, and full-line comments starting with `;` or `#`.
+
+- `[viewer]` stores the global MSAA preference.
+- `[scene.cube]`, `[scene.oak]`, and `[scene.grove]` store sun angles, wind strength and pause, all four bias values, and the tree count for Grove. Each scene has its own `.mesh.<name>` sections for cast and receive flags and a `.ground` section for ground flags and color.
+- `[asset.oak.material.<name>]` stores each oak material’s base RGB, alpha cutoff, and backlighting where editable. Oak and Grove read the same sections. Cube has its own asset sections. Imported GLBs use sections keyed by their normalized absolute paths.
+
+Mesh and material keys use the imported names, with reserved characters percent-escaped and duplicate names numbered by occurrence. Keep names unique and consistent across exports to retain their settings. Missing or invalid fields use their scene, hardware, or imported material defaults. An unsupported file version uses defaults for the entire file.
+
+**Restore default bias** saves the four original bias values for the active scene. To reset all saved settings, close the viewer and launch `CustomGameEngine.exe --reset-settings` or remove `viewer-settings.ini` while the viewer is closed. Camera pose and presets, the active scene, the Grove route, wind animation phase, and inspector layout and selection are session-only. The viewer still accepts `--oak` and `--grove` to choose the starting scene.
+
+### Reload mesh and shadow shaders
+
+Save an edit to [Mesh.hlsl](shaders/Mesh.hlsl), then open **Shaders → Reload shaders** in the Scene Inspector. The viewer continues drawing while DXC compiles `VSMain`, `PSMain`, `ShadowVS`, and `ShadowPS` as Shader Model 6.0. The renderer creates the single-sample camera, shadow, and supported 4× MSAA camera pipelines with the active draw bias. It swaps them together between frames after every pipeline succeeds. On failure, the diagnostics show the failing stage and DXC's file, line, and column when available, or the pipeline operation and D3D12 error code. Use **Copy diagnostics** to copy the full log.
+
+The executable looks for `shaders/Mesh.hlsl` under the source directory recorded by CMake. Includes can resolve relative to that shader directory. It loads `dxcompiler.dll` from beside the configured `DXC_EXECUTABLE`, normally the selected Windows SDK's x64 bin directory. A custom DXC install should have its matching `dxcompiler.dll` and `dxil.dll` in that directory. The diagnostics show the exact paths. If the source or compiler is unavailable, the current shaders stay active and the panel reports the failure. Startup always uses the bytecode embedded by the normal build. Reloaded bytecode lives in memory for that run.
+
+Reload supports edits such as backlighting, cutout logic, wind math, and shadow comparisons that fit the existing shader interfaces. Changes to C++ constant layouts, register bindings, vertex inputs, the root signature, or pipeline state need a coordinated C++ and HLSL rebuild. The HUD shader still uses the normal build.
 
 ### Diagnose shadows
 
-**Shadow diagnostics** edits the active scene live. **Restore default bias** resets all four controls. Each scene keeps its edits for the session.
+**Shadow diagnostics** edits the active scene live. **Restore default bias** resets and saves all four bias values for that scene.
 
 | Control | Default | What it changes |
 | --- | ---: | --- |

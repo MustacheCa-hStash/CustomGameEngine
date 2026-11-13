@@ -41,6 +41,8 @@ add_executable(CustomGameEngine WIN32
     src/ViewerScene.h
     src/ViewerSettings.cpp
     src/ViewerSettings.h
+    src/ShaderCompiler.cpp
+    src/ShaderCompiler.h
     src/SceneInspector.cpp
     src/SceneInspector.h
     src/D3D12Renderer.cpp
@@ -72,7 +74,8 @@ target_include_directories(CustomGameEngine PRIVATE "${CMAKE_CURRENT_BINARY_DIR}
 target_include_directories(CustomGameEngine SYSTEM PRIVATE third_party/cgltf)
 target_compile_features(CustomGameEngine PRIVATE cxx_std_20)
 target_compile_definitions(CustomGameEngine PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
-    "VIEWER_PROJECT_DIRECTORY=L\"${CMAKE_CURRENT_SOURCE_DIR}\"")
+    "VIEWER_PROJECT_DIRECTORY=L\"${CMAKE_CURRENT_SOURCE_DIR}\""
+    "VIEWER_DXC_EXECUTABLE=L\"${DXC_EXECUTABLE}\"")
 target_compile_options(CustomGameEngine PRIVATE /W4 /permissive-)
 target_link_libraries(CustomGameEngine PRIVATE dear_imgui d3d12 dxgi ole32 shell32 user32 windowscodecs)
 

@@ -165,7 +165,8 @@ void SceneInspector::resetSelection()
 
 InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& renderer,
                                        const D3D12Renderer::FrameTiming& timing,
-                                       const std::string& sceneError, bool hasImportedScene)
+                                       const std::string& sceneError, bool hasImportedScene,
+                                       bool reloadingShaders, const std::string& shaderDiagnostics)
 {
     InspectorActions actions;
     ImGui_ImplDX12_NewFrame();
@@ -232,6 +233,28 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
                 bool msaa = renderer.msaaEnabled();
                 actions.toggleMsaa = ImGui::Checkbox("4x MSAA (M)", &msaa);
                 ImGui::EndDisabled();
+            }
+            if (ImGui::CollapsingHeader("Shaders"))
+            {
+                ImGui::BeginDisabled(reloadingShaders);
+                actions.reloadShaders = ImGui::Button("Reload shaders");
+                ImGui::EndDisabled();
+                if (reloadingShaders)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted("Compiling...");
+                }
+                if (!shaderDiagnostics.empty())
+                {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Copy diagnostics")) ImGui::SetClipboardText(shaderDiagnostics.c_str());
+                    if (ImGui::BeginChild("Shader diagnostics", {0.0f, ImGui::GetTextLineHeightWithSpacing() * 8.0f},
+                                          ImGuiChildFlags_Borders))
+                    {
+                        ImGui::TextWrapped("%s", shaderDiagnostics.c_str());
+                    }
+                    ImGui::EndChild();
+                }
             }
             if (ImGui::CollapsingHeader("Shadow diagnostics"))
             {

@@ -29,6 +29,11 @@ constexpr UINT shadowMapSize = 2048;
 constexpr DXGI_SAMPLE_DESC msaaSamples{4, 0};
 constexpr float clearColor[] = {0.30f, 0.20f, 0.17f, 1.0f};
 
+D3D12_SHADER_BYTECODE bytecode(const std::vector<std::byte>& shader)
+{
+    return {shader.data(), shader.size()};
+}
+
 struct DrawConstants
 {
     XMFLOAT4X4 model;
@@ -103,6 +108,37 @@ void check(HRESULT result, const char* operation)
         throw std::runtime_error(std::format("{} failed (0x{:08X}).",
                                              operation, static_cast<unsigned long>(result)));
     }
+}
+
+Microsoft::WRL::ComPtr<ID3D12PipelineState> createPipeline(
+    ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& description, const char* operation)
+{
+    using Microsoft::WRL::ComPtr;
+    ComPtr<ID3D12InfoQueue> queue;
+    device->QueryInterface(IID_PPV_ARGS(&queue));
+    const auto first = queue ? queue->GetNumStoredMessagesAllowedByRetrievalFilter() : 0;
+    ComPtr<ID3D12PipelineState> pipeline;
+    const auto result = device->CreateGraphicsPipelineState(&description, IID_PPV_ARGS(&pipeline));
+    if (FAILED(result) && queue)
+    {
+        std::string detail = operation;
+        const auto end = queue->GetNumStoredMessagesAllowedByRetrievalFilter();
+        for (auto index = first; index < end; ++index)
+        {
+            SIZE_T size = 0;
+            if (FAILED(queue->GetMessage(index, nullptr, &size)) || size == 0) continue;
+            std::vector<std::byte> storage(size);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+            if (SUCCEEDED(queue->GetMessage(index, message, &size)))
+            {
+                detail += "\n";
+                detail += message->pDescription;
+            }
+        }
+        check(result, detail.c_str());
+    }
+    check(result, operation);
+    return pipeline;
 }
 
 bool supportsSampleCount(ID3D12Device* device, DXGI_FORMAT format)
@@ -225,7 +261,9 @@ D3D12Renderer::D3D12Renderer(HWND window)
         createDepthBuffer(multisample_, multisampleDescription);
     }
     createShadowMap();
-    createMeshPipelines(canUseMsaa);
+    createMeshPipelineLayout();
+    installMeshPipelines({meshVS, sizeof(meshVS)}, {meshPS, sizeof(meshPS)},
+                         {shadowVS, sizeof(shadowVS)}, {shadowPS, sizeof(shadowPS)}, {}, canUseMsaa);
     createHud();
     frameConstants_ = createUploadBuffer(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
     msaaEnabled_ = canUseMsaa;
@@ -406,7 +444,7 @@ void D3D12Renderer::createShadowMap()
     device_->CreateDepthStencilView(shadowMap_.Get(), &depthView, shadowDepthTarget_);
 }
 
-void D3D12Renderer::createMeshPipelines(bool enableMultisampling)
+void D3D12Renderer::createMeshPipelineLayout()
 {
     D3D12_DESCRIPTOR_RANGE colorTexture{};
     colorTexture.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -471,10 +509,8 @@ void D3D12Renderer::createMeshPipelines(bool enableMultisampling)
          D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
     };
 
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
+    auto& description = meshPipelineDescription_;
     description.pRootSignature = rootSignature_.Get();
-    description.VS = {meshVS, sizeof(meshVS)};
-    description.PS = {meshPS, sizeof(meshPS)};
     description.InputLayout = {layout, static_cast<UINT>(std::size(layout))};
     description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -489,42 +525,68 @@ void D3D12Renderer::createMeshPipelines(bool enableMultisampling)
     description.SampleDesc.Count = 1;
     description.NumRenderTargets = 1;
     description.RTVFormats[0] = colorFormat;
-    check(device_->CreateGraphicsPipelineState(&description, IID_PPV_ARGS(&singleSample_.pipeline)),
-          "Create single-sample mesh pipeline");
+}
 
-    auto& shadowDescription = shadowPipelineDescription_;
-    shadowDescription = description;
-    shadowDescription.VS = {shadowVS, sizeof(shadowVS)};
-    shadowDescription.PS = {shadowPS, sizeof(shadowPS)};
-    shadowDescription.NumRenderTargets = 0;
-    shadowDescription.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
-    shadowDescription.RasterizerState.DepthBiasClamp = ShadowBiasSettings::drawClamp;
-    updateShadowPipeline({});
+void D3D12Renderer::installMeshPipelines(D3D12_SHADER_BYTECODE cameraVertex, D3D12_SHADER_BYTECODE cameraPixel,
+                                         D3D12_SHADER_BYTECODE shadowVertex, D3D12_SHADER_BYTECODE shadowPixel,
+                                         const ShadowBiasSettings& bias, bool enableMultisampling)
+{
+    auto description = meshPipelineDescription_;
+    description.VS = cameraVertex;
+    description.PS = cameraPixel;
+    auto singleSample = createPipeline(device_.Get(), description, "Create single-sample mesh pipeline");
+    ComPtr<ID3D12PipelineState> multisample;
+    auto shadow = createShadowPipeline(shadowVertex, shadowPixel, bias);
     if (enableMultisampling)
     {
         description.SampleDesc = msaaSamples;
         description.RasterizerState.MultisampleEnable = TRUE;
-        check(device_->CreateGraphicsPipelineState(&description, IID_PPV_ARGS(&multisample_.pipeline)),
-              "Create 4x MSAA mesh pipeline");
+        multisample = createPipeline(device_.Get(), description, "Create 4x MSAA mesh pipeline");
     }
+
+    // The frame loop fences each submission. Commit the whole set between frames.
+    singleSample_.pipeline = std::move(singleSample);
+    multisample_.pipeline = std::move(multisample);
+    shadowPipeline_ = std::move(shadow);
+    appliedConstantBias_ = bias.constant;
+    appliedSlopeBias_ = bias.slopeScale;
+}
+
+void D3D12Renderer::reloadMeshShaders(MeshShaders shaders, const ShadowBiasSettings& bias)
+{
+    installMeshPipelines(bytecode(shaders.cameraVertex), bytecode(shaders.cameraPixel),
+                         bytecode(shaders.shadowVertex), bytecode(shaders.shadowPixel), bias, supportsMsaa());
+    reloadedShaders_ = std::move(shaders);
+}
+
+D3D12Renderer::ComPtr<ID3D12PipelineState> D3D12Renderer::createShadowPipeline(
+    D3D12_SHADER_BYTECODE vertex, D3D12_SHADER_BYTECODE pixel, const ShadowBiasSettings& bias)
+{
+    auto description = meshPipelineDescription_;
+    description.VS = vertex;
+    description.PS = pixel;
+    description.NumRenderTargets = 0;
+    description.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+    description.RasterizerState.DepthBias = bias.constant;
+    description.RasterizerState.SlopeScaledDepthBias = bias.slopeScale;
+    description.RasterizerState.DepthBiasClamp = ShadowBiasSettings::drawClamp;
+    return createPipeline(device_.Get(), description, "Create shadow pipeline");
 }
 
 void D3D12Renderer::updateShadowPipeline(const ShadowBiasSettings& bias)
 {
-    auto& rasterizer = shadowPipelineDescription_.RasterizerState;
-    if (shadowPipeline_ && rasterizer.DepthBias == bias.constant &&
-        rasterizer.SlopeScaledDepthBias == bias.slopeScale)
+    if (appliedConstantBias_ == bias.constant && appliedSlopeBias_ == bias.slopeScale)
     {
         return;
     }
 
-    // Frames complete before the next frame starts, so the old PSO can be replaced here.
-    rasterizer.DepthBias = bias.constant;
-    rasterizer.SlopeScaledDepthBias = bias.slopeScale;
-    ComPtr<ID3D12PipelineState> pipeline;
-    check(device_->CreateGraphicsPipelineState(&shadowPipelineDescription_, IID_PPV_ARGS(&pipeline)),
-          "Create shadow pipeline");
-    shadowPipeline_ = std::move(pipeline);
+    const auto vertex = reloadedShaders_.shadowVertex.empty() ? D3D12_SHADER_BYTECODE{shadowVS, sizeof(shadowVS)}
+                                                              : bytecode(reloadedShaders_.shadowVertex);
+    const auto pixel = reloadedShaders_.shadowPixel.empty() ? D3D12_SHADER_BYTECODE{shadowPS, sizeof(shadowPS)}
+                                                            : bytecode(reloadedShaders_.shadowPixel);
+    shadowPipeline_ = createShadowPipeline(vertex, pixel, bias);
+    appliedConstantBias_ = bias.constant;
+    appliedSlopeBias_ = bias.slopeScale;
 }
 
 void D3D12Renderer::createTextures(std::span<const TextureAsset> textures)

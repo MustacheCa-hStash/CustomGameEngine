@@ -14,6 +14,7 @@ struct InspectorActions
     bool toggleMsaa = false;
     bool treeCountChanged = false;
     bool settingsChanged = false;
+    bool reloadShaders = false;
 };
 
 class SceneInspector
@@ -31,7 +32,7 @@ public:
     void resetSelection();
     InspectorActions frame(ViewerScene& scene, const D3D12Renderer& renderer,
                            const D3D12Renderer::FrameTiming& timing, const std::string& sceneError,
-                           bool hasImportedScene);
+                           bool hasImportedScene, bool reloadingShaders, const std::string& shaderDiagnostics);
     void draw(ID3D12GraphicsCommandList* commands) const;
 
 private:

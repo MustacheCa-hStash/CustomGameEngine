@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ShaderCompiler.h"
 #include "ViewerScene.h"
 
 #include <windows.h>
@@ -34,6 +35,7 @@ public:
     void toggleMsaa();
     void setScene(const ViewerScene& scene);
     void updateSun(const ViewerScene& scene);
+    void reloadMeshShaders(MeshShaders shaders, const ShadowBiasSettings& bias);
     float shadowDepthPerTexel() const { return shadowDepthPerTexel_; }
     float shadowWorldUnitsPerTexel() const { return shadowWorldUnitsPerTexel_; }
     FrameTiming drawFrame(const ViewerScene& scene, const DirectX::XMFLOAT4X4& view, float windPhase,
@@ -74,7 +76,12 @@ private:
     ComPtr<ID3D12Resource> createRenderTexture(const D3D12_RESOURCE_DESC& description,
                                                D3D12_RESOURCE_STATES initialState,
                                                const D3D12_CLEAR_VALUE& clear);
-    void createMeshPipelines(bool enableMultisampling);
+    void createMeshPipelineLayout();
+    void installMeshPipelines(D3D12_SHADER_BYTECODE cameraVertex, D3D12_SHADER_BYTECODE cameraPixel,
+                              D3D12_SHADER_BYTECODE shadowVertex, D3D12_SHADER_BYTECODE shadowPixel,
+                              const ShadowBiasSettings& bias, bool enableMultisampling);
+    ComPtr<ID3D12PipelineState> createShadowPipeline(D3D12_SHADER_BYTECODE vertex, D3D12_SHADER_BYTECODE pixel,
+                                                     const ShadowBiasSettings& bias);
     void updateShadowPipeline(const ShadowBiasSettings& bias);
     void createTextures(std::span<const TextureAsset> textures);
     ComPtr<ID3D12Resource> uploadTexture(const TextureData& mips,
@@ -102,7 +109,10 @@ private:
     ComPtr<ID3D12DescriptorHeap> depthHeap_;
     ComPtr<ID3D12Resource> shadowMap_;
     ComPtr<ID3D12PipelineState> shadowPipeline_;
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC shadowPipelineDescription_{};
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC meshPipelineDescription_{};
+    MeshShaders reloadedShaders_;
+    int appliedConstantBias_ = 0;
+    float appliedSlopeBias_ = 0.0f;
     D3D12_CPU_DESCRIPTOR_HANDLE shadowDepthTarget_{};
     D3D12_GPU_DESCRIPTOR_HANDLE shadowTexture_{};
     DirectX::XMFLOAT4X4 lightViewProjection_;

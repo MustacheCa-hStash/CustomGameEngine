@@ -1,6 +1,6 @@
 # CustomGameEngine project plan
 
-The viewer now switches among Cube, Oak, and Grove scenes with an outliner and linked Object, Mesh, Material, and Texture views. Oak and Grove share the FirstSettlers low-branched white oak LOD0 asset. The grove is the baseline for later LOD and GPU visibility work. Live shader reload is the next checkpoint.
+The viewer switches among Cube, Oak, and Grove scenes with an outliner and linked Object, Mesh, Material, and Texture views. Oak and Grove share the FirstSettlers low-branched white oak LOD0 asset. The grove is the baseline for later LOD and GPU visibility work. Checkpoint 11 adds live reload for the mesh and shadow shaders through the Scene Inspector.
 
 ## Goals
 

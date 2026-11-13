@@ -10,6 +10,7 @@
 #include <cmath>
 #include <exception>
 #include <format>
+#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -345,6 +346,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         D3D12Renderer::FrameTiming timing{};
         std::optional<Clock::time_point> routeStart;
         std::string sceneError;
+        std::future<ShaderCompilation> shaderReload;
+        std::string shaderDiagnostics;
 
         const auto applyView = [&](CameraPreset preset) {
             routeStart.reset();
@@ -440,9 +443,49 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
                 continue;
             }
 
+            if (shaderReload.valid() && shaderReload.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            {
+                std::string compilerLog;
+                try
+                {
+                    auto result = shaderReload.get();
+                    compilerLog = std::move(result.diagnostics);
+                    if (result.shaders)
+                    {
+                        renderer.reloadMeshShaders(std::move(*result.shaders), scene->shadowBias);
+                        shaderDiagnostics = renderer.supportsMsaa()
+                            ? "Reloaded camera (single-sample and 4x MSAA) and shadow pipelines.\n\n"
+                            : "Reloaded single-sample camera and shadow pipelines.\n\n";
+                        shaderDiagnostics += compilerLog;
+                    }
+                    else
+                    {
+                        shaderDiagnostics = "Compilation failed. Continuing with the active shaders.\n\n" + compilerLog;
+                    }
+                }
+                catch (const std::exception& error)
+                {
+                    shaderDiagnostics = std::format("Reload failed. Continuing with the active shaders.\n{}\n\n{}",
+                                                    error.what(), compilerLog);
+                }
+            }
+
             const auto& inspectorError = sceneError.empty() ? settings.error() : sceneError;
             const auto actions = inspector.frame(*scene, renderer, timing, inspectorError,
-                                                 launch.kind == SceneKind::Imported);
+                                                 launch.kind == SceneKind::Imported, shaderReload.valid(),
+                                                 shaderDiagnostics);
+            if (actions.reloadShaders)
+            {
+                try
+                {
+                    shaderReload = std::async(std::launch::async, compileMeshShaders);
+                    shaderDiagnostics.clear();
+                }
+                catch (const std::exception& error)
+                {
+                    shaderDiagnostics = std::format("Could not start shader reload. {}", error.what());
+                }
+            }
             if (actions.sunChanged) renderer.updateSun(*scene);
             if (actions.toggleWind) toggleWind();
             if (actions.toggleMsaa) toggleMsaa();

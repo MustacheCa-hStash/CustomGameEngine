@@ -6,6 +6,10 @@
 
 - **Normal offset bias for shadows.** Evaluate offsetting the receiver's shadow lookup position along its surface normal, with an offset related to the light angle and shadow-map texel size. This may reduce self-shadowing artifacts while retaining contact shadows. Compare it across sun angles on the cube, bark, and both sides of foliage cards, and watch for detached or distorted shadows.
 
+- **Cluster LOD culling.** After validating complete cuts in the [Oak Branch experiment](OAK_BRANCH_CLUSTER_LOD_PLAN.md), use wind-aware visibility bounds for camera and light frustum culling. Test the views separately so off-camera clusters can still cast visible shadows. If cluster visits or submissions are costly, compare a BVH against the flat CPU reference. Spatial bounds can reject whole subtrees for visibility, and conservative projected parent-error bounds can skip descendants whose coarser representations already meet the LOD target. Evaluate hierarchical depth occlusion separately once frustum culling is measured. Compare selected, visible, and submitted counts and verify that drawing with culling gives the same visible result as the complete cut. [Epic’s speaker notes, *Hierarchical culling* and *Two-Pass Occlusion Culling*](https://advances.realtimerendering.com/s2021/Karis_Nanite_SIGGRAPH_Advances_2021_final.pdf)
+
+- **Shadow-specific foliage LOD.** Repeat the [Oak Branch calibration](OAK_BRANCH_CLUSTER_LOD_PLAN.md#shadow-lod-calibration) on full crowns and when changing the shadow projection or resolution. Compare low-sun shadows, wind stability, and the moment a caster enters or leaves the camera frustum. Use visible receiver coverage and GPU time to decide whether to enable an automatic policy. The sampled shadow-texel error gives a geometric estimate alongside these metrics.
+
 ## Viewer tooling
 
 ### Headless scene capture

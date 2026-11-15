@@ -32,7 +32,8 @@ public:
     void resetSelection();
     InspectorActions frame(ViewerScene& scene, const D3D12Renderer& renderer,
                            const D3D12Renderer::FrameTiming& timing, const std::string& sceneError,
-                           bool hasImportedScene, bool reloadingShaders, const std::string& shaderDiagnostics);
+                           bool hasImportedScene, bool reloadingShaders, const std::string& shaderDiagnostics,
+                           const CameraView& camera, float windPhase);
     void draw(ID3D12GraphicsCommandList* commands) const;
 
 private:

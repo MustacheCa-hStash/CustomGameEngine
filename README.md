@@ -97,7 +97,7 @@ The build finds DXC in the selected Windows SDK and compiles the shaders. The sh
 
 Select **Card Oak** or **Modeled Oak** in the Scene menu. `--oak` still opens Card Oak, and `--modeled-oak` starts directly in Modeled Oak. The scenes share the same Overview, Close-up, and Under canopy framing. Card Oak retains its existing settings and shares materials with Grove. Modeled Oak has its own scene and material settings.
 
-Modeled Oak has 5,297,600 leaf triangles and 425,778 bark triangles. Its full-detail GLB is about 212 MiB. It uses the existing indexed renderer for camera and shadow draws. The export keeps the bark albedo and uses the same flat leaf color and editable backlighting as Oak Branch.
+Modeled Oak has 5,297,600 leaf triangles and 425,778 bark triangles. Its full-detail GLB is about 212 MiB. It uses the existing indexed renderer for camera and shadow draws. The full-tree export keeps the bark albedo and uses a flat leaf color with editable backlighting.
 
 For comparison, choose the same preset in each scene and match sun angles, MSAA, and shadow settings. Set wind strength to zero for an exact still comparison. Treat the initial comparison as geometry plus material because Card Oak uses baked crown textures. Compare silhouettes and visible gaps in Overview, leaf edges and overlap in Close-up, and branch visibility and transmission in Under canopy. Then orbit slowly with MSAA off and at 4× to compare shimmer. Record GPU frame time after the HUD settles at the same resolution and camera preset.
 
@@ -107,7 +107,33 @@ The full-tree Blender source is `FirstSettlers/ArtSource/WoodlandEdgeHighPoly/Lo
 
 Select **Oak Branch** from the viewer's **Scene** menu, or launch `build\Debug\CustomGameEngine.exe --branch` to start there. The branch saves settings under `[scene.oak_branch]` and `[asset.oak_branch.material.<name>]`. Use **Close-up** or **Under canopy**, pause wind with **P**, and inspect the separate bark and modeled-leaf meshes. In the leaf **Material** view, adjust **Backlighting** or reload a change to the transmission term in `Mesh.hlsl`. The leaves cast shadows from their geometry.
 
-The export contains 9,888 bark triangles and 123,200 leaf triangles. It places the bottom of the bark at ground level, embeds the bark albedo, and substitutes a flat green texture for Blender's procedural leaf shading. The current viewer uses a scalar diffuse-transmission factor for backlighting. Procedural color variation, bump, and Blender's lighting setup are outside this comparison.
+The export contains 9,888 bark triangles and 123,200 leaf triangles. It places the bottom of the bark at ground level and embeds the bark albedo and a 512 × 512 leaf base-color texture. The exporter bakes the authored Blender color graph, including the veins and UV noise, with a representative value for leaf-to-leaf color variation. The mesh supplies coverage and shading normals, and the viewer applies its own lighting and diffuse backlighting.
+
+### Oak Branch fixed LODs
+
+Building the viewer also builds the offline `BakeFixedLod` tool and generates the branch's `.fixedlod` sidecar and `.fixedlod.txt` report beside its bundled GLB. In **Oak Branch → Branch LOD**, use **Representation** to choose Source GLB or a baked level. **LOD 2 - Locked rims** preserves the outline. **LOD 3 - Rim collapse** permits some outline changes. **LOD 4 - Forced far** allows more rim movement for the far-view comparison. Both rim-collapse levels retain all leaves and their two end anchors. **Color by** shows unlit triangles, fixed groups, or clusters for baked levels. Use **Shaded** for comparisons of lighting and shadow. These controls are session-only.
+
+The baker uses the material's UV set in its collapse cost. For components with usable source UVs, it backs off reductions that would collapse a textured triangle to a line in UV space. The bundled branch uses UV weight 0.1 per coordinate.
+
+**LOD 5 - Four triangles per leaf** and **LOD 6 - Two triangles per leaf** fit the projected area of each original leaf in a reference direction. The two levels share an outline and retain all 3,080 leaves, with 12,320 and 6,160 foliage triangles respectively. LOD 5 keeps a point on the bent centerline. LOD 6 uses a flat pair of triangles.
+
+Choose **Automatic (LOD 3 / 4 / 6)** to let each group switch by projected error. Use **Color by → LOD level** to see the cut, and **Freeze cut** to keep it while you orbit or zoom. **Switch thresholds** starts at 1.70 px for LOD 4 and 1.20 px for LOD 6. **Copy view data** includes the active group level, per-level group counts, and switch estimates alongside the raw errors. **Match camera cut** is the default shadow mode.
+
+Choose **Oak Branch Grid** from the **Scene** menu, or launch `CustomGameEngine.exe --branch-grid`, to explore 25 copies in the benchmark's fixed 5 × 5 layout. It opens with Automatic LOD, indirect draws, and level tints. Orbit with the left mouse button, zoom with the wheel, and use **Distant** to see the whole grid. **Shaded** shows the regular leaf material, and **Freeze cut** holds the selected levels across all copies. The timed route and CSV output are part of the separate benchmark command.
+
+**Indirect draws** batches Automatic foliage by LOD. Use **Freeze cut** to compare drawing paths at a fixed selection. Run `--branch-benchmark report.csv` in a Release build to compare both paths at one and 25 instances. The CSV records CPU selection and submission times, GPU camera and shadow times, and per-pass API call, draw, and triangle counts. [Benchmark instructions](Documentation/OAK_BRANCH_CLUSTER_LOD_PLAN.md#run-the-oak-branch-benchmark)
+
+For a frustum check, open **Oak Branch Grid**, select **Shaded**, enable **Freeze cut**, and pause the wind. Zoom in until the viewport shows part of the grid. Toggle **Frustum culling** under **Branch LOD** and watch **Eligible branches** under **Rendering**. The camera count should drop while the image and visible ground shadows stay steady. The shadow pass tests the full light frustum, which currently encloses the grid. Resume the wind or orbit along the edge of the grid to check branches entering and leaving the camera view.
+
+To compare only caster geometry, freeze the camera cut and pause wind. Use **Shadow LOD** to switch between **Match camera cut** and a forced level. **Off-camera casters only** limits the override to branches outside the camera frustum. **Shadow factor view** shows received shadows in grayscale. Group diagnostics show the estimated error in shadow texels, and **Rendering** shows the number of overridden branches and the shadow foliage workload. Run `--branch-shadow-benchmark report.csv` to repeat the ground and branch shadow comparisons. [Shadow calibration and results](Documentation/OAK_BRANCH_CLUSTER_LOD_PLAN.md#shadow-lod-calibration)
+
+Pause wind and compare LOD 4, 5, and 6 from the same pose. Try **Close-up**, **Under canopy**, and **Distant** (300 scene units). Check individual outlines and veins, openings through the branch, and the ground shadow. Use **Copy view data** to record the nearest acceptable pose. **Camera diagnostics** shows orbit distance, eye and focus positions, yaw, pitch, FOV, and viewport. **Group diagnostics** can highlight a group and displays each level's triangle count and projected error estimate for that group. Turn the highlight off for shaded comparisons. [Experiment and area fit](Documentation/OAK_BRANCH_CLUSTER_LOD_PLAN.md#area-fitted-leaf-representations)
+
+The baker can also take a named mesh and write to a separate output for inspection:
+
+```powershell
+.\build\Debug\BakeFixedLod.exe .\assets\LowBranchedWhiteOak-SingleBranch.glb 'Oak branch - modeled leaves' .\build\branch-test.fixedlod --triangle-cap 128 --group-size 24 --samples 8 --rim-anchors uv-v --uv-weight 0.1 --leaf-proxies uv-v
+```
 
 To regenerate the GLB from the project directory with Blender 5:
 

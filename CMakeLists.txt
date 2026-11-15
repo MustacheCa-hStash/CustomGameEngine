@@ -37,6 +37,8 @@ add_custom_command(
 
 add_executable(CustomGameEngine WIN32
     src/main.cpp
+    src/BranchBenchmark.cpp
+    src/BranchBenchmark.h
     src/ViewerScene.cpp
     src/ViewerScene.h
     src/ViewerSettings.cpp
@@ -52,6 +54,8 @@ add_executable(CustomGameEngine WIN32
     src/TextureLoader.cpp
     src/TextureLoader.h
     src/MeshData.h
+    src/FixedLod.cpp
+    src/FixedLod.h
     "${mesh_vs}"
     "${mesh_ps}"
     "${shadow_vs}"
@@ -79,14 +83,43 @@ target_compile_definitions(CustomGameEngine PRIVATE UNICODE _UNICODE WIN32_LEAN_
 target_compile_options(CustomGameEngine PRIVATE /W4 /permissive-)
 target_link_libraries(CustomGameEngine PRIVATE dear_imgui d3d12 dxgi ole32 shell32 user32 windowscodecs)
 
+add_library(meshoptimizer STATIC
+    third_party/meshoptimizer/allocator.cpp
+    third_party/meshoptimizer/clusterizer.cpp
+    third_party/meshoptimizer/simplifier.cpp
+)
+target_include_directories(meshoptimizer SYSTEM PUBLIC third_party/meshoptimizer)
+
+add_executable(BakeFixedLod Tools/BakeFixedLod.cpp src/FixedLod.cpp src/GltfLoader.cpp src/TextureLoader.cpp)
+target_include_directories(BakeFixedLod PRIVATE src)
+target_include_directories(BakeFixedLod SYSTEM PRIVATE third_party/cgltf)
+target_compile_features(BakeFixedLod PRIVATE cxx_std_20)
+target_compile_definitions(BakeFixedLod PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(BakeFixedLod PRIVATE /W4 /permissive-)
+target_link_libraries(BakeFixedLod PRIVATE meshoptimizer ole32 windowscodecs)
+
+set(branch_name LowBranchedWhiteOak-SingleBranch)
+set(branch_glb "${CMAKE_CURRENT_SOURCE_DIR}/assets/${branch_name}.glb")
+set(branch_bake "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/bakes/${branch_name}.fixedlod")
+add_custom_command(
+    OUTPUT "${branch_bake}" "${branch_bake}.txt"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/bakes"
+    COMMAND BakeFixedLod "${branch_glb}" "Oak branch - modeled leaves" "${branch_bake}" --rim-anchors uv-v --uv-weight 0.1 --leaf-proxies uv-v
+    DEPENDS BakeFixedLod "${branch_glb}"
+    COMMENT "Baking fixed LODs for Oak Branch"
+    VERBATIM
+)
 add_custom_target(viewer_assets
     COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:CustomGameEngine>/assets"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/cube.glb"
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/LowBranchedWhiteOakLOD0.glb"
-        "${CMAKE_CURRENT_SOURCE_DIR}/assets/LowBranchedWhiteOak-SingleBranch.glb"
+        "${branch_glb}"
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/LowBranchedWhiteOak-Modeled.glb"
+        "${branch_bake}"
+        "${branch_bake}.txt"
         "$<TARGET_FILE_DIR:CustomGameEngine>/assets"
+    DEPENDS "${branch_bake}" "${branch_bake}.txt"
     VERBATIM
 )
 add_dependencies(CustomGameEngine viewer_assets)

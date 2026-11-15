@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <random>
+#include <stdexcept>
 #include <utility>
 
 using namespace DirectX;
@@ -94,13 +95,57 @@ Bounds assetBounds(std::span<const MeshData> meshes)
 
 const char* sceneName(SceneKind kind)
 {
-    constexpr const char* names[] = {"Cube", "Card Oak", "Modeled Oak", "Grove", "Oak Branch", "Imported GLB"};
+    constexpr std::array names{"Cube", "Card Oak", "Modeled Oak", "Grove", "Oak Branch", "Oak Branch Grid", "Imported GLB"};
+    static_assert(names.size() == sceneKinds.size());
     return names[static_cast<std::size_t>(kind)];
 }
 
 const char* ViewerScene::name() const
 {
     return sceneName(kind);
+}
+
+unsigned ViewerScene::instanceCount() const
+{
+    return kind == SceneKind::Grove ? treeCount : static_cast<unsigned>(objects.size());
+}
+
+void ViewerScene::setBranchGrid(int side)
+{
+    objects.clear();
+    const int radius = side / 2;
+    for (int z = -radius; z <= radius; ++z)
+    {
+        for (int x = -radius; x <= radius; ++x)
+        {
+            const auto id = static_cast<unsigned>(objects.size()) + 1;
+            objects.push_back({id, {11.0f * x, 11.0f * z, 0.51f * (3 * x + 2 * z), 1.0f}});
+        }
+    }
+    ground = makeGround(*this);
+}
+
+XMMATRIX SceneObject::placementMatrix() const
+{
+    const auto& p = placement;
+    return XMMatrixScaling(p.w, p.w, p.w) * XMMatrixRotationY(p.z) * XMMatrixTranslation(p.x, 0.0f, p.y);
+}
+
+XMFLOAT3 CameraView::eye() const
+{
+    const float horizontal = distance * std::cos(pitch);
+    return {focus.x + horizontal * std::sin(yaw),
+            focus.y + distance * std::sin(pitch),
+            focus.z + horizontal * std::cos(yaw)};
+}
+
+XMFLOAT4X4 CameraView::matrix() const
+{
+    const auto position = eye();
+    XMFLOAT4X4 result;
+    XMStoreFloat4x4(&result, XMMatrixLookAtRH(XMLoadFloat3(&position), XMLoadFloat3(&focus),
+                                             XMVectorSet(0, 1, 0, 0)));
+    return result;
 }
 
 XMFLOAT3 ViewerScene::sunDirection() const
@@ -117,12 +162,19 @@ CameraView ViewerScene::cameraView(CameraPreset preset) const
     const float radius = XMVectorGetX(XMVector3Length(XMLoadFloat3(&bounds.halfExtent)));
     const float distance = std::max(5.4f, radius * 2.9f);
     const auto focus = distance > 5.4f ? bounds.center : XMFLOAT3{0.0f, 0.75f, 0.0f};
+    if (kind == SceneKind::OakBranchGrid && (preset == CameraPreset::Overview || preset == CameraPreset::Distant))
+    {
+        const float gridDistance = preset == CameraPreset::Overview ? 42.0f : 120.0f;
+        return {focus, XMConvertToRadians(-125.0f), XMConvertToRadians(68.0f), gridDistance};
+    }
     switch (preset)
     {
     case CameraPreset::CloseUp:
         return {focus, -0.28f, 0.20f, distance * 0.65f};
     case CameraPreset::UnderCanopy:
         return {{focus.x, focus.y * 0.55f, focus.z}, -0.65f, -0.15f, distance * 0.55f};
+    case CameraPreset::Distant:
+        return {focus, -0.28f, 0.4f, 300.0f};
     default:
         return {focus, -0.28f, 0.4f, kind == SceneKind::Grove ? 112.0f : distance};
     }
@@ -130,7 +182,9 @@ CameraView ViewerScene::cameraView(CameraPreset preset) const
 
 float ViewerScene::farPlane() const
 {
-    return std::max(100.0f, cameraView(CameraPreset::Overview).distance * 10.0f);
+    const float overviewFar = std::max(100.0f, cameraView(CameraPreset::Overview).distance * 10.0f);
+    if (isOakBranchScene(kind)) return std::max(overviewFar, cameraView(CameraPreset::Distant).distance * 1.1f);
+    return overviewFar;
 }
 
 ViewerScenes::ViewerScenes(std::filesystem::path assetDirectory)
@@ -142,7 +196,7 @@ std::filesystem::path ViewerScenes::sourcePath(SceneKind kind, const std::filesy
 {
     if (kind == SceneKind::Imported) return importedPath;
     if (kind == SceneKind::Cube) return assetDirectory_ / L"cube.glb";
-    if (kind == SceneKind::OakBranch) return assetDirectory_ / L"LowBranchedWhiteOak-SingleBranch.glb";
+    if (isOakBranchScene(kind)) return assetDirectory_ / L"LowBranchedWhiteOak-SingleBranch.glb";
     if (kind == SceneKind::ModeledOak) return assetDirectory_ / L"LowBranchedWhiteOak-Modeled.glb";
     return assetDirectory_ / L"LowBranchedWhiteOakLOD0.glb";
 }
@@ -159,7 +213,20 @@ ViewerScene& ViewerScenes::open(SceneKind kind, const std::filesystem::path& imp
     scene.kind = kind;
     const bool usesOak = kind == SceneKind::Oak || kind == SceneKind::Grove;
     scene.source = sourcePath(kind, importedPath);
-    if (usesOak && oak_)
+    if (kind == SceneKind::OakBranchGrid)
+    {
+        const auto& branch = open(SceneKind::OakBranch);
+        scene.asset = branch.asset;
+        scene.fixedLod = branch.fixedLod;
+        scene.fixedLodStatus = branch.fixedLodStatus;
+        scene.assetBounds = branch.assetBounds;
+        if (scene.fixedLod && scene.fixedLod->levels.size() == fixedLodLevelCount)
+        {
+            scene.branchLod = automaticBranchLod;
+            scene.lodTint = FixedLodTint::Level;
+        }
+    }
+    else if (usesOak && oak_)
     {
         scene.asset = oak_;
     }
@@ -172,7 +239,18 @@ ViewerScene& ViewerScenes::open(SceneKind kind, const std::filesystem::path& imp
         }
     }
     scene.meshShadows.resize(scene.asset->meshes.size());
-    scene.assetBounds = assetBounds(scene.asset->meshes);
+    if (kind == SceneKind::OakBranch)
+    {
+        try
+        {
+            scene.fixedLod = std::make_shared<FixedLod>(readFixedLod(scene.source, *scene.asset));
+        }
+        catch (const std::runtime_error& error)
+        {
+            scene.fixedLodStatus = error.what();
+        }
+    }
+    if (kind != SceneKind::OakBranchGrid) scene.assetBounds = assetBounds(scene.asset->meshes);
     if (usesOak)
     {
         cardOakBounds_ = scene.assetBounds;
@@ -188,12 +266,19 @@ ViewerScene& ViewerScenes::open(SceneKind kind, const std::filesystem::path& imp
     }
     scene.foliage = std::any_of(scene.asset->materials.begin(), scene.asset->materials.end(),
                                 [](const MaterialData& material) { return material.hasBacklighting; });
-    scene.objects.push_back({1, {0.0f, 0.0f, 0.0f, 1.0f}});
-    if (kind == SceneKind::Grove)
+    if (kind == SceneKind::OakBranchGrid)
     {
-        populateGrove(scene);
+        scene.sunAzimuth = -100.0f;
+        scene.windPaused = true;
+        scene.setBranchGrid(branchGridSide);
+        scene.inspectedLodInstance = static_cast<int>(scene.objects.size() / 2);
     }
-    scene.ground = makeGround(scene);
+    else
+    {
+        scene.objects.push_back({1, {0.0f, 0.0f, 0.0f, 1.0f}});
+        if (kind == SceneKind::Grove) populateGrove(scene);
+        scene.ground = makeGround(scene);
+    }
     scene.groundMaterial.name = "Ground";
     scene.groundMaterial.color = {0.30f, 0.36f, 0.30f, 1.0f};
     return entry.emplace(std::move(scene));

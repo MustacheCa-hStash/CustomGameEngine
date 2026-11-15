@@ -5,6 +5,8 @@
 #include <backends/imgui_impl_win32.h>
 
 #include <algorithm>
+#include <cmath>
+#include <format>
 #include <stdexcept>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
@@ -14,6 +16,237 @@ namespace
 void showVector(const char* label, const DirectX::XMFLOAT3& value)
 {
     ImGui::Text("%s  %.2f, %.2f, %.2f", label, value.x, value.y, value.z);
+}
+
+void inspectBranchLod(ViewerScene& scene, const D3D12Renderer& renderer, const CameraView& camera, float windPhase)
+{
+    if (!scene.fixedLod)
+    {
+        ImGui::TextWrapped("%s", scene.fixedLodStatus.c_str());
+        return;
+    }
+    const auto& lod = *scene.fixedLod;
+    const auto& mesh = scene.asset->meshes[lod.meshIndex];
+    constexpr const char* levels[] = {"Source GLB", "LOD 0 - Clustered full detail", "LOD 1 - Reduced",
+                                      "LOD 2 - Locked rims", "LOD 3 - Rim collapse", "LOD 4 - Forced far",
+                                      "LOD 5 - Four triangles per leaf", "LOD 6 - Two triangles per leaf",
+                                      "Automatic (LOD 3 / 4 / 6)"};
+    constexpr int automaticItem = IM_ARRAYSIZE(levels) - 1;
+    static_assert(automaticItem == fixedLodLevelCount + 1);
+    const bool hasProxies = lod.levels.size() == fixedLodLevelCount;
+    const auto view = camera.matrix();
+    auto& selection = scene.branchLodSelection;
+    int level = scene.branchLod == automaticBranchLod ? automaticItem : scene.branchLod + 1;
+    const int itemCount = static_cast<int>(lod.levels.size()) + (hasProxies ? 2 : 1);
+    if (ImGui::Combo("Representation", &level, levels, itemCount, itemCount))
+    {
+        scene.branchLod = level == automaticItem ? automaticBranchLod : level - 1;
+        selection.frozen = false;
+        renderer.updateBranchLod(scene, view);
+    }
+    const bool automatic = scene.branchLod == automaticBranchLod;
+    const bool source = scene.branchLod == sourceBranchLod;
+
+    constexpr const char* tints[] = {"Shaded", "Triangle", "Group", "Cluster", "LOD level"};
+    int tint = static_cast<int>(scene.lodTint);
+    ImGui::BeginDisabled(source);
+    if (ImGui::Combo("Color by", &tint, tints, IM_ARRAYSIZE(tints))) scene.lodTint = static_cast<FixedLodTint>(tint);
+    ImGui::EndDisabled();
+
+    constexpr std::array shadowLevels{matchCameraShadowLod, static_cast<int>(fixedLodRimLevel),
+        static_cast<int>(fixedLodFarLevel), static_cast<int>(fixedLodTwoTriangleLevel)};
+    constexpr const char* shadowLabels[] = {"Match camera cut", "LOD 3", "LOD 4", "LOD 6"};
+    const auto shadowItem = std::find(shadowLevels.begin(), shadowLevels.end(), scene.branchShadowLod);
+    int shadowChoice = static_cast<int>(shadowItem - shadowLevels.begin());
+    if (ImGui::Combo("Shadow LOD", &shadowChoice, shadowLabels, hasProxies ? 4 : 1))
+    {
+        scene.branchShadowLod = shadowLevels[shadowChoice];
+    }
+    ImGui::BeginDisabled(scene.branchShadowLod == matchCameraShadowLod);
+    ImGui::Checkbox("Off-camera casters only", &scene.shadowLodOffCameraOnly);
+    ImGui::SetItemTooltip("Override foliage LOD only on branches whose bounds are outside the camera frustum.");
+    ImGui::EndDisabled();
+    ImGui::Checkbox("Shadow factor view", &scene.showShadowFactor);
+    ImGui::SetItemTooltip("Show the received shadow in grayscale. White is unshadowed.");
+
+    const auto instances = scene.instanceCount();
+    const bool multiple = instances > 1;
+    const auto sourceTriangles = mesh.indices.size() / 3 * instances;
+    std::string cutData;
+    if (automatic)
+    {
+        bool update = ImGui::Checkbox("Freeze cut", &selection.frozen);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keep each group's selected LOD while you move the camera.");
+        ImGui::SameLine();
+        ImGui::Checkbox("Indirect draws", &selection.indirectDraws);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Batch the same cut into one draw list per active LOD.");
+        if (ImGui::TreeNode("Switch thresholds"))
+        {
+            ImGui::BeginDisabled(selection.frozen);
+            constexpr auto clamp = ImGuiSliderFlags_AlwaysClamp;
+            update |= ImGui::SliderFloat("LOD 4 limit", &selection.farPixelLimit, 0.10f, 5.0f, "%.2f px", clamp);
+            update |= ImGui::SliderFloat("LOD 6 limit", &selection.proxyPixelLimit, 0.10f, 5.0f, "%.2f px", clamp);
+            ImGui::EndDisabled();
+            ImGui::TreePop();
+        }
+        if (update) renderer.updateBranchLod(scene, view);
+
+        std::array<unsigned, fixedLodLevelCount> groupCounts{};
+        std::size_t triangles = 0;
+        std::size_t clusters = 0;
+        for (std::size_t i = 0; i < selection.groupLevels.size(); ++i)
+        {
+            const auto selected = selection.groupLevels[i];
+            const auto group = i % lod.groups.size();
+            ++groupCounts[selected];
+            clusters += lod.groups[group].levels[selected].clusterCount;
+            triangles += lod.indicesForGroups(selected, group, group).indexCount / 3;
+        }
+        const auto nearGroups = groupCounts[fixedLodRimLevel];
+        const auto farGroups = groupCounts[fixedLodFarLevel];
+        const auto proxyGroups = groupCounts[fixedLodTwoTriangleLevel];
+        cutData = std::format("Cut {} | Groups LOD 3: {}, LOD 4: {}, LOD 6: {} | {} tris | {} clusters\n"
+                              "Switch limits LOD 4 {:.2f} px | LOD 6 {:.2f} px\n",
+                              selection.frozen ? "frozen" : "live", nearGroups, farGroups, proxyGroups,
+                              triangles, clusters, selection.farPixelLimit, selection.proxyPixelLimit);
+        ImGui::Text("%zu foliage triangles, %zu clusters", triangles, clusters);
+        ImGui::TextUnformatted("Groups");
+        ImGui::SameLine();
+        ImGui::TextColored({0.35f, 0.82f, 0.33f, 1.0f}, "LOD 3: %u", nearGroups);
+        ImGui::SameLine();
+        ImGui::TextColored({0.25f, 0.75f, 0.94f, 1.0f}, "LOD 4: %u", farGroups);
+        ImGui::SameLine();
+        ImGui::TextColored({0.78f, 0.48f, 0.94f, 1.0f}, "LOD 6: %u", proxyGroups);
+    }
+    else if (!source)
+    {
+        const auto index = static_cast<std::size_t>(scene.branchLod);
+        const auto& selected = lod.levels[index];
+        const auto triangles = selected.indices.size() / 3 * instances;
+        const auto reduction = 100.0 * (sourceTriangles - triangles) / sourceTriangles;
+        ImGui::Text("%zu foliage triangles (%.1f%% reduction)", triangles, reduction);
+        ImGui::Text("%zu clusters in %zu groups", selected.clusters.size() * instances, lod.groups.size() * instances);
+        float error = 0;
+        for (const auto& group : lod.groups)
+        {
+            error = std::max(error, group.levels[index].surfaceError());
+        }
+        ImGui::Text("Max sampled error %.5f mesh units", error);
+    }
+    else
+    {
+        ImGui::Text("%zu foliage triangles", sourceTriangles);
+    }
+
+    const auto eye = camera.eye();
+    const auto yaw = DirectX::XMConvertToDegrees(camera.yaw);
+    const auto pitch = DirectX::XMConvertToDegrees(camera.pitch);
+    const auto verticalFov = DirectX::XMConvertToDegrees(renderer.cameraVerticalFov);
+    const auto viewport = renderer.viewportSize();
+    if (ImGui::TreeNode("Camera diagnostics"))
+    {
+        ImGui::Text("Orbit distance %.3f scene units", camera.distance);
+        ImGui::Text("Yaw %.1f deg  Pitch %.1f deg", yaw, pitch);
+        showVector("Eye", eye);
+        showVector("Focus", camera.focus);
+        ImGui::Text("Vertical FOV %.1f deg  Viewport %.0f x %.0f", verticalFov, viewport.x, viewport.y);
+        ImGui::TreePop();
+    }
+
+    const bool copy = ImGui::Button("Copy view data");
+    const bool groupOpen = ImGui::TreeNode("Group diagnostics");
+    if (groupOpen)
+    {
+        if (multiple)
+        {
+            int instance = scene.inspectedLodInstance + 1;
+            if (ImGui::SliderInt("Branch instance", &instance, 1, static_cast<int>(instances),
+                                 "%d", ImGuiSliderFlags_AlwaysClamp))
+            {
+                scene.inspectedLodInstance = instance - 1;
+            }
+        }
+        ImGui::SliderInt("Group ID", &scene.inspectedLodGroup, 0, static_cast<int>(lod.groups.size() - 1),
+                         "%d", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::BeginDisabled(source);
+        ImGui::Checkbox(multiple ? "Highlight group across copies" : "Highlight group", &scene.highlightLodGroup);
+        ImGui::EndDisabled();
+    }
+    if (groupOpen || copy)
+    {
+        const auto instanceIndex = static_cast<std::size_t>(scene.inspectedLodInstance);
+        const auto& instance = scene.objects[instanceIndex];
+        const auto groupIndex = static_cast<std::size_t>(scene.inspectedLodGroup);
+        const auto& group = lod.groups[groupIndex];
+        DirectX::XMFLOAT4X4 localToWorld;
+        DirectX::XMStoreFloat4x4(&localToWorld, DirectX::XMLoadFloat4x4(&mesh.localToWorld) * instance.placementMatrix());
+        if (groupOpen)
+        {
+            ImGui::Text("%u components", group.componentCount);
+            ImGui::TextWrapped("Projected from the sampled surface error at rest.");
+        }
+        std::string groupData;
+        if (copy && multiple)
+        {
+            groupData = std::format("Branch instance {} | X {:.2f}, Z {:.2f}\n",
+                                    instance.id, instance.placement.x, instance.placement.y);
+        }
+        if (automatic)
+        {
+            const auto activeLevel = selection.groupLevels[instanceIndex * lod.groups.size() + groupIndex];
+            const auto errors = renderer.projectBranchLodErrors(group, localToWorld, view);
+            const auto line = std::format("Active LOD {} | Selection errors LOD 4 {:.2f} px, LOD 6 {:.2f} px",
+                                          activeLevel, errors.farPixels, errors.proxyPixels);
+            if (groupOpen) ImGui::TextWrapped("%s", line.c_str());
+            if (copy) groupData += line + '\n';
+        }
+        for (std::size_t i = 0; i < lod.levels.size(); ++i)
+        {
+            const float error = group.levels[i].surfaceError();
+            const auto& bounds = i < fixedLodIndicesOnlyCount ? group.bounds : group.proxyBounds;
+            const float pixels = renderer.projectLodError(error, bounds, localToWorld, view);
+            const auto screen = std::isfinite(pixels) ? std::format("{:.2f} px", pixels) : "near plane or behind";
+            const auto triangles = lod.indicesForGroups(i, groupIndex, groupIndex).indexCount / 3;
+            const float lightTexels = renderer.projectShadowError(error, localToWorld);
+            const auto reading = std::format("LOD {}   {} tris   {:.5f} units   {}   {:.2f} shadow texels",
+                                             i, triangles, error, screen, lightTexels);
+            if (groupOpen) ImGui::TextUnformatted(reading.c_str());
+            if (copy) groupData += reading + '\n';
+        }
+        if (groupOpen) ImGui::TextUnformatted("Sampled rim deviation (mesh units)");
+        for (std::size_t i = fixedLodRimLevel; i < lod.levels.size(); ++i)
+        {
+            if (groupOpen)
+            {
+                if (i != fixedLodRimLevel && i % 2 == 0) ImGui::SameLine();
+                ImGui::Text("LOD %zu %.5f", i, group.levels[i].rimDeviation);
+            }
+            if (copy)
+            {
+                if (i == fixedLodRimLevel) groupData += "Sampled rim deviation (mesh units)";
+                groupData += std::format(" | LOD {} {:.5f}", i, group.levels[i].rimDeviation);
+            }
+        }
+        if (groupOpen) ImGui::TreePop();
+        if (copy)
+        {
+            const auto text = std::format(
+                "{} | {} | {}\n"
+                "Orbit distance {:.6f} scene units | Yaw {:.4f} deg | Pitch {:.4f} deg\n"
+                "Eye ({:.6f}, {:.6f}, {:.6f}) | Focus ({:.6f}, {:.6f}, {:.6f})\n"
+                "Vertical FOV {:.1f} deg | Viewport {:.0f} x {:.0f} | {}x MSAA\n"
+                "Sun azimuth {:.2f} deg | Elevation {:.2f} deg | Wind strength {:.2f} ({}, phase {:.4f})\n"
+                "Shadow LOD {} | {} | Shadow factor view {}\n"
+                "{}Group {} ({} components) | Projected error estimated at rest\n{}",
+                scene.name(), levels[level], source ? tints[0] : tints[tint],
+                camera.distance, yaw, pitch, eye.x, eye.y, eye.z, camera.focus.x, camera.focus.y, camera.focus.z,
+                verticalFov, viewport.x, viewport.y, renderer.msaaEnabled() ? 4 : 1,
+                scene.sunAzimuth, scene.sunElevation, scene.windStrength, scene.windPaused ? "paused" : "running",
+                windPhase, shadowLabels[shadowChoice], scene.shadowLodOffCameraOnly ? "Off-camera only" : "All casters",
+                scene.showShadowFactor ? "on" : "off", cutData, scene.inspectedLodGroup, group.componentCount, groupData);
+            ImGui::SetClipboardText(text.c_str());
+        }
+    }
 }
 
 void showMeshIcon()
@@ -182,7 +415,8 @@ void SceneInspector::resetSelection()
 InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& renderer,
                                        const D3D12Renderer::FrameTiming& timing,
                                        const std::string& sceneError, bool hasImportedScene,
-                                       bool reloadingShaders, const std::string& shaderDiagnostics)
+                                       bool reloadingShaders, const std::string& shaderDiagnostics,
+                                       const CameraView& camera, float windPhase)
 {
     InspectorActions actions;
     ImGui_ImplDX12_NewFrame();
@@ -212,6 +446,12 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
             {
                 ImGui::TextWrapped("%s", sceneError.c_str());
             }
+            if (isOakBranchScene(scene.kind) &&
+                ImGui::CollapsingHeader("Branch LOD", ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                ImGui::Checkbox("Frustum culling", &scene.branchFrustumCulling);
+                inspectBranchLod(scene, renderer, camera, windPhase);
+            }
             if (ImGui::CollapsingHeader("Scene controls", ImGuiTreeNodeFlags_DefaultOpen))
             {
                 if (ImGui::Button("Overview")) actions.camera = CameraPreset::Overview;
@@ -221,6 +461,11 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
                 {
                     ImGui::SameLine();
                     if (ImGui::Button("Under canopy")) actions.camera = CameraPreset::UnderCanopy;
+                }
+                if (isOakBranchScene(scene.kind))
+                {
+                    ImGui::SameLine();
+                    if (ImGui::Button("Distant")) actions.camera = CameraPreset::Distant;
                 }
                 actions.sunChanged = ImGui::SliderFloat("Sun azimuth", &scene.sunAzimuth, -180, 180, "%.0f deg",
                                                         ImGuiSliderFlags_AlwaysClamp);
@@ -280,7 +525,26 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
                 ImGui::Text("CPU %.2f ms", timing.cpuMilliseconds);
                 if (timing.gpuMilliseconds) ImGui::Text("GPU %.2f ms", *timing.gpuMilliseconds);
                 else ImGui::TextUnformatted("GPU -- ms");
-                ImGui::Text("Draw calls (scene + HUD) %u", timing.drawCalls);
+                if (timing.gpuCameraMilliseconds && timing.gpuShadowMilliseconds)
+                {
+                    ImGui::Text("GPU camera %.2f ms, shadows %.2f ms", *timing.gpuCameraMilliseconds,
+                                *timing.gpuShadowMilliseconds);
+                }
+                ImGui::Text("Camera %llu tris, %u draws", static_cast<unsigned long long>(timing.camera.triangles),
+                            timing.camera.draws);
+                ImGui::Text("Shadows %llu tris, %u draws", static_cast<unsigned long long>(timing.shadow.triangles),
+                            timing.shadow.draws);
+                if (isOakBranchScene(scene.kind))
+                {
+                    ImGui::Text("Eligible branches %u/%u camera, %u/%u shadows", timing.camera.visibleInstances,
+                                scene.instanceCount(), timing.shadow.visibleInstances, scene.instanceCount());
+                    ImGui::Text("Foliage API calls %u camera, %u shadows", timing.camera.foliageCalls,
+                                timing.shadow.foliageCalls);
+                    ImGui::Text("Shadow foliage %llu tris, %u draws",
+                                static_cast<unsigned long long>(timing.shadow.foliageTriangles), timing.shadow.foliageDraws);
+                    ImGui::Text("Shadow LOD overridden on %u branches", timing.shadow.shadowLodOverrides);
+                }
+                ImGui::Text("Draws (scene + HUD) %u", timing.drawCalls);
             }
             actions.settingsChanged |= inspect(scene, renderer);
         }
@@ -307,16 +571,13 @@ bool SceneInspector::inspect(ViewerScene& scene, const D3D12Renderer& renderer)
             ground_ = true;
             page_ = Page::Object;
         }
-        if (!ground_ && scene.kind == SceneKind::Grove)
+        const auto instances = static_cast<int>(scene.instanceCount());
+        if (!ground_ && instances > 1)
         {
-            objectIndex_ = std::clamp(objectIndex_, 0, static_cast<int>(scene.treeCount) - 1);
-            if (scene.treeCount > 1)
-            {
-                int tree = objectIndex_ + 1;
-                ImGui::SliderInt("Tree instance", &tree, 1, static_cast<int>(scene.treeCount), "%d",
-                                 ImGuiSliderFlags_AlwaysClamp);
-                objectIndex_ = tree - 1;
-            }
+            int instance = std::clamp(objectIndex_ + 1, 1, instances);
+            ImGui::SliderInt(scene.kind == SceneKind::Grove ? "Tree instance" : "Branch instance", &instance,
+                             1, instances, "%d", ImGuiSliderFlags_AlwaysClamp);
+            objectIndex_ = instance - 1;
         }
     }
     if (!ImGui::CollapsingHeader("Inspector", ImGuiTreeNodeFlags_DefaultOpen))
@@ -343,8 +604,7 @@ bool SceneInspector::inspect(ViewerScene& scene, const D3D12Renderer& renderer)
     {
     case Page::Object:
     {
-        const auto& object = scene.objects[std::min<std::size_t>(objectIndex_,
-            scene.kind == SceneKind::Grove ? scene.treeCount - 1 : 0)];
+        const auto& object = scene.objects[std::min<std::size_t>(objectIndex_, scene.instanceCount() - 1)];
         ImGui::Text("Scene ID  %u", ground_ ? 0u : object.id);
         const auto& placement = object.placement;
         showVector("Placement", ground_ ? DirectX::XMFLOAT3{} : DirectX::XMFLOAT3{placement.x, 0, placement.y});
@@ -394,9 +654,9 @@ bool SceneInspector::inspect(ViewerScene& scene, const D3D12Renderer& renderer)
         changed = ImGui::Checkbox("Cast shadows", &shadows.cast);
         ImGui::SameLine();
         changed |= ImGui::Checkbox("Receive shadows", &shadows.receive);
-        if (!ground_ && scene.kind == SceneKind::Grove)
+        if (!ground_ && scene.instanceCount() > 1)
         {
-            ImGui::TextDisabled("Applies to this mesh on every tree.");
+            ImGui::TextDisabled("Applies to this mesh on every instance.");
         }
         ImGui::Text("Vertices  %zu   Triangles  %zu", mesh.vertices.size(), mesh.indices.size() / 3);
         ImGui::Text("UV sets  %s", mesh.uvMask == 3 ? "0, 1" : mesh.uvMask == 1 ? "0" : mesh.uvMask == 2 ? "1" : "None");

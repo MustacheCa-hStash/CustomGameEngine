@@ -10,6 +10,11 @@ cbuffer DrawConstants : register(b0)
     uint movesWithWind;
     uint receivesShadows;
     int twoSidedNormalSign;
+    uint lodTint;
+    uint highlightedLodGroup;
+    uint firstLodTriangle;
+    uint lodLevel;
+    uint shadowView;
 };
 
 cbuffer FrameConstants : register(b1)
@@ -28,6 +33,7 @@ Texture2D<float4> colorTexture : register(t0);
 SamplerState colorSampler : register(s0);
 Texture2D<float> shadowMap : register(t1);
 SamplerComparisonState shadowSampler : register(s1);
+StructuredBuffer<uint3> lodTriangleTags : register(t2);
 
 struct VertexInput
 {
@@ -148,10 +154,39 @@ float sunVisibility(float4 lightPosition, float3 worldNormal, float normalToSun)
     return shadowMap.SampleCmpLevelZero(shadowSampler, uv, projected.z - shadowBias);
 }
 
-float4 PSMain(PixelInput input, bool isFrontFace : SV_IsFrontFace) : SV_Target
+float3 tintColor(uint id)
+{
+    id ^= id >> 16;
+    id *= 0x7feb352d;
+    id ^= id >> 15;
+    id *= 0x846ca68b;
+    id ^= id >> 16;
+    return 0.22 + (0.73 / 255.0) * float3(id & 255, (id >> 8) & 255, (id >> 16) & 255);
+}
+
+float4 PSMain(PixelInput input, bool isFrontFace : SV_IsFrontFace, uint primitive : SV_PrimitiveID) : SV_Target
 {
     float4 baseColor = sampleBaseColor(input.uv);
     applyCutout(baseColor.a);
+    if (shadowView == 0 && (lodTint != 0 || highlightedLodGroup != 0))
+    {
+        const uint3 tag = lodTriangleTags[firstLodTriangle + primitive];
+        if (highlightedLodGroup == tag.y + 1)
+        {
+            return float4(1.0, 0.58, 0.12, 1.0);
+        }
+        if (lodTint == 4)
+        {
+            if (lodLevel == 3) return float4(0.35, 0.82, 0.33, 1.0);
+            if (lodLevel == 4) return float4(0.25, 0.75, 0.94, 1.0);
+            if (lodLevel == 6) return float4(0.78, 0.48, 0.94, 1.0);
+            return float4(tintColor(lodLevel), 1.0);
+        }
+        if (lodTint != 0)
+        {
+            return float4(tintColor(tag[lodTint - 1]), 1.0);
+        }
+    }
     float3 worldNormal = normalize(input.worldNormal);
     // For thin double-sided leaves, evaluate lighting from the visible side.
     // A mirrored node reverses winding relative to its transformed normal.
@@ -162,6 +197,11 @@ float4 PSMain(PixelInput input, bool isFrontFace : SV_IsFrontFace) : SV_Target
     float normalToSun = dot(worldNormal, toSun);
     float diffuse = saturate(normalToSun) + transmission * saturate(-normalToSun);
     float visibility = receivesShadows ? sunVisibility(input.lightPosition, worldNormal, normalToSun) : 1.0;
+    if (shadowView != 0)
+    {
+        // Alpha tags the receiver for measurement. The swap chain displays RGB.
+        return float4(visibility.xxx, shadowView == 1 ? 0.25 : 0.75);
+    }
     float3 lit = baseColor.rgb * (0.35 + 0.65 * diffuse * visibility);
     // Textures are sampled as linear RGB. The current render target stores display RGB.
     return float4(hasColorTexture ? encodeSrgb(lit) : lit, 1.0);

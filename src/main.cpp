@@ -1,3 +1,4 @@
+#include "BranchBenchmark.h"
 #include "D3D12Renderer.h"
 #include "SceneInspector.h"
 #include "ViewerSettings.h"
@@ -109,35 +110,30 @@ struct OrbitCamera
     float pitch = defaultPitch;
     float distance = defaultDistance;
     float homeDistance = defaultDistance;
+    float zoomLimit = 45.0f;
     XMFLOAT3 focus{0.0f, 0.75f, 0.0f};
     POINT lastMouse{};
     bool dragging = false;
 
-    void useView(const CameraView& view, float overviewDistance)
+    void useView(const CameraView& view, float overviewDistance, float distantDistance)
     {
         focus = view.focus;
         yaw = view.yaw;
         pitch = view.pitch;
         distance = view.distance;
         homeDistance = overviewDistance;
+        zoomLimit = std::max(45.0f * homeDistance / defaultDistance, distantDistance);
     }
 
     void zoom(float steps)
     {
         const float scale = homeDistance / defaultDistance;
-        distance = std::clamp(distance * std::pow(0.85f, steps), 1.5f * scale, 45.0f * scale);
+        distance = std::clamp(distance * std::pow(0.85f, steps), 1.5f * scale, zoomLimit);
     }
 
-    XMFLOAT4X4 view() const
+    CameraView currentView() const
     {
-        const float horizontal = distance * std::cos(pitch);
-        const auto target = XMLoadFloat3(&focus);
-        const auto eye = target + XMVectorSet(horizontal * std::sin(yaw),
-                                             distance * std::sin(pitch),
-                                             horizontal * std::cos(yaw), 0.0f);
-        XMFLOAT4X4 result;
-        XMStoreFloat4x4(&result, XMMatrixLookAtRH(eye, target, XMVectorSet(0, 1, 0, 0)));
-        return result;
+        return {focus, yaw, pitch, distance};
     }
 };
 
@@ -257,6 +253,8 @@ struct LaunchOptions
     SceneKind kind = SceneKind::Cube;
     std::filesystem::path imported;
     bool resetSettings = false;
+    std::filesystem::path benchmarkReport;
+    bool shadowBenchmark = false;
 };
 
 LaunchOptions launchOptions()
@@ -268,9 +266,23 @@ LaunchOptions launchOptions()
     {
         throw std::runtime_error("Could not read the command line.");
     }
+    if (count > 1)
+    {
+        const std::wstring_view option = arguments.get()[1];
+        if (option == L"--branch-benchmark" || option == L"--branch-shadow-benchmark")
+        {
+            if (count != 3 || arguments.get()[2][0] == L'\0')
+            {
+                throw std::runtime_error("Supply a CSV output path after the benchmark option.");
+            }
+            const bool shadowBenchmark = option == L"--branch-shadow-benchmark";
+            return {shadowBenchmark ? SceneKind::OakBranchGrid : SceneKind::OakBranch, {}, false,
+                    arguments.get()[2], shadowBenchmark};
+        }
+    }
     if (count > 2)
     {
-        throw std::runtime_error("Usage: CustomGameEngine.exe [--oak | --modeled-oak | --grove | --branch | path-to-mesh.glb | --reset-settings]");
+        throw std::runtime_error("Usage: CustomGameEngine.exe [--oak | --modeled-oak | --grove | --branch | --branch-grid | --branch-benchmark report.csv | --branch-shadow-benchmark report.csv | path-to-mesh.glb | --reset-settings]");
     }
     if (count == 2)
     {
@@ -279,6 +291,7 @@ LaunchOptions launchOptions()
         if (option == L"--oak") return {SceneKind::Oak, {}};
         if (option == L"--modeled-oak") return {SceneKind::ModeledOak, {}};
         if (option == L"--branch") return {SceneKind::OakBranch, {}};
+        if (option == L"--branch-grid") return {SceneKind::OakBranchGrid, {}};
         if (option == L"--reset-settings") return {SceneKind::Cube, {}, true};
         return {SceneKind::Imported, arguments.get()[1]};
     }
@@ -335,6 +348,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         ViewerScenes scenes(directory);
         assetPath = scenes.sourcePath(launch.kind, launch.imported);
         auto* scene = &scenes.open(launch.kind, launch.imported);
+        if (!launch.benchmarkReport.empty())
+        {
+            window = createWindow(instance, camera);
+            D3D12Renderer renderer(window);
+            if (renderer.msaaEnabled()) renderer.toggleMsaa();
+            ShowWindow(window, showCommand);
+            if (launch.shadowBenchmark) return runBranchShadowBenchmark(window, *scene, renderer, launch.benchmarkReport);
+            return runBranchBenchmark(window, *scene, renderer, launch.benchmarkReport);
+        }
         settings.apply(*scene);
         window = createWindow(instance, camera);
         D3D12Renderer renderer(window);
@@ -352,7 +374,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
 
         const auto applyView = [&](CameraPreset preset) {
             routeStart.reset();
-            camera.useView(scene->cameraView(preset), scene->cameraView(CameraPreset::Overview).distance);
+            const float distant = isOakBranchScene(scene->kind)
+                ? scene->cameraView(CameraPreset::Distant).distance : 0.0f;
+            camera.useView(scene->cameraView(preset), scene->cameraView(CameraPreset::Overview).distance, distant);
         };
         const auto refreshTitle = [&] {
             updateWindowTitle(window, renderer, *scene, routeStart.has_value());
@@ -471,10 +495,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
                 }
             }
 
+            auto view = camera.currentView();
+            if (routeStart)
+            {
+                constexpr double routeSeconds = 24.0;
+                const double elapsed = std::chrono::duration<double>(Clock::now() - *routeStart).count();
+                const float angle = static_cast<float>(std::fmod(elapsed, routeSeconds) *
+                                                       (XM_2PI / routeSeconds));
+                view.yaw = OrbitCamera::defaultYaw + angle;
+                view.pitch = 0.42f + 0.15f * std::sin(angle);
+                view.distance = 80.0f + 32.0f * std::cos(angle);
+            }
+            const auto viewMatrix = view.matrix();
+            renderer.updateBranchLod(*scene, viewMatrix);
             const auto& inspectorError = sceneError.empty() ? settings.error() : sceneError;
             const auto actions = inspector.frame(*scene, renderer, timing, inspectorError,
                                                  launch.kind == SceneKind::Imported, shaderReload.valid(),
-                                                 shaderDiagnostics);
+                                                 shaderDiagnostics, view, wind.phase());
             if (actions.reloadShaders)
             {
                 try
@@ -493,28 +530,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
             if (actions.treeCountChanged) treeCountChanged();
             if (actions.settingsChanged || actions.sunChanged) settings.recordScene(*scene);
             settings.saveIfDue();
+            timing = renderer.drawFrame(*scene, viewMatrix, wind.phase(), hud.text(),
+                [&](ID3D12GraphicsCommandList* commands) { inspector.draw(commands); });
+            hud.record(timing);
             if (actions.camera)
             {
                 applyView(*actions.camera);
                 refreshTitle();
             }
-
-            auto view = camera.view();
-            if (routeStart)
-            {
-                constexpr double routeSeconds = 24.0;
-                const double elapsed = std::chrono::duration<double>(Clock::now() - *routeStart).count();
-                const float angle = static_cast<float>(std::fmod(elapsed, routeSeconds) *
-                                                       (XM_2PI / routeSeconds));
-                auto routeCamera = camera;
-                routeCamera.yaw = OrbitCamera::defaultYaw + angle;
-                routeCamera.pitch = 0.42f + 0.15f * std::sin(angle);
-                routeCamera.distance = 80.0f + 32.0f * std::cos(angle);
-                view = routeCamera.view();
-            }
-            timing = renderer.drawFrame(*scene, view, wind.phase(), hud.text(),
-                [&](ID3D12GraphicsCommandList* commands) { inspector.draw(commands); });
-            hud.record(timing);
 
             // Submit the current UI before switching the assets its texture preview references.
             if (actions.scene && *actions.scene != scene->kind)

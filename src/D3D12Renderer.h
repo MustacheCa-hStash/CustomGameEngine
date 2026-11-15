@@ -18,11 +18,27 @@
 class D3D12Renderer
 {
 public:
+    struct PassStats
+    {
+        unsigned draws = 0;
+        unsigned foliageDraws = 0;
+        std::uint64_t triangles = 0;
+        std::uint64_t foliageTriangles = 0;
+        unsigned foliageCalls = 0;
+        unsigned visibleInstances = 0;
+        unsigned shadowLodOverrides = 0;
+    };
+
     struct FrameTiming
     {
         double cpuMilliseconds;
         std::optional<double> gpuMilliseconds;
         unsigned drawCalls = 0;
+        std::optional<double> gpuCameraMilliseconds;
+        std::optional<double> gpuShadowMilliseconds;
+        PassStats camera;
+        PassStats shadow;
+        double cpuBranchDrawListMilliseconds = 0;
     };
 
     explicit D3D12Renderer(HWND window);
@@ -38,13 +54,24 @@ public:
     void reloadMeshShaders(MeshShaders shaders, const ShadowBiasSettings& bias);
     float shadowDepthPerTexel() const { return shadowDepthPerTexel_; }
     float shadowWorldUnitsPerTexel() const { return shadowWorldUnitsPerTexel_; }
+    static constexpr float cameraVerticalFov = DirectX::XM_PIDIV4;
+    DirectX::XMFLOAT2 viewportSize() const { return {viewport_.Width, viewport_.Height}; }
+    float projectLodError(float localError, const Bounds& bounds,
+                          const DirectX::XMFLOAT4X4& localToWorld, const DirectX::XMFLOAT4X4& view) const;
+    float projectShadowError(float localError, const DirectX::XMFLOAT4X4& localToWorld) const;
+    struct BranchLodErrors { float farPixels; float proxyPixels; };
+    BranchLodErrors projectBranchLodErrors(const FixedLodGroup& group, const DirectX::XMFLOAT4X4& localToWorld,
+                                          const DirectX::XMFLOAT4X4& view) const;
+    void updateBranchLod(ViewerScene& scene, const DirectX::XMFLOAT4X4& view) const;
     FrameTiming drawFrame(const ViewerScene& scene, const DirectX::XMFLOAT4X4& view, float windPhase,
                           std::string_view hud,
-                          const std::function<void(ID3D12GraphicsCommandList*)>& drawOverlay = {});
+                          const std::function<void(ID3D12GraphicsCommandList*)>& drawOverlay = {},
+                          std::vector<std::uint32_t>* capture = nullptr);
 
     ID3D12Device* device() const { return device_.Get(); }
     ID3D12CommandQueue* queue() const { return queue_.Get(); }
     DXGI_FORMAT backBufferFormat() const;
+    const std::wstring& adapterName() const { return adapterName_; }
     void writeTextureView(std::size_t texture, D3D12_CPU_DESCRIPTOR_HANDLE destination) const;
 
 private:
@@ -72,12 +99,64 @@ private:
         ComPtr<ID3D12PipelineState> pipeline;
     };
 
+    struct GpuFixedLodLevel
+    {
+        ComPtr<ID3D12Resource> indexBuffer;
+        ComPtr<ID3D12Resource> triangleTags;
+        D3D12_VERTEX_BUFFER_VIEW proxyVertices{};
+        D3D12_INDEX_BUFFER_VIEW indices{};
+        UINT indexCount = 0;
+    };
+
+    struct BranchDraw
+    {
+        UINT firstTriangle;
+        D3D12_DRAW_INDEXED_ARGUMENTS indexed;
+    };
+
+    struct InstanceRange
+    {
+        UINT first;
+        UINT count;
+
+        bool operator==(const InstanceRange&) const = default;
+    };
+
+    struct PassVisibility
+    {
+        std::vector<InstanceRange> ranges;
+        UINT count = 0;
+
+        void clear();
+        void add(UINT instance);
+    };
+
+    struct BranchPassDraws
+    {
+        std::array<std::vector<BranchDraw>, fixedLodLevelCount> byLevel;
+        std::array<std::uint64_t, fixedLodLevelCount> triangles{};
+        std::optional<UINT64> argumentOffset;
+    };
+
+    struct BranchLodProjection
+    {
+        Bounds bounds;
+        float farError;
+        float proxyError;
+    };
+
     void createDepthBuffer(RenderMode& mode, D3D12_RESOURCE_DESC description);
     void createShadowMap();
     ComPtr<ID3D12Resource> createRenderTexture(const D3D12_RESOURCE_DESC& description,
                                                D3D12_RESOURCE_STATES initialState,
                                                const D3D12_CLEAR_VALUE& clear);
     void createMeshPipelineLayout();
+    void createBranchCommandSignature();
+    static BranchLodProjection branchGroupProjection(const FixedLodGroup& group);
+    static BranchLodProjection branchInstanceProjection(std::span<const BranchLodProjection> groups);
+    BranchLodErrors projectBranchLodErrors(const BranchLodProjection& projection,
+                                          const DirectX::XMFLOAT4X4& localToWorld,
+                                          const DirectX::XMFLOAT4X4& view) const;
     void installMeshPipelines(D3D12_SHADER_BYTECODE cameraVertex, D3D12_SHADER_BYTECODE cameraPixel,
                               D3D12_SHADER_BYTECODE shadowVertex, D3D12_SHADER_BYTECODE shadowPixel,
                               const ShadowBiasSettings& bias, bool enableMultisampling);
@@ -88,20 +167,32 @@ private:
     ComPtr<ID3D12Resource> uploadTexture(const TextureData& mips,
                                          std::vector<ComPtr<ID3D12Resource>>& staging);
     GpuMesh uploadMesh(const MeshData& mesh);
+    GpuFixedLodLevel uploadFixedLodLevel(const FixedLod& lod, std::size_t levelIndex);
     ComPtr<ID3D12Resource> createUploadBuffer(std::size_t size);
     ComPtr<ID3D12Resource> uploadBuffer(const void* data, std::size_t size);
-    void updateFrameConstants(const ViewerScene& scene, const DirectX::XMFLOAT4X4& view, float windPhase);
-    unsigned drawShadowMap(const ViewerScene& scene);
-    unsigned drawMeshes(const ViewerScene& scene, bool shadowPass);
-    void drawMesh(const GpuMesh& mesh, const MaterialData& material, bool wind,
-                  bool receiveShadows, UINT instanceCount, UINT firstInstance);
+    DirectX::XMFLOAT2 updateFrameConstants(const ViewerScene& scene, DirectX::FXMMATRIX viewProjection, float windPhase);
+    void prepareVisibility(const ViewerScene& scene, DirectX::FXMMATRIX viewProjection, DirectX::XMFLOAT2 windOffset);
+    void prepareBranchDraws(const ViewerScene& scene, const PassVisibility& visibility, BranchPassDraws& pass,
+                            std::size_t& argumentBytes);
+    void copyFrameColor(ID3D12Resource* backBuffer);
+    void readFrameColor(std::vector<std::uint32_t>& pixels);
+    PassStats drawShadowMap(const ViewerScene& scene);
+    PassStats drawMeshes(const ViewerScene& scene, bool shadowPass);
+    void bindMesh(const GpuMesh& mesh, const MaterialData& material, bool wind, bool receiveShadows,
+                  const GpuFixedLodLevel* lod, FixedLodTint tint, UINT highlightedGroup, UINT lodLevel,
+                  UINT firstTriangle);
+    std::uint64_t drawMesh(const GpuMesh& mesh, const MaterialData& material, bool wind,
+                  bool receiveShadows, UINT instanceCount, UINT firstInstance,
+                  const GpuFixedLodLevel* lod = nullptr, FixedLodTint tint = FixedLodTint::Shaded,
+                  UINT highlightedGroup = 0, UINT lodLevel = 0, FixedLodIndexRange range = {});
     void createFrameTimer();
-    std::optional<double> readGpuTime() const;
+    void readGpuTimes(FrameTiming& timing) const;
     void createHud();
     void drawHud(D3D12_CPU_DESCRIPTOR_HANDLE target, std::string_view text);
     void waitForGpu();
 
     ComPtr<ID3D12Device> device_;
+    std::wstring adapterName_;
     ComPtr<ID3D12CommandQueue> queue_;
     ComPtr<IDXGISwapChain3> swapChain_;
     ComPtr<ID3D12DescriptorHeap> renderTargetHeap_;
@@ -136,6 +227,21 @@ private:
     D3D12_VERTEX_BUFFER_VIEW instanceView_{};
     std::shared_ptr<const AssetData> asset_;
     std::vector<GpuMesh> meshes_;
+    std::array<GpuFixedLodLevel, fixedLodLevelCount> fixedLodLevels_;
+    ComPtr<ID3D12Resource> fixedLodProxyVertices_;
+    std::vector<BranchLodProjection> branchGroupProjections_;
+    BranchLodProjection branchInstanceProjection_{};
+    Bounds branchCullBounds_{};
+    PassVisibility cameraVisibility_;
+    PassVisibility shadowVisibility_;
+    PassVisibility shadowMatchVisibility_;
+    PassVisibility shadowOverrideVisibility_;
+    BranchPassDraws cameraBranchDraws_;
+    BranchPassDraws shadowBranchDraws_;
+    bool shareBranchDraws_ = true;
+    bool showShadowFactor_ = false;
+    ComPtr<ID3D12CommandSignature> branchCommandSignature_;
+    ComPtr<ID3D12Resource> branchArgumentBuffer_;
     GpuMesh ground_;
     ComPtr<ID3D12DescriptorHeap> textureHeap_;
     std::vector<ComPtr<ID3D12Resource>> textures_;
@@ -145,6 +251,9 @@ private:
     D3D12_RECT scissor_{};
     ComPtr<ID3D12QueryHeap> timestampQueries_;
     ComPtr<ID3D12Resource> timestampReadback_;
+    ComPtr<ID3D12Resource> frameColorReadback_;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT frameColorLayout_{};
+    UINT64 frameColorBytes_ = 0;
     UINT64 timestampFrequency_ = 0;
     ComPtr<ID3D12RootSignature> hudRoot_;
     ComPtr<ID3D12PipelineState> hudPipeline_;

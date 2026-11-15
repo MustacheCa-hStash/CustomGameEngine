@@ -1,19 +1,24 @@
 #pragma once
 
-#include "MeshData.h"
+#include "FixedLod.h"
 
 #include <array>
 #include <filesystem>
 #include <memory>
 #include <span>
 
-enum class SceneKind { Cube, Oak, ModeledOak, Grove, OakBranch, Imported };
+enum class SceneKind { Cube, Oak, ModeledOak, Grove, OakBranch, OakBranchGrid, Imported };
 inline constexpr std::array sceneKinds{SceneKind::Cube, SceneKind::Oak, SceneKind::ModeledOak, SceneKind::Grove,
-                                      SceneKind::OakBranch, SceneKind::Imported};
+                                      SceneKind::OakBranch, SceneKind::OakBranchGrid, SceneKind::Imported};
+inline constexpr bool isOakBranchScene(SceneKind kind)
+{
+    return kind == SceneKind::OakBranch || kind == SceneKind::OakBranchGrid;
+}
 const char* sceneName(SceneKind kind);
-enum class CameraPreset { Overview, CloseUp, UnderCanopy };
+enum class CameraPreset { Overview, CloseUp, UnderCanopy, Distant };
 
 inline constexpr std::array<unsigned, 4> groveCounts{1, 25, 100, 400};
+inline constexpr int branchGridSide = 5;
 inline constexpr float maxWindStrength = 2.0f;
 
 struct CameraView
@@ -22,6 +27,9 @@ struct CameraView
     float yaw;
     float pitch;
     float distance;
+
+    DirectX::XMFLOAT3 eye() const;
+    DirectX::XMFLOAT4X4 matrix() const;
 };
 
 struct SceneObject
@@ -29,6 +37,8 @@ struct SceneObject
     unsigned id;
     // X/Z translation, yaw in radians, and uniform scale.
     DirectX::XMFLOAT4 placement;
+
+    DirectX::XMMATRIX placementMatrix() const;
 };
 
 struct ShadowBiasSettings
@@ -47,6 +57,30 @@ struct MeshShadows
 {
     bool cast = true;
     bool receive = true;
+};
+
+inline constexpr int sourceBranchLod = -1;
+inline constexpr int automaticBranchLod = -2;
+inline constexpr int matchCameraShadowLod = -1;
+
+struct BranchLodSelection
+{
+    struct TestCounts
+    {
+        unsigned instances = 0;
+        unsigned acceptedInstances = 0;
+        std::size_t groups = 0;
+    };
+
+    static constexpr float defaultFarPixelLimit = 1.7f;
+    static constexpr float defaultProxyPixelLimit = 1.2f;
+    float farPixelLimit = defaultFarPixelLimit;
+    float proxyPixelLimit = defaultProxyPixelLimit;
+    bool frozen = false;
+    bool indirectDraws = true;
+    bool useInstanceBounds = true;
+    std::vector<std::size_t> groupLevels;
+    TestCounts tests;
 };
 
 struct ViewerScene
@@ -68,8 +102,22 @@ struct ViewerScene
     bool windPaused = false;
     bool foliage = false;
     unsigned treeCount = 100;
+    std::shared_ptr<const FixedLod> fixedLod;
+    std::string fixedLodStatus;
+    int branchLod = sourceBranchLod;
+    BranchLodSelection branchLodSelection;
+    bool branchFrustumCulling = false;
+    int branchShadowLod = matchCameraShadowLod;
+    bool shadowLodOffCameraOnly = false;
+    bool showShadowFactor = false;
+    FixedLodTint lodTint = FixedLodTint::Shaded;
+    int inspectedLodGroup = 0;
+    int inspectedLodInstance = 0;
+    bool highlightLodGroup = false;
 
     const char* name() const;
+    unsigned instanceCount() const;
+    void setBranchGrid(int side);
     DirectX::XMFLOAT3 sunDirection() const;
     CameraView cameraView(CameraPreset preset) const;
     float farPlane() const;

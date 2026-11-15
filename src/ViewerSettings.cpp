@@ -70,6 +70,7 @@ Scope scopeFor(const ViewerScene& scene)
     case SceneKind::ModeledOak: return {"scene.modeled_oak", "asset.modeled_oak"};
     case SceneKind::Grove: return {"scene.grove", "asset.oak"};
     case SceneKind::OakBranch: return {"scene.oak_branch", "asset.oak_branch"};
+    case SceneKind::OakBranchGrid: return {"scene.oak_branch_grid", "asset.oak_branch"};
     case SceneKind::Imported:
     {
         std::error_code error;

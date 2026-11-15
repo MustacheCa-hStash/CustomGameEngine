@@ -65,7 +65,7 @@ Direct3D adds both draw terms and caps the positive sum at **0.002 normalized li
 
 Use **Mesh → Cast shadows** to include that mesh in the shadow map, and **Receive shadows** to control whether its shading samples the map. Bark and foliage have separate settings. A Grove setting applies to that mesh on every tree in the scene. Ground starts with casting off and receiving on. The camera's MSAA toggle changes camera edge sampling while the shadow map stays single-sample.
 
-The build copies both sample GLBs into the `assets` folder alongside the executable. Use `--oak` to start in the named Oak scene. A GLB path opens a separate Imported GLB scene:
+The build copies the sample GLBs into the `assets` folder alongside the executable. Use `--oak` to start in the named Oak scene. A GLB path opens a separate Imported GLB scene:
 
 ```powershell
 .\build\Debug\CustomGameEngine.exe ".\assets\LowBranchedWhiteOakLOD0.glb"
@@ -92,6 +92,28 @@ Use a self-contained glTF 2.0 binary with uncompressed static triangle meshes, p
 The build finds DXC in the selected Windows SDK and compiles the shaders. The shader bytecode is embedded in the executable. If you use a separate DXC installation, pass `-DDXC_EXECUTABLE=<path-to-dxc.exe>` at configure time. The GLB parser is [cgltf v1.15](https://github.com/jkuhlmann/cgltf/releases/tag/v1.15). The inspector uses [Dear ImGui v1.92.5](https://github.com/ocornut/imgui/releases/tag/v1.92.5) with its Win32 and D3D12 backends. Both dependencies are vendored with their license notices.
 
 ## Blender sources
+
+### Checkpoint 12B. Card Oak and Modeled Oak
+
+Select **Card Oak** or **Modeled Oak** in the Scene menu. `--oak` still opens Card Oak, and `--modeled-oak` starts directly in Modeled Oak. The scenes share the same Overview, Close-up, and Under canopy framing. Card Oak retains its existing settings and shares materials with Grove. Modeled Oak has its own scene and material settings.
+
+Modeled Oak has 5,297,600 leaf triangles and 425,778 bark triangles. Its full-detail GLB is about 212 MiB. It uses the existing indexed renderer for camera and shadow draws. The export keeps the bark albedo and uses the same flat leaf color and editable backlighting as Oak Branch.
+
+For comparison, choose the same preset in each scene and match sun angles, MSAA, and shadow settings. Set wind strength to zero for an exact still comparison. Treat the initial comparison as geometry plus material because Card Oak uses baked crown textures. Compare silhouettes and visible gaps in Overview, leaf edges and overlap in Close-up, and branch visibility and transmission in Under canopy. Then orbit slowly with MSAA off and at 4× to compare shimmer. Record GPU frame time after the HUD settles at the same resolution and camera preset.
+
+The full-tree Blender source is `FirstSettlers/ArtSource/WoodlandEdgeHighPoly/LowBranchedWhiteOak.blend`. To regenerate the full-tree GLB, use the command below with that source and `assets/LowBranchedWhiteOak-Modeled.glb` as the output.
+
+### Checkpoint 12A. Modeled oak branch
+
+Select **Oak Branch** from the viewer's **Scene** menu, or launch `build\Debug\CustomGameEngine.exe --branch` to start there. The branch saves settings under `[scene.oak_branch]` and `[asset.oak_branch.material.<name>]`. Use **Close-up** or **Under canopy**, pause wind with **P**, and inspect the separate bark and modeled-leaf meshes. In the leaf **Material** view, adjust **Backlighting** or reload a change to the transmission term in `Mesh.hlsl`. The leaves cast shadows from their geometry.
+
+The export contains 9,888 bark triangles and 123,200 leaf triangles. It places the bottom of the bark at ground level, embeds the bark albedo, and substitutes a flat green texture for Blender's procedural leaf shading. The current viewer uses a scalar diffuse-transmission factor for backlighting. Procedural color variation, bump, and Blender's lighting setup are outside this comparison.
+
+To regenerate the GLB from the project directory with Blender 5:
+
+```powershell
+& 'C:\Program Files\Blender Foundation\Blender 5.0\blender.exe' -b ..\FirstSettlers\ArtSource\WoodlandEdgeHighPoly\LowBranchedWhiteOak-SingleBranch.blend --python-exit-code 1 --python Tools\ExportOakBranch.py -- assets\LowBranchedWhiteOak-SingleBranch.glb
+```
 
 - The [cube project](assets/source/cube.blend) is the editable source for `assets/cube.glb`. It was recreated from the original Blender export script and produces an identical GLB.
 - The [low-branched white oak LOD0 project](../FirstSettlers/ArtSource/WoodlandEdgeLOD0/LowBranchedWhiteOak/LowBranchedWhiteOakLOD0.blend) lives in the FirstSettlers art repository with its textures packed. The engine GLB uses the original 4,192 triangles and UVs. Its materials embed `BarkAlbedo.png` and a 2048 × 2048 export of `CrownAlbedoBase.png` with its alpha channel. The foliage uses the FirstSettlers material's 0.30 cutoff and renders on both sides.

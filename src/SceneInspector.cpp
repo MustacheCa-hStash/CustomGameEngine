@@ -16,6 +16,22 @@ void showVector(const char* label, const DirectX::XMFLOAT3& value)
     ImGui::Text("%s  %.2f, %.2f, %.2f", label, value.x, value.y, value.z);
 }
 
+void showMeshIcon()
+{
+    const float lineHeight = ImGui::GetTextLineHeight();
+    const float size = lineHeight * 0.72f;
+    const ImVec2 cursor = ImGui::GetCursorScreenPos();
+    const ImVec2 topLeft(cursor.x, cursor.y + (lineHeight - size) * 0.5f);
+    const ImVec2 bottomRight(topLeft.x + size, topLeft.y + size);
+    const ImU32 color = ImGui::GetColorU32(ImGuiCol_CheckMark);
+    auto* draw = ImGui::GetWindowDrawList();
+    draw->AddRect(topLeft, bottomRight, color);
+    draw->AddLine(topLeft, bottomRight, color);
+    draw->AddLine(ImVec2(bottomRight.x, topLeft.y),
+                  ImVec2(topLeft.x + size * 0.5f, topLeft.y + size * 0.5f), color);
+    ImGui::Dummy(ImVec2(size, lineHeight));
+}
+
 bool inspectShadowBias(ShadowBiasSettings& bias, const D3D12Renderer& renderer)
 {
     constexpr auto sliderFlags = ImGuiSliderFlags_AlwaysClamp;
@@ -182,11 +198,10 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
         {
             if (ImGui::BeginCombo("Scene", scene.name()))
             {
-                constexpr const char* names[] = {"Cube", "Oak", "Grove", "Imported GLB"};
-                for (int i = 0; i < (hasImportedScene ? 4 : 3); ++i)
+                for (const auto kind : sceneKinds)
                 {
-                    const auto kind = static_cast<SceneKind>(i);
-                    if (ImGui::Selectable(names[i], scene.kind == kind))
+                    if (kind == SceneKind::Imported && !hasImportedScene) continue;
+                    if (ImGui::Selectable(sceneName(kind), scene.kind == kind))
                     {
                         actions.scene = kind;
                     }
@@ -346,17 +361,28 @@ bool SceneInspector::inspect(ViewerScene& scene, const D3D12Renderer& renderer)
             }
         }
         const auto slots = ground_ ? std::span(&scene.ground, 1) : std::span(scene.asset->meshes);
+        ImGui::Spacing();
+        ImGui::SeparatorText("Meshes");
         for (std::size_t i = 0; i < slots.size(); ++i)
         {
             const auto& part = slots[i];
             const auto& slot = ground_ ? scene.groundMaterial : scene.asset->materials[part.material];
             ImGui::PushID(static_cast<int>(i));
-            if (ImGui::Selectable(part.name.c_str()))
+            const float iconX = ImGui::GetCursorPosX();
+            showMeshIcon();
+            ImGui::SameLine();
+            const float nameOffset = ImGui::GetCursorPosX() - iconX;
+            if (ImGui::Selectable(part.name.c_str(), ground_ || i == meshIndex_))
             {
                 if (!ground_) meshIndex_ = i;
                 page_ = Page::Mesh;
             }
-            ImGui::TextWrapped("Material  %s", slot.name.c_str());
+            ImGui::Indent(nameOffset);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ImGui::TextWrapped("Material: %s", slot.name.c_str());
+            ImGui::PopStyleColor();
+            ImGui::Unindent(nameOffset);
+            ImGui::Spacing();
             ImGui::PopID();
         }
         break;
@@ -374,9 +400,8 @@ bool SceneInspector::inspect(ViewerScene& scene, const D3D12Renderer& renderer)
         }
         ImGui::Text("Vertices  %zu   Triangles  %zu", mesh.vertices.size(), mesh.indices.size() / 3);
         ImGui::Text("UV sets  %s", mesh.uvMask == 3 ? "0, 1" : mesh.uvMask == 1 ? "0" : mesh.uvMask == 2 ? "1" : "None");
-        const auto bounds = meshBounds(std::span(&mesh, 1), false);
-        showVector("Local center", bounds.center);
-        showVector("Half extent", bounds.halfExtent);
+        showVector("Local center", mesh.localBounds.center);
+        showVector("Half extent", mesh.localBounds.halfExtent);
         showVector("Asset translation", {mesh.localToWorld._41, mesh.localToWorld._42, mesh.localToWorld._43});
         if (ImGui::Button("Inspect assigned material")) page_ = Page::Material;
         ImGui::TextWrapped("%s", material.name.c_str());
@@ -398,6 +423,9 @@ bool SceneInspector::inspect(ViewerScene& scene, const D3D12Renderer& renderer)
         {
             changed |= ImGui::SliderFloat("Alpha cutoff", &material.alphaCutoff, 0.0f, 1.0f, "%.2f",
                                           ImGuiSliderFlags_AlwaysClamp);
+        }
+        if (material.hasBacklighting)
+        {
             changed |= ImGui::SliderFloat("Backlighting", &material.transmission, 0.0f, 1.0f, "%.2f",
                                           ImGuiSliderFlags_AlwaysClamp);
         }

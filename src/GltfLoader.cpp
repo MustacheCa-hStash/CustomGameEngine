@@ -65,6 +65,8 @@ MeshData readPrimitive(const cgltf_primitive& primitive, const DirectX::XMFLOAT4
     mesh.localToWorld = localToWorld;
     mesh.uvMask = (texcoords[0] ? 1u : 0u) | (texcoords[1] ? 2u : 0u);
     mesh.vertices.resize(positions->count);
+    auto lower = DirectX::XMVectorReplicate(std::numeric_limits<float>::max());
+    auto upper = DirectX::XMVectorNegate(lower);
     for (std::size_t i = 0; i < mesh.vertices.size(); ++i)
     {
         auto& vertex = mesh.vertices[i];
@@ -75,6 +77,9 @@ MeshData readPrimitive(const cgltf_primitive& primitive, const DirectX::XMFLOAT4
             throw std::runtime_error("Could not read a position or normal. Use non-sparse vertex attributes.");
         }
         vertex.position = DirectX::XMFLOAT3(position);
+        const auto localPosition = DirectX::XMLoadFloat3(&vertex.position);
+        lower = DirectX::XMVectorMin(lower, localPosition);
+        upper = DirectX::XMVectorMax(upper, localPosition);
         vertex.normal = DirectX::XMFLOAT3(normal);
         for (std::size_t set = 0; set < std::size(texcoords); ++set)
         {
@@ -88,6 +93,10 @@ MeshData readPrimitive(const cgltf_primitive& primitive, const DirectX::XMFLOAT4
         }
     }
 
+    DirectX::XMStoreFloat3(&mesh.localBounds.center,
+                          DirectX::XMVectorScale(DirectX::XMVectorAdd(lower, upper), 0.5f));
+    DirectX::XMStoreFloat3(&mesh.localBounds.halfExtent,
+                          DirectX::XMVectorScale(DirectX::XMVectorSubtract(upper, lower), 0.5f));
     mesh.indices.resize(indexCount);
     if (!indices)
     {
@@ -116,6 +125,13 @@ MaterialData readMaterial(const cgltf_material& source, AssetData& asset)
         material.alphaCutoff = source.alpha_cutoff;
         // For this viewer, a two-sided cutout is treated as a thin surface.
         material.transmission = source.double_sided ? 0.25f : 0.0f;
+        material.hasBacklighting = true;
+    }
+    if (source.has_diffuse_transmission)
+    {
+        material.transmission = source.diffuse_transmission.diffuse_transmission_factor;
+        material.hasBacklighting = true;
+        material.twoSidedTransmission = source.double_sided;
     }
     if (!source.has_pbr_metallic_roughness)
     {

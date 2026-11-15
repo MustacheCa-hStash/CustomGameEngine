@@ -9,6 +9,7 @@ cbuffer DrawConstants : register(b0)
     float transmission;
     uint movesWithWind;
     uint receivesShadows;
+    int twoSidedNormalSign;
 };
 
 cbuffer FrameConstants : register(b1)
@@ -147,11 +148,17 @@ float sunVisibility(float4 lightPosition, float3 worldNormal, float normalToSun)
     return shadowMap.SampleCmpLevelZero(shadowSampler, uv, projected.z - shadowBias);
 }
 
-float4 PSMain(PixelInput input) : SV_Target
+float4 PSMain(PixelInput input, bool isFrontFace : SV_IsFrontFace) : SV_Target
 {
     float4 baseColor = sampleBaseColor(input.uv);
     applyCutout(baseColor.a);
     float3 worldNormal = normalize(input.worldNormal);
+    // For thin double-sided leaves, evaluate lighting from the visible side.
+    // A mirrored node reverses winding relative to its transformed normal.
+    if (twoSidedNormalSign != 0)
+    {
+        worldNormal *= (isFrontFace ? 1.0 : -1.0) * twoSidedNormalSign;
+    }
     float normalToSun = dot(worldNormal, toSun);
     float diffuse = saturate(normalToSun) + transmission * saturate(-normalToSun);
     float visibility = receivesShadows ? sunVisibility(input.lightPosition, worldNormal, normalToSun) : 1.0;

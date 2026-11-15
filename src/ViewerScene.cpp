@@ -66,18 +66,18 @@ MeshData makeGround(const ViewerScene& scene)
         {{ extent, 0.0f, -extent}, {0.0f, 1.0f, 0.0f}, {}},
     };
     ground.indices = {0, 1, 2, 0, 2, 3};
+    ground.localBounds = {{0.0f, 0.0f, 0.0f}, {extent, 0.0f, extent}};
     XMStoreFloat4x4(&ground.localToWorld, XMMatrixIdentity());
     return ground;
 }
-}
 
-Bounds meshBounds(std::span<const MeshData> meshes, bool worldSpace)
+Bounds assetBounds(std::span<const MeshData> meshes)
 {
     auto lower = XMVectorReplicate(std::numeric_limits<float>::max());
     auto upper = -lower;
     for (const auto& mesh : meshes)
     {
-        const auto world = worldSpace ? XMLoadFloat4x4(&mesh.localToWorld) : XMMatrixIdentity();
+        const auto world = XMLoadFloat4x4(&mesh.localToWorld);
         for (const auto& vertex : mesh.vertices)
         {
             const auto position = XMVector3TransformCoord(XMLoadFloat3(&vertex.position), world);
@@ -90,11 +90,17 @@ Bounds meshBounds(std::span<const MeshData> meshes, bool worldSpace)
     XMStoreFloat3(&bounds.halfExtent, (upper - lower) * 0.5f);
     return bounds;
 }
+}
+
+const char* sceneName(SceneKind kind)
+{
+    constexpr const char* names[] = {"Cube", "Card Oak", "Modeled Oak", "Grove", "Oak Branch", "Imported GLB"};
+    return names[static_cast<std::size_t>(kind)];
+}
 
 const char* ViewerScene::name() const
 {
-    constexpr const char* names[] = {"Cube", "Oak", "Grove", "Imported GLB"};
-    return names[static_cast<std::size_t>(kind)];
+    return sceneName(kind);
 }
 
 XMFLOAT3 ViewerScene::sunDirection() const
@@ -107,9 +113,10 @@ XMFLOAT3 ViewerScene::sunDirection() const
 
 CameraView ViewerScene::cameraView(CameraPreset preset) const
 {
-    const float radius = XMVectorGetX(XMVector3Length(XMLoadFloat3(&assetBounds.halfExtent)));
+    const auto& bounds = cameraBounds ? *cameraBounds : assetBounds;
+    const float radius = XMVectorGetX(XMVector3Length(XMLoadFloat3(&bounds.halfExtent)));
     const float distance = std::max(5.4f, radius * 2.9f);
-    const auto focus = distance > 5.4f ? assetBounds.center : XMFLOAT3{0.0f, 0.75f, 0.0f};
+    const auto focus = distance > 5.4f ? bounds.center : XMFLOAT3{0.0f, 0.75f, 0.0f};
     switch (preset)
     {
     case CameraPreset::CloseUp:
@@ -131,6 +138,15 @@ ViewerScenes::ViewerScenes(std::filesystem::path assetDirectory)
 {
 }
 
+std::filesystem::path ViewerScenes::sourcePath(SceneKind kind, const std::filesystem::path& importedPath) const
+{
+    if (kind == SceneKind::Imported) return importedPath;
+    if (kind == SceneKind::Cube) return assetDirectory_ / L"cube.glb";
+    if (kind == SceneKind::OakBranch) return assetDirectory_ / L"LowBranchedWhiteOak-SingleBranch.glb";
+    if (kind == SceneKind::ModeledOak) return assetDirectory_ / L"LowBranchedWhiteOak-Modeled.glb";
+    return assetDirectory_ / L"LowBranchedWhiteOakLOD0.glb";
+}
+
 ViewerScene& ViewerScenes::open(SceneKind kind, const std::filesystem::path& importedPath)
 {
     auto& entry = scenes_[static_cast<std::size_t>(kind)];
@@ -142,8 +158,7 @@ ViewerScene& ViewerScenes::open(SceneKind kind, const std::filesystem::path& imp
     ViewerScene scene{};
     scene.kind = kind;
     const bool usesOak = kind == SceneKind::Oak || kind == SceneKind::Grove;
-    scene.source = kind == SceneKind::Imported ? importedPath :
-        assetDirectory_ / (usesOak ? L"LowBranchedWhiteOakLOD0.glb" : L"cube.glb");
+    scene.source = sourcePath(kind, importedPath);
     if (usesOak && oak_)
     {
         scene.asset = oak_;
@@ -157,9 +172,22 @@ ViewerScene& ViewerScenes::open(SceneKind kind, const std::filesystem::path& imp
         }
     }
     scene.meshShadows.resize(scene.asset->meshes.size());
-    scene.assetBounds = meshBounds(scene.asset->meshes, true);
+    scene.assetBounds = assetBounds(scene.asset->meshes);
+    if (usesOak)
+    {
+        cardOakBounds_ = scene.assetBounds;
+    }
+    if (kind == SceneKind::ModeledOak)
+    {
+        if (!cardOakBounds_)
+        {
+            const auto cardOak = loadGlb(sourcePath(SceneKind::Oak, {}));
+            cardOakBounds_ = assetBounds(cardOak.meshes);
+        }
+        scene.cameraBounds = cardOakBounds_;
+    }
     scene.foliage = std::any_of(scene.asset->materials.begin(), scene.asset->materials.end(),
-                                [](const MaterialData& material) { return material.transmission > 0.0f; });
+                                [](const MaterialData& material) { return material.hasBacklighting; });
     scene.objects.push_back({1, {0.0f, 0.0f, 0.0f, 1.0f}});
     if (kind == SceneKind::Grove)
     {

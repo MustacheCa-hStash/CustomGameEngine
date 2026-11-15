@@ -7,17 +7,14 @@
 #include <memory>
 #include <span>
 
-enum class SceneKind { Cube, Oak, Grove, Imported };
+enum class SceneKind { Cube, Oak, ModeledOak, Grove, OakBranch, Imported };
+inline constexpr std::array sceneKinds{SceneKind::Cube, SceneKind::Oak, SceneKind::ModeledOak, SceneKind::Grove,
+                                      SceneKind::OakBranch, SceneKind::Imported};
+const char* sceneName(SceneKind kind);
 enum class CameraPreset { Overview, CloseUp, UnderCanopy };
 
 inline constexpr std::array<unsigned, 4> groveCounts{1, 25, 100, 400};
 inline constexpr float maxWindStrength = 2.0f;
-
-struct Bounds
-{
-    DirectX::XMFLOAT3 center;
-    DirectX::XMFLOAT3 halfExtent;
-};
 
 struct CameraView
 {
@@ -59,6 +56,7 @@ struct ViewerScene
     std::shared_ptr<AssetData> asset;
     std::vector<SceneObject> objects;
     Bounds assetBounds;
+    std::optional<Bounds> cameraBounds;
     MeshData ground;
     MaterialData groundMaterial;
     ShadowBiasSettings shadowBias;
@@ -81,12 +79,13 @@ class ViewerScenes
 {
 public:
     explicit ViewerScenes(std::filesystem::path assetDirectory);
+    std::filesystem::path sourcePath(SceneKind kind, const std::filesystem::path& importedPath) const;
     ViewerScene& open(SceneKind kind, const std::filesystem::path& importedPath = {});
 
 private:
     std::filesystem::path assetDirectory_;
-    std::array<std::optional<ViewerScene>, 4> scenes_;
+    std::array<std::optional<ViewerScene>, sceneKinds.size()> scenes_;
     std::shared_ptr<AssetData> oak_;
+    std::optional<Bounds> cardOakBounds_;
 };
 
-Bounds meshBounds(std::span<const MeshData> meshes, bool worldSpace);

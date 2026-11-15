@@ -67,7 +67,9 @@ Scope scopeFor(const ViewerScene& scene)
     {
     case SceneKind::Cube: return {"scene.cube", "asset.cube"};
     case SceneKind::Oak: return {"scene.oak", "asset.oak"};
+    case SceneKind::ModeledOak: return {"scene.modeled_oak", "asset.modeled_oak"};
     case SceneKind::Grove: return {"scene.grove", "asset.oak"};
+    case SceneKind::OakBranch: return {"scene.oak_branch", "asset.oak_branch"};
     case SceneKind::Imported:
     {
         std::error_code error;
@@ -143,6 +145,9 @@ void writeMaterial(Fields& fields, const MaterialData& material)
     if (material.alphaCutoff >= 0.0f)
     {
         fields["alpha_cutoff"] = formatNumber(material.alphaCutoff);
+    }
+    if (material.hasBacklighting)
+    {
         fields["backlighting"] = formatNumber(material.transmission);
     }
 }
@@ -159,6 +164,9 @@ void readMaterial(const Sections& sections, const std::string& section, Material
     if (material.alphaCutoff >= 0.0f)
     {
         material.alphaCutoff = read("alpha_cutoff", material.alphaCutoff);
+    }
+    if (material.hasBacklighting)
+    {
         material.transmission = read("backlighting", material.transmission);
     }
 }

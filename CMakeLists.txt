@@ -84,6 +84,8 @@ add_custom_target(viewer_assets
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/cube.glb"
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/LowBranchedWhiteOakLOD0.glb"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/LowBranchedWhiteOak-SingleBranch.glb"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/LowBranchedWhiteOak-Modeled.glb"
         "$<TARGET_FILE_DIR:CustomGameEngine>/assets"
     VERBATIM
 )

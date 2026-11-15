@@ -14,12 +14,19 @@ struct Vertex
     DirectX::XMFLOAT2 texcoords[2];
 };
 
+struct Bounds
+{
+    DirectX::XMFLOAT3 center;
+    DirectX::XMFLOAT3 halfExtent;
+};
+
 struct MeshData
 {
     std::string name;
     std::vector<Vertex> vertices;
     std::vector<std::uint32_t> indices;
     DirectX::XMFLOAT4X4 localToWorld;
+    Bounds localBounds{};
     std::size_t material = 0;
     std::uint32_t uvMask = 0;
 };
@@ -32,6 +39,8 @@ struct MaterialData
     std::uint32_t textureCoordinateSet = 0;
     float alphaCutoff = -1.0f;
     float transmission = 0.0f;
+    bool hasBacklighting = false;
+    bool twoSidedTransmission = false;
 };
 
 struct TextureMip

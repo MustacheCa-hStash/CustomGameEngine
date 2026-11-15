@@ -45,6 +45,7 @@ struct DrawConstants
     float transmission;
     UINT movesWithWind;
     UINT receivesShadows;
+    int twoSidedNormalSign;
 };
 
 struct FrameConstants
@@ -60,7 +61,7 @@ struct FrameConstants
 };
 
 constexpr UINT drawConstantCount = sizeof(DrawConstants) / sizeof(float);
-static_assert(drawConstantCount == 42);
+static_assert(drawConstantCount == 43);
 static_assert(sizeof(FrameConstants) == 164);
 static_assert(offsetof(FrameConstants, normalBiasWorld) == 160);
 static_assert(sizeof(FrameConstants) <= D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -515,6 +516,8 @@ void D3D12Renderer::createMeshPipelineLayout()
     description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    // glTF front faces are counterclockwise in our right-handed camera.
+    description.RasterizerState.FrontCounterClockwise = TRUE;
     description.RasterizerState.DepthClipEnable = TRUE;
     description.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     description.DepthStencilState.DepthEnable = TRUE;
@@ -721,7 +724,9 @@ D3D12Renderer::GpuMesh D3D12Renderer::uploadMesh(const MeshData& mesh)
     gpu.indexCount = static_cast<UINT>(mesh.indices.size());
     gpu.localToWorld = mesh.localToWorld;
     const auto world = XMLoadFloat4x4(&mesh.localToWorld);
-    XMStoreFloat4x4(&gpu.normalToWorld, XMMatrixTranspose(XMMatrixInverse(nullptr, world)));
+    XMVECTOR determinant;
+    XMStoreFloat4x4(&gpu.normalToWorld, XMMatrixTranspose(XMMatrixInverse(&determinant, world)));
+    gpu.mirrored = XMVectorGetX(determinant) < 0.0f;
     gpu.material = mesh.material;
     return gpu;
 }
@@ -921,6 +926,10 @@ void D3D12Renderer::drawMesh(const GpuMesh& mesh, const MaterialData& material, 
     constants.transmission = material.transmission;
     constants.movesWithWind = wind;
     constants.receivesShadows = receiveShadows;
+    if (material.twoSidedTransmission)
+    {
+        constants.twoSidedNormalSign = mesh.mirrored ? -1 : 1;
+    }
     commands_->SetGraphicsRoot32BitConstants(0, drawConstantCount, &constants, 0);
     auto texture = textureHeap_->GetGPUDescriptorHandleForHeapStart();
     const auto index = material.colorTexture ? *material.colorTexture + 1 : 0;

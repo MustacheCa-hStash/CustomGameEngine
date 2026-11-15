@@ -270,13 +270,15 @@ LaunchOptions launchOptions()
     }
     if (count > 2)
     {
-        throw std::runtime_error("Usage: CustomGameEngine.exe [--oak | --grove | path-to-mesh.glb | --reset-settings]");
+        throw std::runtime_error("Usage: CustomGameEngine.exe [--oak | --modeled-oak | --grove | --branch | path-to-mesh.glb | --reset-settings]");
     }
     if (count == 2)
     {
         const std::wstring_view option = arguments.get()[1];
         if (option == L"--grove") return {SceneKind::Grove, {}};
         if (option == L"--oak") return {SceneKind::Oak, {}};
+        if (option == L"--modeled-oak") return {SceneKind::ModeledOak, {}};
+        if (option == L"--branch") return {SceneKind::OakBranch, {}};
         if (option == L"--reset-settings") return {SceneKind::Cube, {}, true};
         return {SceneKind::Imported, arguments.get()[1]};
     }
@@ -330,9 +332,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
             if (!settings.save()) throw std::runtime_error(settings.error());
         }
         const auto directory = assetDirectory();
-        assetPath = launch.kind == SceneKind::Imported ? launch.imported :
-            directory / (launch.kind == SceneKind::Cube ? L"cube.glb" : L"LowBranchedWhiteOakLOD0.glb");
         ViewerScenes scenes(directory);
+        assetPath = scenes.sourcePath(launch.kind, launch.imported);
         auto* scene = &scenes.open(launch.kind, launch.imported);
         settings.apply(*scene);
         window = createWindow(instance, camera);

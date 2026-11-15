@@ -61,6 +61,7 @@ private:
         UINT indexCount;
         DirectX::XMFLOAT4X4 localToWorld;
         DirectX::XMFLOAT4X4 normalToWorld;
+        bool mirrored;
         std::size_t material;
     };
 

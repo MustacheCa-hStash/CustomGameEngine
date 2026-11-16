@@ -1,8 +1,10 @@
 #include "ViewerScene.h"
 
 #include "GltfLoader.h"
+#include "SourceFingerprint.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <random>
@@ -91,11 +93,43 @@ Bounds assetBounds(std::span<const MeshData> meshes)
     XMStoreFloat3(&bounds.halfExtent, (upper - lower) * 0.5f);
     return bounds;
 }
+
+auto loadBranchVoxelRegions(const ViewerScene& scene, const std::filesystem::path& file, const std::filesystem::path& mask)
+{
+    const auto& voxels = *scene.branchVoxels[automaticBranchVoxelIndex];
+    const auto& normals = *scene.branchVoxelNormals[automaticBranchVoxelIndex];
+    const auto owners = readVoxelRegionOwners(file, sourceFingerprint(mask), sourceFingerprint(fixedLodPath(scene.source)),
+                                              occupiedVoxelCount(voxels));
+    auto regions = std::make_shared<std::array<BranchVoxelRegion, voxelBranchRegionCount>>();
+    for (auto& region : *regions)
+    {
+        region.foliage = {voxels.sourceFingerprint, voxels.meshIndex, voxels.origin, voxels.cellSize, {}};
+        region.normals.hasDirectionalWeights = normals.hasDirectionalWeights;
+        region.normals.hasShadowReceivers = normals.hasShadowReceivers;
+    }
+    std::size_t cell = 0;
+    for (const auto& brick : voxels.bricks)
+    {
+        std::array<std::uint64_t, voxelBranchRegionCount> masks{};
+        for (auto bits = brick.occupancy; bits; bits &= bits - 1)
+        {
+            const auto owner = owners[cell];
+            masks[owner] |= std::uint64_t{1} << std::countr_zero(bits);
+            (*regions)[owner].normals.cells.push_back(normals.cells[cell++]);
+        }
+        for (std::size_t i = 0; i < regions->size(); ++i)
+            if (masks[i]) (*regions)[i].foliage.bricks.push_back({brick.coordinate, masks[i]});
+    }
+    for (const auto& region : *regions)
+        if (region.foliage.bricks.empty()) throw std::runtime_error("The region bake contains an empty voxel region.");
+    return regions;
+}
 }
 
 const char* sceneName(SceneKind kind)
 {
-    constexpr std::array names{"Cube", "Card Oak", "Modeled Oak", "Grove", "Oak Branch", "Oak Branch Grid", "Imported GLB"};
+    constexpr std::array names{"Cube", "Card Oak", "Modeled Oak", "Modeled Oak Walk", "Grove", "Oak Branch", "Oak Branch Grid", "Oak Branch Orbit",
+                               "Oak Branch Transition", "Imported GLB"};
     static_assert(names.size() == sceneKinds.size());
     return names[static_cast<std::size_t>(kind)];
 }
@@ -110,9 +144,18 @@ unsigned ViewerScene::instanceCount() const
     return kind == SceneKind::Grove ? treeCount : static_cast<unsigned>(objects.size());
 }
 
+bool ViewerScene::hasAutomaticBranchVoxels() const
+{
+    return fixedLod && fixedLod->levels.size() == fixedLodLevelCount &&
+           branchVoxelCoverageOptimized[automaticBranchVoxelIndex] && branchVoxels[automaticBranchVoxelIndex] &&
+           branchVoxelNormals[automaticBranchVoxelIndex];
+}
+
 void ViewerScene::setBranchGrid(int side)
 {
     objects.clear();
+    branchLodSelection.groupLevels.clear();
+    branchLodSelection.voxelCut.clear();
     const int radius = side / 2;
     for (int z = -radius; z <= radius; ++z)
     {
@@ -148,6 +191,26 @@ XMFLOAT4X4 CameraView::matrix() const
     return result;
 }
 
+CameraView oakWalkView(OakWalkRoute route, float seconds)
+{
+    const float elapsed = std::clamp(seconds, 0.0f, oakWalkDuration(route));
+    if (route == OakWalkRoute::Circle)
+    {
+        const float yaw = elapsed == oakWalkDuration(route) ? 0.0f : elapsed * oakWalkSpeed / oakWalkRadius;
+        return {{0.0f, oakWalkEyeHeight, 0.0f}, yaw, 0.0f, oakWalkRadius};
+    }
+
+    const float distance = oakWalkStart - elapsed * oakWalkSpeed;
+    const auto glance = [elapsed](float start, float duration) {
+        const float phase = std::clamp((elapsed - start) / duration, 0.0f, 1.0f);
+        const float s = std::sin(XM_PI * phase);
+        return s * s;
+    };
+    const float yaw = XMConvertToRadians(31.0f) * (glance(18.0f, 7.0f) - glance(26.0f, 7.0f));
+    // CameraView uses the backward axis, so place its look point one unit ahead of the eye.
+    return {{-std::sin(yaw), oakWalkEyeHeight, distance - std::cos(yaw)}, yaw, 0.0f, 1.0f};
+}
+
 XMFLOAT3 ViewerScene::sunDirection() const
 {
     const float azimuth = XMConvertToRadians(sunAzimuth);
@@ -180,9 +243,26 @@ CameraView ViewerScene::cameraView(CameraPreset preset) const
     }
 }
 
+CameraView ViewerScene::branchOrbitView(float elapsedSeconds, float distance) const
+{
+    struct Angle { float yaw, pitch; };
+    constexpr Angle path[]{{-125, 68}, {-60, 34}, {32, 8}, {71, 61}, {145, 24}, {235, 68}};
+    const float fraction = std::clamp(elapsedSeconds / branchOrbitDuration, 0.0f, 1.0f);
+    const float yaw = std::lerp(path[0].yaw, path[std::size(path) - 1].yaw, fraction);
+    const auto* end = std::end(path);
+    const auto* next = std::upper_bound(std::begin(path) + 1, end - 1, yaw,
+                                       [](float angle, const Angle& key) { return angle < key.yaw; });
+    const auto& from = next[-1];
+    const auto& to = *next;
+    const float t = (yaw - from.yaw) / (to.yaw - from.yaw);
+    const float pitch = std::lerp(from.pitch, to.pitch, t * t * (3.0f - 2.0f * t));
+    const float viewYaw = fraction == 1.0f ? path[0].yaw : yaw;
+    return {assetBounds.center, XMConvertToRadians(viewYaw), XMConvertToRadians(pitch), distance};
+}
+
 float ViewerScene::farPlane() const
 {
-    const float overviewFar = std::max(100.0f, cameraView(CameraPreset::Overview).distance * 10.0f);
+    const float overviewFar = std::max({100.0f, minimumFarPlane, cameraView(CameraPreset::Overview).distance * 10.0f});
     if (isOakBranchScene(kind)) return std::max(overviewFar, cameraView(CameraPreset::Distant).distance * 1.1f);
     return overviewFar;
 }
@@ -197,7 +277,8 @@ std::filesystem::path ViewerScenes::sourcePath(SceneKind kind, const std::filesy
     if (kind == SceneKind::Imported) return importedPath;
     if (kind == SceneKind::Cube) return assetDirectory_ / L"cube.glb";
     if (isOakBranchScene(kind)) return assetDirectory_ / L"LowBranchedWhiteOak-SingleBranch.glb";
-    if (kind == SceneKind::ModeledOak) return assetDirectory_ / L"LowBranchedWhiteOak-Modeled.glb";
+    if (kind == SceneKind::ModeledOak || kind == SceneKind::ModeledOakWalk)
+        return assetDirectory_ / L"LowBranchedWhiteOak-Modeled.glb";
     return assetDirectory_ / L"LowBranchedWhiteOakLOD0.glb";
 }
 
@@ -212,15 +293,21 @@ ViewerScene& ViewerScenes::open(SceneKind kind, const std::filesystem::path& imp
     ViewerScene scene{};
     scene.kind = kind;
     const bool usesOak = kind == SceneKind::Oak || kind == SceneKind::Grove;
+    const bool usesModeledOak = kind == SceneKind::ModeledOak || kind == SceneKind::ModeledOakWalk;
     scene.source = sourcePath(kind, importedPath);
-    if (kind == SceneKind::OakBranchGrid)
+    if (isOakBranchScene(kind) && kind != SceneKind::OakBranch)
     {
         const auto& branch = open(SceneKind::OakBranch);
         scene.asset = branch.asset;
         scene.fixedLod = branch.fixedLod;
         scene.fixedLodStatus = branch.fixedLodStatus;
+        scene.branchVoxels = branch.branchVoxels;
+        scene.branchVoxelNormals = branch.branchVoxelNormals;
+        scene.branchVoxelCoverageOptimized = branch.branchVoxelCoverageOptimized;
+        scene.branchVoxelRegions = branch.branchVoxelRegions;
+        scene.branchVoxelStatus = branch.branchVoxelStatus;
         scene.assetBounds = branch.assetBounds;
-        if (scene.fixedLod && scene.fixedLod->levels.size() == fixedLodLevelCount)
+        if (kind == SceneKind::OakBranchGrid && scene.fixedLod && scene.fixedLod->levels.size() == fixedLodLevelCount)
         {
             scene.branchLod = automaticBranchLod;
             scene.lodTint = FixedLodTint::Level;
@@ -230,6 +317,10 @@ ViewerScene& ViewerScenes::open(SceneKind kind, const std::filesystem::path& imp
     {
         scene.asset = oak_;
     }
+    else if (usesModeledOak && modeledOak_)
+    {
+        scene.asset = modeledOak_;
+    }
     else
     {
         scene.asset = std::make_shared<AssetData>(loadGlb(scene.source));
@@ -237,9 +328,10 @@ ViewerScene& ViewerScenes::open(SceneKind kind, const std::filesystem::path& imp
         {
             oak_ = scene.asset;
         }
+        if (usesModeledOak) modeledOak_ = scene.asset;
     }
     scene.meshShadows.resize(scene.asset->meshes.size());
-    if (kind == SceneKind::OakBranch)
+    if (kind == SceneKind::OakBranch || kind == SceneKind::ModeledOakWalk)
     {
         try
         {
@@ -249,8 +341,72 @@ ViewerScene& ViewerScenes::open(SceneKind kind, const std::filesystem::path& imp
         {
             scene.fixedLodStatus = error.what();
         }
+        if (kind == SceneKind::OakBranch && scene.fixedLod && scene.fixedLod->levels.size() == fixedLodLevelCount)
+        {
+            const auto fingerprint = fixedLodSourceFingerprint(scene.source);
+            constexpr std::array<const wchar_t*, branchVoxelBakeCount> extensions{
+                L".fine.voxels", L".coarse.voxels", L".sixteenth.voxels", L".eighth.voxels", L".quarter.voxels",
+                L".half.voxels"};
+            for (std::size_t i = 0; i < extensions.size(); ++i)
+            {
+                auto path = scene.source;
+                path.replace_extension(extensions[i]);
+                const auto reportBakeError = [&](const std::filesystem::path& candidate, const std::runtime_error& error) {
+                    if (!scene.branchVoxelStatus.empty()) scene.branchVoxelStatus += '\n';
+                    scene.branchVoxelStatus += candidate.filename().string() + " " + error.what();
+                };
+                const auto loadBake = [&](const std::filesystem::path& candidate) {
+                    try
+                    {
+                        auto data = readVoxelFoliage(candidate);
+                        if (data.sourceFingerprint != fingerprint || data.meshIndex != scene.fixedLod->meshIndex || data.bricks.empty())
+                            throw std::runtime_error("Voxel foliage bake does not match the branch mesh.");
+                        scene.branchVoxels[i] = std::make_shared<const VoxelFoliage>(std::move(data));
+                        return true;
+                    }
+                    catch (const std::runtime_error& error)
+                    {
+                        reportBakeError(candidate, error);
+                        return false;
+                    }
+                };
+                auto fitted = path;
+                fitted.replace_extension(L".coverage.voxels");
+                if (std::filesystem::exists(fitted) && loadBake(fitted))
+                    scene.branchVoxelCoverageOptimized[i] = true;
+                else
+                    loadBake(path);
+                auto normalPath = scene.branchVoxelCoverageOptimized[i] ? fitted : path;
+                normalPath.replace_extension(L".normals");
+                if (!scene.branchVoxels[i] || !std::filesystem::exists(normalPath)) continue;
+                try
+                {
+                    const auto& mask = scene.branchVoxelCoverageOptimized[i] ? fitted : path;
+                    auto normals = readVoxelNormals(normalPath, sourceFingerprint(mask), occupiedVoxelCount(*scene.branchVoxels[i]));
+                    scene.branchVoxelNormals[i] = std::make_shared<const VoxelNormalData>(std::move(normals));
+                }
+                catch (const std::runtime_error& error)
+                {
+                    reportBakeError(normalPath, error);
+                }
+            }
+            auto regionPath = scene.source;
+            regionPath.replace_extension(L".eighth.coverage.regions");
+            if (scene.hasAutomaticBranchVoxels() && scene.fixedLod->groups.size() >= voxelBranchRegionCount &&
+                std::filesystem::exists(regionPath))
+            {
+                auto mask = scene.source;
+                mask.replace_extension(L".eighth.coverage.voxels");
+                try { scene.branchVoxelRegions = loadBranchVoxelRegions(scene, regionPath, mask); }
+                catch (const std::runtime_error& error)
+                {
+                    if (!scene.branchVoxelStatus.empty()) scene.branchVoxelStatus += '\n';
+                    scene.branchVoxelStatus += regionPath.filename().string() + " " + error.what();
+                }
+            }
+        }
     }
-    if (kind != SceneKind::OakBranchGrid) scene.assetBounds = assetBounds(scene.asset->meshes);
+    if (!isOakBranchScene(kind) || kind == SceneKind::OakBranch) scene.assetBounds = assetBounds(scene.asset->meshes);
     if (usesOak)
     {
         cardOakBounds_ = scene.assetBounds;
@@ -278,6 +434,36 @@ ViewerScene& ViewerScenes::open(SceneKind kind, const std::filesystem::path& imp
         scene.objects.push_back({1, {0.0f, 0.0f, 0.0f, 1.0f}});
         if (kind == SceneKind::Grove) populateGrove(scene);
         scene.ground = makeGround(scene);
+    }
+    if (isBranchOrbitScene(kind))
+    {
+        scene.sunAzimuth = -100.0f;
+        scene.windPaused = true;
+        scene.branchVoxelView = scene.fixedLod && scene.fixedLod->levels.size() == fixedLodLevelCount
+            ? BranchVoxelView::Lod6 : BranchVoxelView::Off;
+        scene.branchAppearance = BranchAppearance::Coverage;
+    }
+    if (kind == SceneKind::OakBranchTransition)
+    {
+        if (scene.branchVoxelRegions) scene.branchVoxelView = BranchVoxelView::Regional;
+        else if (scene.hasAutomaticBranchVoxels()) scene.branchVoxelView = BranchVoxelView::Automatic;
+        scene.branchAppearance = BranchAppearance::Shaded;
+        scene.branchLod = automaticBranchLod;
+        scene.branchVoxelUseNormals = true;
+        scene.branchFrustumCulling = true;
+    }
+    if (kind == SceneKind::ModeledOakWalk)
+    {
+        scene.sunAzimuth = -100.0f;
+        scene.windStrength = 0.0f;
+        scene.windPaused = true;
+        scene.branchFrustumCulling = true;
+        scene.branchGroupFrustumCulling = true;
+        if (scene.fixedLod && scene.fixedLod->levels.size() == fixedLodLevelCount)
+        {
+            scene.branchLod = automaticBranchLod;
+            scene.branchShadowLod = static_cast<int>(fixedLodFarLevel);
+        }
     }
     scene.groundMaterial.name = "Ground";
     scene.groundMaterial.color = {0.30f, 0.36f, 0.30f, 1.0f};

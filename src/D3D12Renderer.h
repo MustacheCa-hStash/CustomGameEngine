@@ -26,7 +26,11 @@ public:
         std::uint64_t foliageTriangles = 0;
         unsigned foliageCalls = 0;
         unsigned visibleInstances = 0;
+        std::size_t foliageGroupsConsidered = 0;
+        std::size_t foliageGroupsVisible = 0;
         unsigned shadowLodOverrides = 0;
+        std::uint64_t voxelBricks = 0;
+        std::uint64_t proxyFoliageTriangles = 0;
     };
 
     struct FrameTiming
@@ -38,6 +42,7 @@ public:
         std::optional<double> gpuShadowMilliseconds;
         PassStats camera;
         PassStats shadow;
+        std::array<PassStats, sunCascadeSplits.size()> shadowCascades;
         double cpuBranchDrawListMilliseconds = 0;
     };
 
@@ -50,10 +55,12 @@ public:
     bool msaaEnabled() const;
     void toggleMsaa();
     void setScene(const ViewerScene& scene);
+    void updateCameraProjection(float nearPlane, float farPlane);
     void updateSun(const ViewerScene& scene);
     void reloadMeshShaders(MeshShaders shaders, const ShadowBiasSettings& bias);
     float shadowDepthPerTexel() const { return shadowDepthPerTexel_; }
     float shadowWorldUnitsPerTexel() const { return shadowWorldUnitsPerTexel_; }
+    const auto& sunCascadeTexelWidths() const { return cascadeWorldUnitsPerTexel_; }
     static constexpr float cameraVerticalFov = DirectX::XM_PIDIV4;
     DirectX::XMFLOAT2 viewportSize() const { return {viewport_.Width, viewport_.Height}; }
     float projectLodError(float localError, const Bounds& bounds,
@@ -66,7 +73,8 @@ public:
     FrameTiming drawFrame(const ViewerScene& scene, const DirectX::XMFLOAT4X4& view, float windPhase,
                           std::string_view hud,
                           const std::function<void(ID3D12GraphicsCommandList*)>& drawOverlay = {},
-                          std::vector<std::uint32_t>* capture = nullptr);
+                          std::vector<std::uint32_t>* capture = nullptr,
+                          const DirectX::XMFLOAT4X4* cascadeFitView = nullptr);
 
     ID3D12Device* device() const { return device_.Get(); }
     ID3D12CommandQueue* queue() const { return queue_.Get(); }
@@ -108,6 +116,18 @@ private:
         UINT indexCount = 0;
     };
 
+    struct PassVisibility;
+    struct GpuVoxelLevel
+    {
+        ComPtr<ID3D12Resource> bricks;
+        ComPtr<ID3D12Resource> normals;
+        bool hasDirectionalWeights = false;
+        bool hasShadowReceivers = false;
+        DirectX::XMFLOAT3 origin{};
+        float cellSize = 0;
+        UINT brickCount = 0;
+    };
+
     struct BranchDraw
     {
         UINT firstTriangle;
@@ -129,6 +149,7 @@ private:
 
         void clear();
         void add(UINT instance);
+        bool contains(UINT instance) const;
     };
 
     struct BranchPassDraws
@@ -138,21 +159,41 @@ private:
         std::optional<UINT64> argumentOffset;
     };
 
+    struct CascadeCasterDraws
+    {
+        PassVisibility instances;
+        PassVisibility sourceFoliage;
+        BranchPassDraws bakedFoliage;
+        std::size_t groupsConsidered = 0;
+        std::size_t groupsVisible = 0;
+    };
+
     struct BranchLodProjection
     {
         Bounds bounds;
         float farError;
         float proxyError;
+        float lockedRimError;
+        float rimError;
     };
 
     void createDepthBuffer(RenderMode& mode, D3D12_RESOURCE_DESC description);
     void createShadowMap();
+    void createCascadeShadowMaps();
+    ComPtr<ID3D12Resource> createShadowDepth(UINT16 slices);
+    void writeCascadeShadowView();
+    void updateShadowCascades(const DirectX::XMFLOAT4X4& view, const ViewerScene& scene);
     ComPtr<ID3D12Resource> createRenderTexture(const D3D12_RESOURCE_DESC& description,
                                                D3D12_RESOURCE_STATES initialState,
                                                const D3D12_CLEAR_VALUE& clear);
     void createMeshPipelineLayout();
     void createBranchCommandSignature();
-    static BranchLodProjection branchGroupProjection(const FixedLodGroup& group);
+    void createVoxelPipeline(bool enableMultisampling);
+    GpuVoxelLevel uploadVoxelLevel(const VoxelFoliage& foliage, const VoxelNormalData* normals);
+    void uploadBranchVoxels(const ViewerScene& scene);
+    void drawBranchVoxels(const ViewerScene& scene, const GpuVoxelLevel& level, DirectX::FXMMATRIX view,
+                          const PassVisibility& visibility, PassStats& stats, bool packPlacements, bool shadowPass = false);
+    static BranchLodProjection branchGroupProjection(const FixedLodGroup& group, bool fullCrown = false);
     static BranchLodProjection branchInstanceProjection(std::span<const BranchLodProjection> groups);
     BranchLodErrors projectBranchLodErrors(const BranchLodProjection& projection,
                                           const DirectX::XMFLOAT4X4& localToWorld,
@@ -172,12 +213,18 @@ private:
     ComPtr<ID3D12Resource> uploadBuffer(const void* data, std::size_t size);
     DirectX::XMFLOAT2 updateFrameConstants(const ViewerScene& scene, DirectX::FXMMATRIX viewProjection, float windPhase);
     void prepareVisibility(const ViewerScene& scene, DirectX::FXMMATRIX viewProjection, DirectX::XMFLOAT2 windOffset);
+    void prepareFoliageGroupVisibility(const ViewerScene& scene, DirectX::FXMMATRIX viewProjection, DirectX::XMFLOAT2 windOffset);
+    void prepareCascadeCasterDraws(const ViewerScene& scene, DirectX::XMFLOAT2 windOffset, std::size_t& argumentBytes);
     void prepareBranchDraws(const ViewerScene& scene, const PassVisibility& visibility, BranchPassDraws& pass,
-                            std::size_t& argumentBytes);
+                            std::size_t& argumentBytes, bool omitVoxelRegions = false,
+                            std::span<const std::uint8_t> visibleGroups = {}, int forcedLevel = automaticBranchLod,
+                            std::span<const int> instanceLevels = {});
     void copyFrameColor(ID3D12Resource* backBuffer);
     void readFrameColor(std::vector<std::uint32_t>& pixels);
     PassStats drawShadowMap(const ViewerScene& scene);
-    PassStats drawMeshes(const ViewerScene& scene, bool shadowPass);
+    PassStats drawCascadeShadowMaps(const ViewerScene& scene, std::array<PassStats, sunCascadeSplits.size()>& slices);
+    PassStats drawMeshes(const ViewerScene& scene, bool shadowPass, bool omitFoliage = false,
+                        const CascadeCasterDraws* cascade = nullptr);
     void bindMesh(const GpuMesh& mesh, const MaterialData& material, bool wind, bool receiveShadows,
                   const GpuFixedLodLevel* lod, FixedLodTint tint, UINT highlightedGroup, UINT lodLevel,
                   UINT firstTriangle);
@@ -200,14 +247,22 @@ private:
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, bufferCount> renderTargets_{};
     ComPtr<ID3D12DescriptorHeap> depthHeap_;
     ComPtr<ID3D12Resource> shadowMap_;
+    ComPtr<ID3D12Resource> cascadeShadowMap_;
     ComPtr<ID3D12PipelineState> shadowPipeline_;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC meshPipelineDescription_{};
     MeshShaders reloadedShaders_;
     int appliedConstantBias_ = 0;
     float appliedSlopeBias_ = 0.0f;
     D3D12_CPU_DESCRIPTOR_HANDLE shadowDepthTarget_{};
+    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, sunCascadeSplits.size()> cascadeDepthTargets_{};
+    D3D12_CPU_DESCRIPTOR_HANDLE cascadeShadowView_{};
     D3D12_GPU_DESCRIPTOR_HANDLE shadowTexture_{};
     DirectX::XMFLOAT4X4 lightViewProjection_;
+    DirectX::XMFLOAT4X4 sunRotation_;
+    DirectX::XMFLOAT2 cascadeCasterDepth_;
+    std::array<DirectX::XMFLOAT4X4, sunCascadeSplits.size()> cascadeViewProjections_;
+    std::array<float, sunCascadeSplits.size()> cascadeWorldUnitsPerTexel_{};
+    std::array<float, sunCascadeSplits.size()> cascadeDepthPerTexel_{};
     DirectX::XMFLOAT3 toSun_;
     float shadowDepthPerTexel_ = 0.0f;
     float shadowWorldUnitsPerTexel_ = 0.0f;
@@ -226,27 +281,59 @@ private:
     ComPtr<ID3D12Resource> instances_;
     D3D12_VERTEX_BUFFER_VIEW instanceView_{};
     std::shared_ptr<const AssetData> asset_;
+    std::shared_ptr<const FixedLod> fixedLodAsset_;
     std::vector<GpuMesh> meshes_;
     std::array<GpuFixedLodLevel, fixedLodLevelCount> fixedLodLevels_;
     ComPtr<ID3D12Resource> fixedLodProxyVertices_;
     std::vector<BranchLodProjection> branchGroupProjections_;
     BranchLodProjection branchInstanceProjection_{};
+    std::vector<Bounds> cascadeFoliageBlocks_;
+    float cascadeProxyError_ = 0;
     Bounds branchCullBounds_{};
+    Bounds voxelCullBounds_{};
     PassVisibility cameraVisibility_;
+    PassVisibility cameraTriangleBranches_;
+    PassVisibility cameraVoxelBranches_;
+    std::array<PassVisibility, voxelBranchRegionCount> cameraVoxelRegions_;
     PassVisibility shadowVisibility_;
     PassVisibility shadowMatchVisibility_;
     PassVisibility shadowOverrideVisibility_;
     BranchPassDraws cameraBranchDraws_;
+    std::vector<std::uint8_t> cameraGroupVisibility_;
+    std::size_t cameraGroupsConsidered_ = 0;
+    std::size_t cameraGroupsVisible_ = 0;
     BranchPassDraws shadowBranchDraws_;
+    std::array<CascadeCasterDraws, sunCascadeSplits.size()> cascadeCasterDraws_;
+    PassVisibility cascadeBakedVisibility_;
+    std::vector<int> cascadeInstanceLevels_;
+    std::vector<std::uint8_t> cascadeGroupVisibility_;
+    std::vector<std::uint8_t> cascadeInstanceFlags_;
     bool shareBranchDraws_ = true;
     bool showShadowFactor_ = false;
+    const GpuMesh* diagnosticFoliage_ = nullptr;
+    BranchAppearance branchAppearance_ = BranchAppearance::Shaded;
     ComPtr<ID3D12CommandSignature> branchCommandSignature_;
     ComPtr<ID3D12Resource> branchArgumentBuffer_;
+    std::array<GpuVoxelLevel, branchVoxelBakeCount> voxelLevels_;
+    std::array<GpuVoxelLevel, voxelBranchRegionCount> voxelRegionLevels_;
+    std::array<BranchLodProjection, voxelBranchRegionCount> voxelRegionProjections_;
+    std::vector<std::uint8_t> voxelGroupRegionBits_;
+    ComPtr<ID3D12Resource> voxelPlacements_;
+    std::size_t voxelDrawSlot_ = 0;
+    UINT voxelPlacementOffset_ = 0;
+    ComPtr<ID3D12RootSignature> voxelRoot_;
+    ComPtr<ID3D12PipelineState> voxelSingleSample_;
+    ComPtr<ID3D12PipelineState> voxelMultisample_;
+    ComPtr<ID3D12PipelineState> voxelShadowPipeline_;
+    ComPtr<ID3D12Resource> voxelConstants_;
+    ComPtr<ID3D12Resource> voxelBoxIndices_;
     GpuMesh ground_;
     ComPtr<ID3D12DescriptorHeap> textureHeap_;
     std::vector<ComPtr<ID3D12Resource>> textures_;
     UINT textureDescriptorSize_ = 0;
     DirectX::XMFLOAT4X4 projection_;
+    float cameraNearPlane_ = 0;
+    float cameraFarPlane_ = 0;
     D3D12_VIEWPORT viewport_{};
     D3D12_RECT scissor_{};
     ComPtr<ID3D12QueryHeap> timestampQueries_;

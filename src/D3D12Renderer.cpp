@@ -5,11 +5,15 @@
 #include "ShadowVS.h"
 #include "HudVS.h"
 #include "HudPS.h"
+#include "VoxelVS.h"
+#include "VoxelPS.h"
+#include "VoxelShadowPS.h"
 
 #include <d3d12sdklayers.h>
 #include <DirectXCollision.h>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -64,11 +68,66 @@ struct FrameConstants
     float windStart;
     float inverseWindHeight;
     float normalBiasWorld;
+    UINT useCascades;
+    UINT showCascadeColors;
+    UINT filterCascades;
+    XMFLOAT4 cascadeSplits;
+    std::array<XMFLOAT4X4, sunCascadeSplits.size()> cascadeViewProjections;
+    XMFLOAT4 cascadeShadowBias;
+    XMFLOAT4 cascadeNormalBias;
+    XMFLOAT4 cascadeBlendWidths;
+    XMFLOAT4 cascadeDepthPerTexel;
+    XMFLOAT4 lightRight;
 };
+
+struct VoxelFrameConstants
+{
+    XMFLOAT4X4 viewProjection;
+    XMFLOAT4X4 lightViewProjection;
+    XMFLOAT4X4 meshToAsset;
+    XMFLOAT4X4 assetToMesh;
+    XMFLOAT3 eye;
+    float nearPlane;
+    float farPlane;
+    float projectionZScale;
+    float projectionZOffset;
+    float shadowBias;
+    XMFLOAT3 baseColor;
+    UINT useNormals;
+    UINT viewMode;
+    UINT encodeColor;
+    UINT receivesShadows;
+    UINT mirrored;
+    XMFLOAT3 toSun;
+    float transmission;
+    UINT shadowReceiver;
+    UINT tightBrickProxies;
+};
+
+struct VoxelDrawConstants
+{
+    XMFLOAT3 origin;
+    float cellSize;
+    UINT brickCount;
+    UINT firstPlacement;
+};
+
+struct GpuVoxelBrick
+{
+    VoxelCoordinate coordinate;
+    std::array<std::uint32_t, 2> occupancy;
+    std::uint32_t packedProxyBounds;
+};
+
+static_assert(sizeof(VoxelFrameConstants) == 344);
+static_assert(sizeof(VoxelDrawConstants) == 24);
+static_assert(sizeof(GpuVoxelBrick) == 24);
+constexpr std::uint16_t voxelBoxIndices[]{
+    0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5, 0, 1, 5, 0, 5, 4,
+    2, 6, 7, 2, 7, 3, 0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6};
 
 constexpr UINT drawConstantCount = sizeof(DrawConstants) / sizeof(float);
 static_assert(drawConstantCount == 48);
-constexpr float cameraNearPlane = 0.05f;
 
 std::array<XMVECTOR, 6> frustumPlanes(FXMMATRIX viewProjection)
 {
@@ -95,10 +154,54 @@ bool intersectsFrustum(const BoundingBox& box, const std::array<XMVECTOR, 6>& pl
     return true;
 }
 
+bool insideFrustum(const BoundingBox& box, const std::array<XMVECTOR, 6>& planes)
+{
+    const auto center = XMVectorSetW(XMLoadFloat3(&box.Center), 1.0f);
+    const auto half = XMLoadFloat3(&box.Extents);
+    return std::ranges::all_of(planes, [&](auto plane) {
+        return XMVectorGetX(XMVector4Dot(plane, center)) >= XMVectorGetX(XMVector3Dot(XMVectorAbs(plane), half));
+    });
+}
+
+BoundingBox worldWindBounds(const Bounds& bounds, const SceneObject& object, XMFLOAT2 windOffset)
+{
+    BoundingBox world;
+    const BoundingBox local(bounds.center, bounds.halfExtent);
+    local.Transform(world, object.placementMatrix());
+    // The shader's saturated bend weight moves each vertex by zero to the full offset.
+    const float dx = windOffset.x * object.placement.w * 0.5f;
+    const float dz = windOffset.y * object.placement.w * 0.5f;
+    world.Center.x += dx;
+    world.Center.z += dz;
+    world.Extents.x += std::abs(dx);
+    world.Extents.z += std::abs(dz);
+    return world;
+}
+
+std::array<XMVECTOR, 6> windExpandedLocalPlanes(FXMMATRIX localToClip, const std::array<XMVECTOR, 6>& worldPlanes,
+                                               float instanceScale, XMFLOAT2 windOffset)
+{
+    auto localPlanes = frustumPlanes(localToClip);
+    for (std::size_t p = 0; p < localPlanes.size(); ++p)
+    {
+        const auto normal = worldPlanes[p];
+        const float shift = instanceScale * (XMVectorGetX(normal) * windOffset.x + XMVectorGetZ(normal) * windOffset.y);
+        localPlanes[p] = XMVectorSetW(localPlanes[p], XMVectorGetW(localPlanes[p]) + std::max(0.0f, shift));
+    }
+    return localPlanes;
+}
+
+constexpr std::size_t cascadeGroupBlockSize = 16;
+constexpr std::uint8_t cascadeCasterVisible = 1;
+constexpr std::uint8_t cascadeCasterOverride = 2;
+
 enum FrameTimestamp : UINT { FrameStart, ShadowStart, ShadowEnd, CameraEnd, FrameEnd, TimestampCount };
-static_assert(sizeof(FrameConstants) == 164);
+static_assert(sizeof(FrameConstants) == 464);
 static_assert(offsetof(FrameConstants, normalBiasWorld) == 160);
-static_assert(sizeof(FrameConstants) <= D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+static_assert(offsetof(FrameConstants, cascadeViewProjections) == 192);
+constexpr std::size_t frameConstantAlignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+constexpr std::size_t frameConstantStride = (sizeof(FrameConstants) + frameConstantAlignment - 1) /
+                                           frameConstantAlignment * frameConstantAlignment;
 
 struct HudRect
 {
@@ -276,14 +379,17 @@ D3D12Renderer::D3D12Renderer(HWND window)
     scissor_.right = static_cast<LONG>(backBuffer.Width);
     scissor_.bottom = static_cast<LONG>(backBuffer.Height);
     heapDescription.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    heapDescription.NumDescriptors = canUseMsaa ? 3 : 2;
+    const UINT cameraDepthDescriptors = canUseMsaa ? 2 : 1;
+    heapDescription.NumDescriptors = cameraDepthDescriptors + 1 + static_cast<UINT>(sunCascadeSplits.size());
     check(device_->CreateDescriptorHeap(&heapDescription, IID_PPV_ARGS(&depthHeap_)),
           "Create depth descriptor heap");
     singleSample_.depthTarget = depthHeap_->GetCPUDescriptorHandleForHeapStart();
     createDepthBuffer(singleSample_, backBuffer);
     const UINT depthDescriptorSize = device_->GetDescriptorHandleIncrementSize(heapDescription.Type);
     shadowDepthTarget_ = singleSample_.depthTarget;
-    shadowDepthTarget_.ptr += (heapDescription.NumDescriptors - 1) * depthDescriptorSize;
+    shadowDepthTarget_.ptr += cameraDepthDescriptors * depthDescriptorSize;
+    for (std::size_t i = 0; i < cascadeDepthTargets_.size(); ++i)
+        cascadeDepthTargets_[i].ptr = shadowDepthTarget_.ptr + (i + 1) * depthDescriptorSize;
 
     if (canUseMsaa)
     {
@@ -307,8 +413,9 @@ D3D12Renderer::D3D12Renderer(HWND window)
     createBranchCommandSignature();
     installMeshPipelines({meshVS, sizeof(meshVS)}, {meshPS, sizeof(meshPS)},
                          {shadowVS, sizeof(shadowVS)}, {shadowPS, sizeof(shadowPS)}, {}, canUseMsaa);
+    createVoxelPipeline(canUseMsaa);
     createHud();
-    frameConstants_ = createUploadBuffer(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+    frameConstants_ = createUploadBuffer((1 + sunCascadeSplits.size()) * frameConstantStride);
     msaaEnabled_ = canUseMsaa;
 
     check(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator_)),
@@ -352,7 +459,7 @@ DXGI_FORMAT D3D12Renderer::backBufferFormat() const
 void D3D12Renderer::setScene(const ViewerScene& scene)
 {
     // Each frame and texture upload has completed before the viewer can switch scenes.
-    if (asset_ != scene.asset)
+    if (asset_ != scene.asset || fixedLodAsset_ != scene.fixedLod)
     {
         std::vector<GpuMesh> meshes;
         meshes.reserve(scene.asset->meshes.size());
@@ -363,6 +470,8 @@ void D3D12Renderer::setScene(const ViewerScene& scene)
         std::array<GpuFixedLodLevel, fixedLodLevelCount> levels;
         ComPtr<ID3D12Resource> proxyVertices;
         branchGroupProjections_.clear();
+        cascadeFoliageBlocks_.clear();
+        cascadeProxyError_ = 0.0f;
         branchCullBounds_ = scene.assetBounds;
         if (scene.fixedLod)
         {
@@ -393,15 +502,30 @@ void D3D12Renderer::setScene(const ViewerScene& scene)
             if (lod.levels.size() > fixedLodTwoTriangleLevel)
             {
                 branchGroupProjections_.reserve(lod.groups.size());
-                for (const auto& group : lod.groups) branchGroupProjections_.push_back(branchGroupProjection(group));
+                for (const auto& group : lod.groups)
+                    branchGroupProjections_.push_back(branchGroupProjection(group, scene.kind == SceneKind::ModeledOakWalk));
                 branchInstanceProjection_ = branchInstanceProjection(branchGroupProjections_);
+                if (scene.kind == SceneKind::ModeledOakWalk)
+                {
+                    const std::span<const BranchLodProjection> groups = branchGroupProjections_;
+                    for (std::size_t first = 0; first < groups.size(); first += cascadeGroupBlockSize)
+                        cascadeFoliageBlocks_.push_back(branchInstanceProjection(
+                            groups.subspan(first, std::min(cascadeGroupBlockSize, groups.size() - first))).bounds);
+                    for (const auto& group : lod.groups)
+                    {
+                        const auto& proxy = group.levels[fixedLodTwoTriangleLevel];
+                        cascadeProxyError_ = std::max({cascadeProxyError_, proxy.surfaceError(), proxy.rimDeviation});
+                    }
+                }
             }
         }
         createTextures(scene.asset->textures);
         meshes_ = std::move(meshes);
         fixedLodLevels_ = std::move(levels);
         fixedLodProxyVertices_ = std::move(proxyVertices);
+        uploadBranchVoxels(scene);
         asset_ = scene.asset;
+        fixedLodAsset_ = scene.fixedLod;
     }
     ground_ = uploadMesh(scene.ground);
     std::vector<XMFLOAT4> placements{{0.0f, 0.0f, 0.0f, 1.0f}};
@@ -412,10 +536,18 @@ void D3D12Renderer::setScene(const ViewerScene& scene)
     const UINT bytes = static_cast<UINT>(placements.size() * sizeof(XMFLOAT4));
     instances_ = uploadBuffer(placements.data(), bytes);
     instanceView_ = {instances_->GetGPUVirtualAddress(), bytes, sizeof(XMFLOAT4)};
+    if (scene.hasAutomaticBranchVoxels())
+    {
+        const auto placementBytes = (scene.branchVoxelRegions ? voxelBranchRegionCount : 1) *
+                                    scene.instanceCount() * sizeof(XMFLOAT4);
+        if (!voxelPlacements_ || voxelPlacements_->GetDesc().Width < placementBytes)
+            voxelPlacements_ = createUploadBuffer(placementBytes);
+    }
     if (scene.fixedLod)
     {
         const auto maxDraws = scene.fixedLod->groups.size() * scene.instanceCount();
-        const auto argumentBytes = 2 * maxDraws * sizeof(BranchDraw);
+        const auto passCount = scene.kind == SceneKind::ModeledOakWalk ? 1 + sunCascadeSplits.size() : 2;
+        const auto argumentBytes = passCount * maxDraws * sizeof(BranchDraw);
         if (!branchArgumentBuffer_ || branchArgumentBuffer_->GetDesc().Width < argumentBytes)
         {
             branchArgumentBuffer_ = createUploadBuffer(argumentBytes);
@@ -425,9 +557,7 @@ void D3D12Renderer::setScene(const ViewerScene& scene)
             cameraBranchDraws_.byLevel[level].reserve(maxDraws);
         }
     }
-    const float aspect = viewport_.Width / viewport_.Height;
-    XMStoreFloat4x4(&projection_, XMMatrixPerspectiveFovRH(cameraVerticalFov, aspect,
-                                                           cameraNearPlane, scene.farPlane()));
+    updateCameraProjection(scene.nearPlane, scene.farPlane());
 
     const auto& bounds = scene.assetBounds;
     const float height = 2.0f * bounds.halfExtent.y;
@@ -435,6 +565,15 @@ void D3D12Renderer::setScene(const ViewerScene& scene)
     inverseWindHeight_ = scene.foliage && height > 0.0f ? 1.0f / (0.88f * height) : 0.0f;
     windAmplitude_ = scene.foliage ? 0.05f * height : 0.0f;
     updateSun(scene);
+}
+
+void D3D12Renderer::updateCameraProjection(float nearPlane, float farPlane)
+{
+    if (nearPlane == cameraNearPlane_ && farPlane == cameraFarPlane_) return;
+    const float aspect = viewport_.Width / viewport_.Height;
+    XMStoreFloat4x4(&projection_, XMMatrixPerspectiveFovRH(cameraVerticalFov, aspect, nearPlane, farPlane));
+    cameraNearPlane_ = nearPlane;
+    cameraFarPlane_ = farPlane;
 }
 
 float D3D12Renderer::projectLodError(float localError, const Bounds& bounds,
@@ -447,7 +586,7 @@ float D3D12Renderer::projectLodError(float localError, const Bounds& bounds,
                       XMVectorAbs(transform.r[1]) * bounds.halfExtent.y +
                       XMVectorAbs(transform.r[2]) * bounds.halfExtent.z;
     const float zMin = -XMVectorGetZ(center) - XMVectorGetZ(half);
-    if (zMin <= cameraNearPlane) return std::numeric_limits<float>::infinity();
+    if (zMin <= cameraNearPlane_) return std::numeric_limits<float>::infinity();
     const auto farSide = XMVectorAbs(center) + half;
     const float rMax = std::hypot(XMVectorGetX(farSide), XMVectorGetY(farSide));
 
@@ -466,11 +605,13 @@ float D3D12Renderer::projectLodError(float localError, const Bounds& bounds,
     return focalPixels * (localError * std::sqrt(maxRow) / zMin) * std::hypot(1.0f, rMax / zMin);
 }
 
-D3D12Renderer::BranchLodProjection D3D12Renderer::branchGroupProjection(const FixedLodGroup& group)
+D3D12Renderer::BranchLodProjection D3D12Renderer::branchGroupProjection(const FixedLodGroup& group, bool fullCrown)
 {
     const float farError = std::max(group.levels[fixedLodRimLevel].surfaceError(),
                                     group.levels[fixedLodFarLevel].surfaceError());
     const float proxyError = std::max(farError, group.levels[fixedLodTwoTriangleLevel].surfaceError());
+    const float lockedRimError = std::max(group.levels[1].surfaceError(), group.levels[2].surfaceError());
+    const float rimError = std::max(lockedRimError, group.levels[fixedLodRimLevel].surfaceError());
 
     // Give both transitions the same projection volume and pad for the sampled displacements.
     const auto center = XMLoadFloat3(&group.bounds.center);
@@ -481,8 +622,9 @@ D3D12Renderer::BranchLodProjection D3D12Renderer::branchGroupProjection(const Fi
     const auto upper = XMVectorMax(center + extent, proxyCenter + proxyExtent);
     Bounds projectionBounds;
     XMStoreFloat3(&projectionBounds.center, (upper + lower) * 0.5f);
-    XMStoreFloat3(&projectionBounds.halfExtent, (upper - lower) * 0.5f + XMVectorReplicate(proxyError));
-    return {projectionBounds, farError, proxyError};
+    const float padding = fullCrown ? std::max(proxyError, rimError) : proxyError;
+    XMStoreFloat3(&projectionBounds.halfExtent, (upper - lower) * 0.5f + XMVectorReplicate(padding));
+    return {projectionBounds, farError, proxyError, lockedRimError, rimError};
 }
 
 D3D12Renderer::BranchLodProjection D3D12Renderer::branchInstanceProjection(std::span<const BranchLodProjection> groups)
@@ -498,6 +640,8 @@ D3D12Renderer::BranchLodProjection D3D12Renderer::branchInstanceProjection(std::
         upper = XMVectorMax(upper, center + half);
         instance.farError = std::max(instance.farError, candidate.farError);
         instance.proxyError = std::max(instance.proxyError, candidate.proxyError);
+        instance.lockedRimError = std::max(instance.lockedRimError, candidate.lockedRimError);
+        instance.rimError = std::max(instance.rimError, candidate.rimError);
     }
     const auto center = (lower + upper) * 0.5f;
     auto half = XMVectorMax(center - lower, upper - center);
@@ -523,47 +667,101 @@ D3D12Renderer::BranchLodErrors D3D12Renderer::projectBranchLodErrors(
 
 void D3D12Renderer::updateBranchLod(ViewerScene& scene, const XMFLOAT4X4& view) const
 {
-    if (scene.branchLod != automaticBranchLod || !scene.fixedLod ||
+    const bool fullCrown = scene.kind == SceneKind::ModeledOakWalk;
+    const bool regional = scene.branchVoxelView == BranchVoxelView::Regional && scene.branchVoxelRegions;
+    const bool automaticVoxels = automaticBranchVoxels(scene.branchVoxelView) && scene.hasAutomaticBranchVoxels();
+    if ((!automaticVoxels && scene.branchLod != automaticBranchLod) || !scene.fixedLod ||
         scene.fixedLod->levels.size() <= fixedLodTwoTriangleLevel) return;
 
     auto& selection = scene.branchLodSelection;
     const auto count = scene.instanceCount();
     const auto groupCount = branchGroupProjections_.size();
     const auto cutSize = groupCount * count;
-    if (selection.frozen && selection.groupLevels.size() == cutSize) return;
+    if (selection.frozen && selection.groupLevels.size() == cutSize &&
+        (!automaticVoxels || (selection.voxelCut.size() == count && selection.voxelCutMode == scene.branchVoxelView))) return;
     selection.tests = {};
     selection.groupLevels.resize(cutSize);
+    if (automaticVoxels)
+    {
+        if (selection.voxelCutMode != scene.branchVoxelView) selection.voxelCut.clear();
+        selection.voxelCut.resize(count);
+        selection.voxelCutMode = scene.branchVoxelView;
+    }
     const auto meshToAsset = XMLoadFloat4x4(&scene.asset->meshes[scene.fixedLod->meshIndex].localToWorld);
     for (unsigned instance = 0; instance < count; ++instance)
     {
         XMFLOAT4X4 localToWorld;
         XMStoreFloat4x4(&localToWorld, meshToAsset * scene.objects[instance].placementMatrix());
         const auto cut = std::span(selection.groupLevels).subspan(instance * groupCount, groupCount);
-        if (selection.useInstanceBounds)
+        bool coarsest = false;
+        float pixelsPerUnit = 0;
+        if (selection.useInstanceBounds || automaticVoxels)
         {
             ++selection.tests.instances;
             const auto& projection = branchInstanceProjection_;
             // Leave a margin for float transforms and projections at the shortcut's threshold.
-            const float pixelsPerUnit = 1.0001f * projectLodError(1.0f, projection.bounds, localToWorld, view);
-            if (std::isfinite(pixelsPerUnit) && pixelsPerUnit * projection.farError <= selection.farPixelLimit &&
-                pixelsPerUnit * projection.proxyError <= selection.proxyPixelLimit)
+            pixelsPerUnit = 1.0001f * projectLodError(1.0f, projection.bounds, localToWorld, view);
+            const float farError = fullCrown ? std::max(projection.farError, projection.rimError) : projection.farError;
+            const float proxyError = std::max(projection.proxyError, farError);
+            coarsest = std::isfinite(pixelsPerUnit) && pixelsPerUnit * farError <= selection.farPixelLimit &&
+                pixelsPerUnit * proxyError <= selection.proxyPixelLimit;
+            if (coarsest && selection.useInstanceBounds)
             {
                 std::fill(cut.begin(), cut.end(), fixedLodTwoTriangleLevel);
                 ++selection.tests.acceptedInstances;
-                continue;
             }
         }
-        selection.tests.groups += groupCount;
-        for (std::size_t i = 0; i < groupCount; ++i)
+        if (!coarsest || !selection.useInstanceBounds)
         {
-            auto& level = cut[i];
-            level = fixedLodRimLevel;
-            const auto errors = projectBranchLodErrors(branchGroupProjections_[i], localToWorld, view);
-            if (errors.farPixels <= selection.farPixelLimit)
+            selection.tests.groups += groupCount;
+            for (std::size_t i = 0; i < groupCount; ++i)
             {
-                level = errors.proxyPixels <= selection.proxyPixelLimit ? fixedLodTwoTriangleLevel : fixedLodFarLevel;
+                auto& level = cut[i];
+                if (fullCrown)
+                {
+                    const auto& group = branchGroupProjections_[i];
+                    const float scale = projectLodError(1.0f, group.bounds, localToWorld, view);
+                    const float farError = std::max(group.farError, group.rimError);
+                    if (scale * farError <= selection.farPixelLimit)
+                        level = scale * std::max(group.proxyError, farError) <= selection.proxyPixelLimit
+                            ? fixedLodTwoTriangleLevel : fixedLodFarLevel;
+                    else if (scale * group.rimError <= selection.nearPixelLimit)
+                        level = fixedLodRimLevel;
+                    else if (scale * group.lockedRimError <= selection.nearPixelLimit)
+                        level = 2;
+                    else
+                        level = 0;
+                    continue;
+                }
+                level = fixedLodRimLevel;
+                const auto errors = projectBranchLodErrors(branchGroupProjections_[i], localToWorld, view);
+                if (errors.farPixels <= selection.farPixelLimit)
+                    level = errors.proxyPixels <= selection.proxyPixelLimit ? fixedLodTwoTriangleLevel : fixedLodFarLevel;
             }
         }
+        if (!automaticVoxels) continue;
+        auto& voxelCut = selection.voxelCut[instance];
+        const float cellSize = static_cast<float>(scene.branchVoxels[automaticBranchVoxelIndex]->cellSize);
+        const auto projectedLimit = [&](std::uint8_t previous) {
+            return scene.branchVoxelEnterPixels * (previous ? branchVoxelExitFactor : 1.0f);
+        };
+        if (!regional)
+        {
+            voxelCut = coarsest && pixelsPerUnit * cellSize <= projectedLimit(voxelCut) ? allVoxelRegions : 0;
+            continue;
+        }
+        std::uint8_t nextCut = 0;
+        for (std::size_t region = 0; region < voxelBranchRegionCount; ++region)
+        {
+            const auto bit = static_cast<std::uint8_t>(1u << region);
+            const auto& bounds = voxelRegionProjections_[region].bounds;
+            if (projectLodError(cellSize, bounds, localToWorld, view) > projectedLimit(voxelCut & bit)) continue;
+            const auto first = voxelRegionGroupStart(region, groupCount);
+            const auto length = voxelRegionGroupStart(region + 1, groupCount) - first;
+            if (coarsest || std::ranges::all_of(cut.subspan(first, length), [](auto level) { return level == fixedLodTwoTriangleLevel; }))
+                nextCut |= bit;
+        }
+        voxelCut = nextCut;
     }
 }
 
@@ -583,15 +781,23 @@ void D3D12Renderer::createBranchCommandSignature()
           "Create branch draw command signature");
 }
 
-float D3D12Renderer::projectShadowError(float localError, const XMFLOAT4X4& localToWorld) const
+namespace
 {
-    const auto axes = XMMatrixTranspose(XMLoadFloat4x4(&localToWorld) * XMLoadFloat4x4(&lightViewProjection_));
+float projectShadowTexels(float localError, FXMMATRIX localToLightClip)
+{
+    const auto axes = XMMatrixTranspose(localToLightClip);
     const float xx = XMVectorGetX(XMVector3Dot(axes.r[0], axes.r[0]));
     const float xy = XMVectorGetX(XMVector3Dot(axes.r[0], axes.r[1]));
     const float yy = XMVectorGetX(XMVector3Dot(axes.r[1], axes.r[1]));
     // Largest singular value of the local-to-light XY transform, then NDC to texels.
     const float stretch = std::sqrt(0.5f * (xx + yy + std::hypot(xx - yy, 2.0f * xy)));
     return localError * stretch * (shadowMapSize * 0.5f);
+}
+}
+
+float D3D12Renderer::projectShadowError(float localError, const XMFLOAT4X4& localToWorld) const
+{
+    return projectShadowTexels(localError, XMLoadFloat4x4(&localToWorld) * XMLoadFloat4x4(&lightViewProjection_));
 }
 
 void D3D12Renderer::PassVisibility::clear()
@@ -613,11 +819,20 @@ void D3D12Renderer::PassVisibility::add(UINT instance)
     ++count;
 }
 
+bool D3D12Renderer::PassVisibility::contains(UINT instance) const
+{
+    const auto next = std::ranges::upper_bound(ranges, instance, {}, &InstanceRange::first);
+    if (next == ranges.begin()) return false;
+    const auto& range = *(next - 1);
+    return instance - range.first < range.count;
+}
+
 void D3D12Renderer::prepareVisibility(const ViewerScene& scene, FXMMATRIX viewProjection, XMFLOAT2 windOffset)
 {
     const auto count = scene.instanceCount();
     const bool culling = scene.branchFrustumCulling;
-    const bool splitShadows = scene.branchShadowLod >= 0 && scene.shadowLodOffCameraOnly;
+    const bool experiment = scene.branchVoxelView != BranchVoxelView::Off && !automaticBranchVoxels(scene.branchVoxelView);
+    const bool splitShadows = !experiment && scene.branchShadowLod >= 0 && scene.shadowLodOffCameraOnly;
     if (!culling && !splitShadows)
     {
         cameraVisibility_.ranges.assign(1, InstanceRange{0, count});
@@ -632,22 +847,13 @@ void D3D12Renderer::prepareVisibility(const ViewerScene& scene, FXMMATRIX viewPr
     shadowOverrideVisibility_.clear();
     const auto cameraPlanes = frustumPlanes(viewProjection);
     const auto shadowPlanes = frustumPlanes(XMLoadFloat4x4(&lightViewProjection_));
-    const BoundingBox assetBox(branchCullBounds_.center, branchCullBounds_.halfExtent);
+    const auto& bounds = scene.branchVoxelView != BranchVoxelView::Off ? voxelCullBounds_ : branchCullBounds_;
     for (UINT i = 0; i < count; ++i)
     {
-        const auto& object = scene.objects[i];
-        BoundingBox worldBox;
-        assetBox.Transform(worldBox, object.placementMatrix());
-        // The shader's saturated bend weight moves each vertex by 0 to the full offset.
-        const float dx = windOffset.x * object.placement.w * 0.5f;
-        const float dz = windOffset.y * object.placement.w * 0.5f;
-        worldBox.Center.x += dx;
-        worldBox.Center.z += dz;
-        worldBox.Extents.x += std::abs(dx);
-        worldBox.Extents.z += std::abs(dz);
+        const auto worldBox = worldWindBounds(bounds, scene.objects[i], windOffset);
         const bool inCamera = intersectsFrustum(worldBox, cameraPlanes);
         if (!culling || inCamera) cameraVisibility_.add(i);
-        if (culling && !intersectsFrustum(worldBox, shadowPlanes)) continue;
+        if (culling && !scene.usesSunCascades() && !intersectsFrustum(worldBox, shadowPlanes)) continue;
         shadowVisibility_.add(i);
         if (splitShadows)
         {
@@ -657,8 +863,123 @@ void D3D12Renderer::prepareVisibility(const ViewerScene& scene, FXMMATRIX viewPr
     }
 }
 
+void D3D12Renderer::prepareFoliageGroupVisibility(const ViewerScene& scene, FXMMATRIX viewProjection, XMFLOAT2 windOffset)
+{
+    cameraGroupVisibility_.clear();
+    cameraGroupsConsidered_ = cameraGroupsVisible_ = 0;
+    if (scene.kind != SceneKind::ModeledOakWalk || !scene.fixedLod || scene.branchLod == sourceBranchLod) return;
+    const auto groups = branchGroupProjections_.size();
+    cameraGroupsConsidered_ = cameraGroupsVisible_ = groups * cameraVisibility_.count;
+    if (!scene.branchGroupFrustumCulling || !cameraGroupsConsidered_) return;
+
+    const auto worldPlanes = frustumPlanes(viewProjection);
+    const auto meshToAsset = XMLoadFloat4x4(&scene.asset->meshes[scene.fixedLod->meshIndex].localToWorld);
+    for (const auto range : cameraVisibility_.ranges)
+    {
+        for (UINT i = range.first; i < range.first + range.count; ++i)
+        {
+            const auto& object = scene.objects[i];
+            if (insideFrustum(worldWindBounds(branchCullBounds_, object, windOffset), worldPlanes)) continue;
+            const auto localPlanes = windExpandedLocalPlanes(meshToAsset * object.placementMatrix() * viewProjection,
+                                                             worldPlanes, object.placement.w, windOffset);
+            for (std::size_t group = 0; group < groups; ++group)
+            {
+                const auto& bounds = branchGroupProjections_[group].bounds;
+                if (intersectsFrustum(BoundingBox(bounds.center, bounds.halfExtent), localPlanes)) continue;
+                if (cameraGroupVisibility_.empty()) cameraGroupVisibility_.resize(groups * scene.instanceCount(), 1);
+                cameraGroupVisibility_[i * groups + group] = 0;
+                --cameraGroupsVisible_;
+            }
+        }
+    }
+}
+
+void D3D12Renderer::prepareCascadeCasterDraws(const ViewerScene& scene, XMFLOAT2 windOffset, std::size_t& argumentBytes)
+{
+    const auto count = scene.instanceCount();
+    cascadeInstanceFlags_.assign(count, 0);
+    const bool hasFoliage = scene.fixedLod && scene.meshShadows[scene.fixedLod->meshIndex].cast;
+    const bool coarsen = scene.coarsenSunCascadeFoliage && scene.canCoarsenCascadeFoliage();
+    const auto groups = branchGroupProjections_.size();
+    const auto meshToAsset = hasFoliage ? XMLoadFloat4x4(&scene.asset->meshes[scene.fixedLod->meshIndex].localToWorld) : XMMatrixIdentity();
+    cascadeInstanceLevels_.resize(count);
+    for (std::size_t slice = 0; slice < cascadeCasterDraws_.size(); ++slice)
+    {
+        auto& pass = cascadeCasterDraws_[slice];
+        pass.instances.clear();
+        pass.sourceFoliage.clear();
+        pass.groupsConsidered = pass.groupsVisible = 0;
+        cascadeBakedVisibility_.clear();
+        cascadeGroupVisibility_.clear();
+        const auto lightClip = XMLoadFloat4x4(&cascadeViewProjections_[slice]);
+        const auto planes = frustumPlanes(lightClip);
+        for (const auto range : shadowVisibility_.ranges)
+        {
+            for (UINT i = range.first; i < range.first + range.count; ++i)
+            {
+                const auto& object = scene.objects[i];
+                const auto worldBox = worldWindBounds(branchCullBounds_, object, windOffset);
+                // Test the light volume, including its blend overlap. Camera visibility is independent.
+                if (scene.cullSunCascadeCasters && !intersectsFrustum(worldBox, planes)) continue;
+                pass.instances.add(i);
+                cascadeInstanceFlags_[i] |= cascadeCasterVisible;
+                if (!hasFoliage) continue;
+
+                const bool override = scene.branchShadowLod >= 0 &&
+                    (!scene.shadowLodOffCameraOnly || shadowOverrideVisibility_.contains(i));
+                int level = override ? scene.branchShadowLod : scene.branchLod;
+                if (level == sourceBranchLod)
+                {
+                    pass.sourceFoliage.add(i);
+                    continue;
+                }
+
+                const auto localClip = meshToAsset * object.placementMatrix() * lightClip;
+                if (coarsen && projectShadowTexels(cascadeProxyError_, localClip) <= sunCascadeProxyErrorTexels)
+                    level = static_cast<int>(fixedLodTwoTriangleLevel);
+                if (override) cascadeInstanceFlags_[i] |= cascadeCasterOverride;
+                cascadeInstanceLevels_[i] = level;
+                cascadeBakedVisibility_.add(i);
+                pass.groupsConsidered += groups;
+                pass.groupsVisible += groups;
+                if (!scene.cullSunCascadeCasters || insideFrustum(worldBox, planes)) continue;
+
+                const auto localPlanes = windExpandedLocalPlanes(localClip, planes, object.placement.w, windOffset);
+                const auto reject = [&](std::size_t first, std::size_t length) {
+                    if (cascadeGroupVisibility_.empty()) cascadeGroupVisibility_.resize(count * groups, 1);
+                    std::fill_n(cascadeGroupVisibility_.begin() + i * groups + first, length, 0);
+                    pass.groupsVisible -= length;
+                };
+                for (std::size_t block = 0; block < cascadeFoliageBlocks_.size(); ++block)
+                {
+                    const auto& bounds = cascadeFoliageBlocks_[block];
+                    const BoundingBox box(bounds.center, bounds.halfExtent);
+                    if (insideFrustum(box, localPlanes)) continue;
+                    const auto first = block * cascadeGroupBlockSize;
+                    const auto length = std::min(cascadeGroupBlockSize, groups - first);
+                    if (!intersectsFrustum(box, localPlanes))
+                    {
+                        reject(first, length);
+                        continue;
+                    }
+                    for (std::size_t group = first; group < first + length; ++group)
+                    {
+                        const auto& candidate = branchGroupProjections_[group].bounds;
+                        if (!intersectsFrustum(BoundingBox(candidate.center, candidate.halfExtent), localPlanes)) reject(group, 1);
+                    }
+                }
+            }
+        }
+        if (hasFoliage)
+            prepareBranchDraws(scene, cascadeBakedVisibility_, pass.bakedFoliage, argumentBytes, false,
+                               cascadeGroupVisibility_, automaticBranchLod, cascadeInstanceLevels_);
+    }
+}
+
 void D3D12Renderer::prepareBranchDraws(const ViewerScene& scene, const PassVisibility& visibility,
-                                      BranchPassDraws& pass, std::size_t& argumentBytes)
+                                      BranchPassDraws& pass, std::size_t& argumentBytes, bool omitVoxelRegions,
+                                      std::span<const std::uint8_t> visibleGroups, int forcedLevel,
+                                      std::span<const int> instanceLevels)
 {
     pass.argumentOffset.reset();
     pass.triangles.fill(0);
@@ -674,12 +995,33 @@ void D3D12Renderer::prepareBranchDraws(const ViewerScene& scene, const PassVisib
     };
 
     const std::span<const std::size_t> levels = scene.branchLodSelection.groupLevels;
-    if (levels.size() != groups * scene.instanceCount())
+    const bool validCut = levels.size() == groups * scene.instanceCount();
+    if (visibleGroups.empty() && instanceLevels.empty() && forcedLevel < 0 && !validCut)
     {
         for (const auto range : visibility.ranges) append(fixedLodRimLevel, {}, range.count, range.first + 1);
         return;
     }
-    const auto cutOf = [&](UINT instance) { return levels.subspan(instance * groups, groups); };
+    const auto fixedLevelOf = [&](UINT instance) {
+        return instanceLevels.empty() ? forcedLevel : instanceLevels[instance];
+    };
+    const auto cutOf = [&](UINT instance) {
+        return validCut && fixedLevelOf(instance) < 0 ? levels.subspan(instance * groups, groups) : std::span<const std::size_t>{};
+    };
+    const auto atLevel = [&](UINT instance, std::span<const std::size_t> cut, std::size_t group) {
+        if (!cut.empty()) return cut[group];
+        const auto level = fixedLevelOf(instance);
+        return level < 0 ? fixedLodRimLevel : static_cast<std::size_t>(level);
+    };
+    const auto voxelMaskOf = [&](UINT instance) {
+        return omitVoxelRegions ? scene.branchLodSelection.voxelCut[instance] : 0;
+    };
+    const auto groupsOf = [&](UINT instance) {
+        return visibleGroups.empty() ? std::span<const std::uint8_t>{} : visibleGroups.subspan(instance * groups, groups);
+    };
+    const auto allVisible = [&](UINT instance) {
+        const auto mask = groupsOf(instance);
+        return std::ranges::find(mask, std::uint8_t{0}) == mask.end();
+    };
     const auto allAtLevel = [](std::span<const std::size_t> cut, std::size_t level) {
         return std::all_of(cut.begin(), cut.end(), [level](std::size_t value) { return value == level; });
     };
@@ -689,20 +1031,37 @@ void D3D12Renderer::prepareBranchDraws(const ViewerScene& scene, const PassVisib
         for (UINT instance = range.first; instance < limit;)
         {
             const auto cut = cutOf(instance);
-            if (allAtLevel(cut, cut.front()))
+            const auto mask = voxelMaskOf(instance);
+            if (!mask && (cut.empty() || allAtLevel(cut, cut.front())) && allVisible(instance))
             {
+                const auto level = atLevel(instance, cut, 0);
                 UINT end = instance + 1;
-                while (end < limit && allAtLevel(cutOf(end), cut.front())) ++end;
-                append(cut.front(), {}, end - instance, instance + 1);
+                while (end < limit && !voxelMaskOf(end) && allVisible(end))
+                {
+                    const auto next = cutOf(end);
+                    if (atLevel(end, next, 0) != level || !allAtLevel(next, level)) break;
+                    ++end;
+                }
+                append(level, {}, end - instance, instance + 1);
                 instance = end;
                 continue;
             }
             // Consecutive groups at the same level occupy one contiguous index range.
+            const auto maskGroups = groupsOf(instance);
+            const auto skipped = [&](std::size_t group) {
+                return (mask && (mask & voxelGroupRegionBits_[group])) ||
+                       (!maskGroups.empty() && !maskGroups[group]);
+            };
             for (std::size_t first = 0; first < groups;)
             {
-                const auto level = cut[first];
+                if (skipped(first))
+                {
+                    ++first;
+                    continue;
+                }
+                const auto level = atLevel(instance, cut, first);
                 std::size_t end = first + 1;
-                while (end < groups && cut[end] == level) ++end;
+                while (end < groups && atLevel(instance, cut, end) == level && !skipped(end)) ++end;
                 append(level, lod.indicesForGroups(level, first, end - 1), 1, instance + 1);
                 first = end;
             }
@@ -762,6 +1121,7 @@ void D3D12Renderer::updateSun(const ViewerScene& scene)
     // Fit the light to conservative placement bounds. A sun edit needs no GPU resource rebuild.
     const auto rotation = XMMatrixLookToRH(XMVectorZero(), -XMLoadFloat3(&toSun_),
                                            XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
+    XMStoreFloat4x4(&sunRotation_, rotation);
     auto minimum = XMVectorReplicate(std::numeric_limits<float>::max());
     auto maximum = -minimum;
     const auto includeLightPoint = [&](FXMVECTOR world) {
@@ -773,6 +1133,9 @@ void D3D12Renderer::updateSun(const ViewerScene& scene)
     {
         includeLightPoint(XMLoadFloat3(&vertex.position));
     }
+    float casterMin = XMVectorGetZ(minimum);
+    float casterMax = XMVectorGetZ(maximum);
+    const BoundingBox casterBounds(branchCullBounds_.center, branchCullBounds_.halfExtent);
     float maxInstanceScale = 1.0f;
     const auto& [center, half] = scene.assetBounds;
     for (const auto& object : scene.objects)
@@ -780,6 +1143,10 @@ void D3D12Renderer::updateSun(const ViewerScene& scene)
         const auto& instance = object.placement;
         maxInstanceScale = std::max(maxInstanceScale, instance.w);
         const auto placement = object.placementMatrix();
+        BoundingBox lightBounds;
+        casterBounds.Transform(lightBounds, placement * rotation);
+        casterMin = std::min(casterMin, lightBounds.Center.z - lightBounds.Extents.z);
+        casterMax = std::max(casterMax, lightBounds.Center.z + lightBounds.Extents.z);
         for (float x : {center.x - half.x, center.x + half.x})
         {
             for (float y : {center.y - half.y, center.y + half.y})
@@ -798,6 +1165,7 @@ void D3D12Renderer::updateSun(const ViewerScene& scene)
     const float span = std::max(upper.x - lower.x, upper.y - lower.y);
     const float padding = std::max(0.25f, span * 0.025f) +
                           windAmplitude_ * maxWindStrength * maxInstanceScale;
+    cascadeCasterDepth_ = {casterMin - padding, casterMax + padding};
     constexpr float nearPlane = 1.0f;
     const float depthSpan = upper.z - lower.z + 2.0f * padding;
     const auto view = rotation * XMMatrixTranslation(0.0f, 0.0f, -upper.z - padding - nearPlane);
@@ -809,13 +1177,94 @@ void D3D12Renderer::updateSun(const ViewerScene& scene)
     shadowDepthPerTexel_ = shadowWorldUnitsPerTexel_ / depthSpan;
 }
 
-void D3D12Renderer::createShadowMap()
+void D3D12Renderer::updateShadowCascades(const XMFLOAT4X4& view, const ViewerScene& scene)
+{
+    const auto lightRotation = XMLoadFloat4x4(&sunRotation_);
+    const auto cameraToLight = XMMatrixInverse(nullptr, XMLoadFloat4x4(&view)) * lightRotation;
+    constexpr float nearPlane = 1.0f;
+    const float casterDepthSpan = cascadeCasterDepth_.y - cascadeCasterDepth_.x;
+    const float tanHalfX = 1.0f / projection_._11;
+    const float tanHalfY = 1.0f / projection_._22;
+    const float tanDiagonalSquared = tanHalfX * tanHalfX + tanHalfY * tanHalfY;
+    const bool stabilized = scene.stabilizeSunCascades;
+    const float normalBiasTexels = scene.shadowBias.normalTexels;
+    float splitStart = std::min(cameraNearPlane_, sunCascadeSplits.front());
+    for (std::size_t cascade = 0; cascade < sunCascadeSplits.size(); ++cascade)
+    {
+        const float splitEnd = sunCascadeSplits[cascade];
+        // Include the previous split's transition strip in the incoming map.
+        const float fitStart = scene.blendSunCascades && cascade != 0 ?
+            std::max(std::min(cameraNearPlane_, splitStart), splitStart - sunCascadeBlendWidths[cascade - 1]) : splitStart;
+        auto lower = XMVectorReplicate(std::numeric_limits<float>::max());
+        auto upper = -lower;
+        float width;
+        auto center = XMVectorZero();
+        if (stabilized)
+        {
+            // Equate the distance from the center to the near and far corners.
+            // For a wide slice, the far plane's bounding circle alone contains the near corners.
+            const float centerDepth = std::min(splitEnd, 0.5f * (fitStart + splitEnd) * (1.0f + tanDiagonalSquared));
+            const float offset = splitEnd - centerDepth;
+            const float radius = std::sqrt(offset * offset + splitEnd * splitEnd * tanDiagonalSquared);
+            width = 2.0f * radius;
+            center = XMVector3TransformCoord(XMVectorSet(0, 0, -centerDepth, 1), cameraToLight);
+        }
+        else
+        {
+            for (const float depth : {fitStart, splitEnd})
+            {
+                const float halfX = depth / projection_._11;
+                const float halfY = depth / projection_._22;
+                for (const float x : {-halfX, halfX})
+                    for (const float y : {-halfY, halfY})
+                    {
+                        const auto point = XMVector3TransformCoord(XMVectorSet(x, y, -depth, 1), cameraToLight);
+                        lower = XMVectorMin(lower, point);
+                        upper = XMVectorMax(upper, point);
+                    }
+            }
+            const auto dimensions = upper - lower;
+            width = std::max(XMVectorGetX(dimensions), XMVectorGetY(dimensions));
+        }
+        // Reserve space for PCF and, when snapping, half a texel of translation.
+        const float guardTexels = (stabilized ? 2.5f : 2.0f) + normalBiasTexels;
+        const float pad = guardTexels * width / (shadowMapSize - 2.0f * guardTexels);
+        const float texelWidth = (width + 2.0f * pad) / shadowMapSize;
+        const float normalOffset = normalBiasTexels * texelWidth;
+        const float depthOffset = -cascadeCasterDepth_.y - normalOffset - nearPlane;
+        const float depthSpan = casterDepthSpan + 2.0f * normalOffset;
+        if (stabilized)
+        {
+            const auto snap = [texelWidth](float position) {
+                return static_cast<float>(std::round(double(position) / texelWidth) * texelWidth);
+            };
+            const auto lightView = lightRotation *
+                XMMatrixTranslation(-snap(XMVectorGetX(center)), -snap(XMVectorGetY(center)), depthOffset);
+            const float span = width + 2.0f * pad;
+            const auto lightProjection = XMMatrixOrthographicRH(span, span, nearPlane, nearPlane + depthSpan);
+            XMStoreFloat4x4(&cascadeViewProjections_[cascade], lightView * lightProjection);
+        }
+        else
+        {
+            const auto lightView = lightRotation * XMMatrixTranslation(0.0f, 0.0f, depthOffset);
+            const auto lightProjection = XMMatrixOrthographicOffCenterRH(
+                XMVectorGetX(lower) - pad, XMVectorGetX(upper) + pad,
+                XMVectorGetY(lower) - pad, XMVectorGetY(upper) + pad, nearPlane, nearPlane + depthSpan);
+            XMStoreFloat4x4(&cascadeViewProjections_[cascade], lightView * lightProjection);
+        }
+        cascadeWorldUnitsPerTexel_[cascade] = texelWidth;
+        cascadeDepthPerTexel_[cascade] = cascadeWorldUnitsPerTexel_[cascade] / depthSpan;
+        splitStart = splitEnd;
+    }
+}
+
+D3D12Renderer::ComPtr<ID3D12Resource> D3D12Renderer::createShadowDepth(UINT16 slices)
 {
     D3D12_RESOURCE_DESC description{};
     description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     description.Width = shadowMapSize;
     description.Height = shadowMapSize;
-    description.DepthOrArraySize = 1;
+    description.DepthOrArraySize = slices;
     description.MipLevels = 1;
     description.Format = DXGI_FORMAT_R32_TYPELESS;
     description.SampleDesc.Count = 1;
@@ -823,12 +1272,42 @@ void D3D12Renderer::createShadowMap()
     D3D12_CLEAR_VALUE clear{};
     clear.Format = depthFormat;
     clear.DepthStencil.Depth = 1.0f;
-    shadowMap_ = createRenderTexture(description, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, clear);
+    return createRenderTexture(description, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, clear);
+}
 
+void D3D12Renderer::createShadowMap()
+{
+    shadowMap_ = createShadowDepth(1);
     D3D12_DEPTH_STENCIL_VIEW_DESC depthView{};
     depthView.Format = depthFormat;
     depthView.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     device_->CreateDepthStencilView(shadowMap_.Get(), &depthView, shadowDepthTarget_);
+}
+
+void D3D12Renderer::createCascadeShadowMaps()
+{
+    cascadeShadowMap_ = createShadowDepth(static_cast<UINT16>(sunCascadeSplits.size()));
+    D3D12_DEPTH_STENCIL_VIEW_DESC depthView{};
+    depthView.Format = depthFormat;
+    depthView.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+    depthView.Texture2DArray.ArraySize = 1;
+    for (UINT cascade = 0; cascade < cascadeDepthTargets_.size(); ++cascade)
+    {
+        depthView.Texture2DArray.FirstArraySlice = cascade;
+        device_->CreateDepthStencilView(cascadeShadowMap_.Get(), &depthView, cascadeDepthTargets_[cascade]);
+    }
+    writeCascadeShadowView();
+}
+
+void D3D12Renderer::writeCascadeShadowView()
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = DXGI_FORMAT_R32_FLOAT;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2DArray.MipLevels = 1;
+    view.Texture2DArray.ArraySize = static_cast<UINT>(sunCascadeSplits.size());
+    device_->CreateShaderResourceView(cascadeShadowMap_.Get(), &view, cascadeShadowView_);
 }
 
 void D3D12Renderer::createMeshPipelineLayout()
@@ -836,8 +1315,10 @@ void D3D12Renderer::createMeshPipelineLayout()
     D3D12_DESCRIPTOR_RANGE colorTexture{};
     colorTexture.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     colorTexture.NumDescriptors = 1;
-    auto shadowTexture = colorTexture;
-    shadowTexture.BaseShaderRegister = 1;
+    D3D12_DESCRIPTOR_RANGE shadowTextures[]{colorTexture, colorTexture};
+    shadowTextures[0].BaseShaderRegister = 1;
+    shadowTextures[1].BaseShaderRegister = 3;
+    shadowTextures[1].OffsetInDescriptorsFromTableStart = 1;
 
     D3D12_ROOT_PARAMETER parameters[5]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -846,7 +1327,7 @@ void D3D12Renderer::createMeshPipelineLayout()
     parameters[1].DescriptorTable = {1, &colorTexture};
     parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters[2].DescriptorTable = {1, &shadowTexture};
+    parameters[2].DescriptorTable = {static_cast<UINT>(std::size(shadowTextures)), shadowTextures};
     parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     parameters[3].Descriptor.ShaderRegister = 1;
@@ -919,6 +1400,277 @@ void D3D12Renderer::createMeshPipelineLayout()
     description.RTVFormats[0] = colorFormat;
 }
 
+void D3D12Renderer::createVoxelPipeline(bool enableMultisampling)
+{
+    D3D12_DESCRIPTOR_RANGE shadow{};
+    shadow.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    shadow.NumDescriptors = 1;
+    shadow.BaseShaderRegister = 2;
+    D3D12_ROOT_PARAMETER parameters[6]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[1].Constants = {1, 0, sizeof(VoxelDrawConstants) / sizeof(UINT)};
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[3].Descriptor.ShaderRegister = 1;
+    parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[4].DescriptorTable = {1, &shadow};
+    parameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[5].Descriptor.ShaderRegister = 3;
+    parameters[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    sampler.MaxAnisotropy = 1;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 1;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    const D3D12_ROOT_SIGNATURE_DESC root{static_cast<UINT>(std::size(parameters)), parameters, 1, &sampler,
+                                        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    ComPtr<ID3DBlob> blob;
+    check(D3D12SerializeRootSignature(&root, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr), "Serialize voxel root signature");
+    check(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&voxelRoot_)),
+          "Create voxel root signature");
+
+    auto description = meshPipelineDescription_;
+    description.pRootSignature = voxelRoot_.Get();
+    description.InputLayout = {};
+    description.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
+    description.VS = {voxelVS, sizeof(voxelVS)};
+    description.PS = {voxelPS, sizeof(voxelPS)};
+    voxelSingleSample_ = createPipeline(device_.Get(), description, "Create voxel pipeline");
+    auto shadowDescription = description;
+    shadowDescription.PS = {voxelShadowPS, sizeof(voxelShadowPS)};
+    shadowDescription.NumRenderTargets = 0;
+    shadowDescription.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+    voxelShadowPipeline_ = createPipeline(device_.Get(), shadowDescription, "Create voxel shadow pipeline");
+    if (enableMultisampling)
+    {
+        description.SampleDesc = msaaSamples;
+        description.RasterizerState.MultisampleEnable = TRUE;
+        voxelMultisample_ = createPipeline(device_.Get(), description, "Create 4x MSAA voxel pipeline");
+    }
+    constexpr auto alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+    constexpr auto stride = (sizeof(VoxelFrameConstants) + alignment - 1) / alignment * alignment;
+    voxelConstants_ = createUploadBuffer(stride * (voxelBranchRegionCount + 2));
+    voxelBoxIndices_ = uploadBuffer(voxelBoxIndices, sizeof(voxelBoxIndices));
+}
+
+D3D12Renderer::GpuVoxelLevel D3D12Renderer::uploadVoxelLevel(const VoxelFoliage& source, const VoxelNormalData* normals)
+{
+    GpuVoxelLevel level{};
+    level.origin = {static_cast<float>(source.origin[0]), static_cast<float>(source.origin[1]),
+                    static_cast<float>(source.origin[2])};
+    level.cellSize = static_cast<float>(source.cellSize);
+    level.brickCount = static_cast<UINT>(source.bricks.size());
+    std::vector<GpuVoxelBrick> bricks;
+    bricks.reserve(source.bricks.size());
+    for (const auto& brick : source.bricks)
+    {
+        std::array<unsigned, 3> lower{voxelBrickSide, voxelBrickSide, voxelBrickSide};
+        std::array<unsigned, 3> upper{};
+        for (auto cells = brick.occupancy; cells; cells &= cells - 1)
+        {
+            const auto bit = static_cast<unsigned>(std::countr_zero(cells));
+            const std::array cell{bit % voxelBrickSide, bit / voxelBrickSide % voxelBrickSide,
+                                  bit / (voxelBrickSide * voxelBrickSide)};
+            for (std::size_t axis = 0; axis < cell.size(); ++axis)
+            {
+                lower[axis] = std::min(lower[axis], cell[axis]);
+                upper[axis] = std::max(upper[axis], cell[axis] + 1);
+            }
+        }
+        std::uint32_t packedBounds = 0;
+        // Three bits per corner coordinate, with upper bounds exclusive.
+        for (std::size_t axis = 0; axis < lower.size(); ++axis)
+            packedBounds |= (lower[axis] << (3 * axis)) | (upper[axis] << (3 * (axis + 3)));
+        bricks.push_back({brick.coordinate, {static_cast<UINT>(brick.occupancy), static_cast<UINT>(brick.occupancy >> 32)},
+                          packedBounds});
+    }
+    level.bricks = uploadBuffer(bricks.data(), bricks.size() * sizeof(GpuVoxelBrick));
+    if (normals)
+    {
+        std::vector<UINT> buffer;
+        buffer.reserve(bricks.size() + std::tuple_size_v<PackedVoxelNormals> * normals->cells.size());
+        UINT offset = 0;
+        for (const auto& brick : source.bricks)
+        {
+            buffer.push_back(offset);
+            offset += std::popcount(brick.occupancy);
+        }
+        for (const auto& cell : normals->cells) buffer.insert(buffer.end(), cell.begin(), cell.end());
+        level.normals = uploadBuffer(buffer.data(), buffer.size() * sizeof(UINT));
+        level.hasDirectionalWeights = normals->hasDirectionalWeights;
+        level.hasShadowReceivers = normals->hasShadowReceivers;
+    }
+    return level;
+}
+
+void D3D12Renderer::uploadBranchVoxels(const ViewerScene& scene)
+{
+    voxelLevels_ = {};
+    voxelRegionLevels_ = {};
+    voxelGroupRegionBits_.clear();
+    voxelCullBounds_ = branchCullBounds_;
+    if (!scene.fixedLod) return;
+    const auto model = XMLoadFloat4x4(&scene.asset->meshes[scene.fixedLod->meshIndex].localToWorld);
+    auto boundsLower = XMLoadFloat3(&branchCullBounds_.center) - XMLoadFloat3(&branchCullBounds_.halfExtent);
+    auto boundsUpper = XMLoadFloat3(&branchCullBounds_.center) + XMLoadFloat3(&branchCullBounds_.halfExtent);
+    for (std::size_t i = 0; i < voxelLevels_.size(); ++i)
+    {
+        if (!scene.branchVoxels[i]) continue;
+        const auto& source = *scene.branchVoxels[i];
+        auto& level = voxelLevels_[i];
+        level = uploadVoxelLevel(source, scene.branchVoxelNormals[i].get());
+        auto lower = XMVectorReplicate(std::numeric_limits<float>::max());
+        auto upper = -lower;
+        const float edge = voxelBrickSide * level.cellSize;
+        for (const auto& brick : source.bricks)
+        {
+            const auto corner = XMLoadFloat3(&level.origin) +
+                edge * XMVectorSet(static_cast<float>(brick.coordinate[0]), static_cast<float>(brick.coordinate[1]),
+                                   static_cast<float>(brick.coordinate[2]), 0);
+            lower = XMVectorMin(lower, corner);
+            upper = XMVectorMax(upper, corner + XMVectorReplicate(edge));
+        }
+        BoundingBox local, asset;
+        XMStoreFloat3(&local.Center, (lower + upper) * 0.5f);
+        XMStoreFloat3(&local.Extents, (upper - lower) * 0.5f);
+        local.Transform(asset, model);
+        boundsLower = XMVectorMin(boundsLower, XMLoadFloat3(&asset.Center) - XMLoadFloat3(&asset.Extents));
+        boundsUpper = XMVectorMax(boundsUpper, XMLoadFloat3(&asset.Center) + XMLoadFloat3(&asset.Extents));
+    }
+    XMStoreFloat3(&voxelCullBounds_.center, (boundsLower + boundsUpper) * 0.5f);
+    XMStoreFloat3(&voxelCullBounds_.halfExtent, (boundsUpper - boundsLower) * 0.5f);
+    if (scene.branchVoxelRegions)
+    {
+        const auto groupCount = branchGroupProjections_.size();
+        voxelGroupRegionBits_.resize(groupCount);
+        for (std::size_t i = 0; i < voxelBranchRegionCount; ++i)
+        {
+            const auto& source = (*scene.branchVoxelRegions)[i];
+            voxelRegionLevels_[i] = uploadVoxelLevel(source.foliage, &source.normals);
+            const auto first = voxelRegionGroupStart(i, groupCount);
+            const auto end = voxelRegionGroupStart(i + 1, groupCount);
+            std::fill(voxelGroupRegionBits_.begin() + first, voxelGroupRegionBits_.begin() + end,
+                      static_cast<std::uint8_t>(1u << i));
+            auto projection = branchInstanceProjection(std::span(branchGroupProjections_).subspan(first, end - first));
+            auto& half = projection.bounds.halfExtent;
+            const auto cellSize = voxelRegionLevels_[i].cellSize;
+            half.x += cellSize; half.y += cellSize; half.z += cellSize;
+            voxelRegionProjections_[i] = projection;
+        }
+    }
+}
+
+void D3D12Renderer::drawBranchVoxels(const ViewerScene& scene, const GpuVoxelLevel& level, FXMMATRIX view,
+                                   const PassVisibility& visibility, PassStats& stats, bool packPlacements, bool shadowPass)
+{
+    if (visibility.ranges.empty()) return;
+    packPlacements = packPlacements && visibility.ranges.size() > 1;
+    const auto meshIndex = scene.fixedLod->meshIndex;
+    const auto& mesh = meshes_[meshIndex];
+    const auto& material = scene.asset->materials[mesh.material];
+    VoxelFrameConstants frame{};
+    const auto viewProjection = shadowPass ? XMLoadFloat4x4(&lightViewProjection_) : view * XMLoadFloat4x4(&projection_);
+    XMStoreFloat4x4(&frame.viewProjection, viewProjection);
+    frame.lightViewProjection = lightViewProjection_;
+    frame.meshToAsset = mesh.localToWorld;
+    XMStoreFloat4x4(&frame.assetToMesh, XMMatrixInverse(nullptr, XMLoadFloat4x4(&mesh.localToWorld)));
+    if (!shadowPass) XMStoreFloat3(&frame.eye, XMMatrixInverse(nullptr, view).r[3]);
+    frame.nearPlane = cameraNearPlane_;
+    frame.farPlane = cameraFarPlane_;
+    frame.projectionZScale = -projection_._33;
+    frame.projectionZOffset = projection_._43;
+    frame.shadowBias = (scene.shadowBias.samplingTexels + scene.branchVoxelShadowOffsetTexels) * shadowDepthPerTexel_;
+    frame.baseColor = {material.color.x, material.color.y, material.color.z};
+    if (scene.branchVoxelUseNormals && level.normals)
+        frame.useNormals = scene.branchVoxelDirectionalNormals && level.hasDirectionalWeights ? 2u : 1u;
+    frame.toSun = toSun_;
+    frame.transmission = material.transmission;
+    if (scene.branchAppearance == BranchAppearance::Coverage) frame.viewMode = 1u;
+    if (scene.branchAppearance == BranchAppearance::BaseColor) frame.viewMode = 3u;
+    if (scene.branchAppearance == BranchAppearance::Diffuse) frame.viewMode = 4u;
+    if (scene.branchAppearance == BranchAppearance::ReceivedShadows) frame.viewMode = 5u;
+    if (scene.branchAppearance == BranchAppearance::CoverageMask) frame.viewMode = 6u;
+    if (scene.branchAppearance == BranchAppearance::Representation) frame.viewMode = 7u;
+    if (scene.branchVoxelDepthCapture) frame.viewMode = 2u;
+    frame.receivesShadows = scene.meshShadows[meshIndex].receive;
+    frame.mirrored = mesh.mirrored;
+    const auto receiver = scene.branchVoxelShadowReceiver;
+    frame.shadowReceiver = static_cast<UINT>(receiver == VoxelShadowReceiver::BakedLeaf && !level.hasShadowReceivers
+        ? VoxelShadowReceiver::CellEntry : receiver);
+    frame.tightBrickProxies = scene.branchVoxelTightProxies;
+    if (material.colorTexture)
+    {
+        const auto& rgba = scene.asset->textures[*material.colorTexture].mips.back().rgba;
+        const auto linear = [](std::uint8_t value) {
+            const auto s = value / 255.0f;
+            return s <= 0.04045f ? s / 12.92f : std::pow((s + 0.055f) / 1.055f, 2.4f);
+        };
+        frame.baseColor.x *= linear(rgba[0]);
+        frame.baseColor.y *= linear(rgba[1]);
+        frame.baseColor.z *= linear(rgba[2]);
+        frame.encodeColor = 1;
+    }
+    const D3D12_RANGE noCpuReads{0, 0};
+    constexpr auto alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+    constexpr auto stride = (sizeof(VoxelFrameConstants) + alignment - 1) / alignment * alignment;
+    const auto constantOffset = voxelDrawSlot_++ * stride;
+    const D3D12_RANGE written{constantOffset, constantOffset + sizeof(frame)};
+    void* mapped = nullptr;
+    check(voxelConstants_->Map(0, &noCpuReads, &mapped), "Map voxel frame constants");
+    std::memcpy(static_cast<std::byte*>(mapped) + constantOffset, &frame, sizeof(frame));
+    voxelConstants_->Unmap(0, &written);
+
+    commands_->SetPipelineState(shadowPass ? voxelShadowPipeline_.Get() :
+                                (msaaEnabled_ ? voxelMultisample_.Get() : voxelSingleSample_.Get()));
+    commands_->SetGraphicsRootSignature(voxelRoot_.Get());
+    commands_->SetGraphicsRootConstantBufferView(0, voxelConstants_->GetGPUVirtualAddress() + constantOffset);
+    commands_->SetGraphicsRootShaderResourceView(2, level.bricks->GetGPUVirtualAddress());
+    commands_->SetGraphicsRootShaderResourceView(3, (packPlacements ? voxelPlacements_ : instances_)->GetGPUVirtualAddress());
+    if (!shadowPass)
+    {
+        commands_->SetGraphicsRootDescriptorTable(4, shadowTexture_);
+        commands_->SetGraphicsRootShaderResourceView(5, (level.normals ? level.normals : level.bricks)->GetGPUVirtualAddress());
+    }
+    const D3D12_INDEX_BUFFER_VIEW box{voxelBoxIndices_->GetGPUVirtualAddress(), sizeof(voxelBoxIndices), DXGI_FORMAT_R16_UINT};
+    commands_->IASetIndexBuffer(&box);
+    const auto draw = [&](UINT firstPlacement, UINT placementCount)
+    {
+        const auto bricks = static_cast<std::uint64_t>(placementCount) * level.brickCount;
+        if (bricks > UINT_MAX) throw std::runtime_error("Visible voxel brick count exceeds the draw limit.");
+        const VoxelDrawConstants args{level.origin, level.cellSize, level.brickCount, firstPlacement};
+        commands_->SetGraphicsRoot32BitConstants(1, sizeof(args) / sizeof(UINT), &args, 0);
+        commands_->DrawIndexedInstanced(static_cast<UINT>(std::size(voxelBoxIndices)), static_cast<UINT>(bricks), 0, 0, 0);
+        ++stats.draws;
+        ++stats.foliageDraws;
+        ++stats.foliageCalls;
+        stats.voxelBricks += bricks;
+        stats.triangles += bricks * 12;
+        stats.foliageTriangles += bricks * 12;
+    };
+    if (packPlacements)
+    {
+        check(voxelPlacements_->Map(0, &noCpuReads, &mapped), "Map voxel placements");
+        const auto first = voxelPlacementOffset_;
+        auto* placements = static_cast<XMFLOAT4*>(mapped);
+        for (const auto range : visibility.ranges)
+            for (UINT i = range.first; i < range.first + range.count; ++i)
+                placements[voxelPlacementOffset_++] = scene.objects[i].placement;
+        const D3D12_RANGE placementWrites{first * sizeof(XMFLOAT4), voxelPlacementOffset_ * sizeof(XMFLOAT4)};
+        voxelPlacements_->Unmap(0, &placementWrites);
+        draw(first, visibility.count);
+    }
+    else
+        for (const auto range : visibility.ranges) draw(range.first + 1, range.count);
+}
+
 void D3D12Renderer::installMeshPipelines(D3D12_SHADER_BYTECODE cameraVertex, D3D12_SHADER_BYTECODE cameraPixel,
                                          D3D12_SHADER_BYTECODE shadowVertex, D3D12_SHADER_BYTECODE shadowPixel,
                                          const ShadowBiasSettings& bias, bool enableMultisampling)
@@ -987,7 +1739,7 @@ void D3D12Renderer::createTextures(std::span<const TextureAsset> textures)
     check(commands_->Reset(allocator_.Get(), nullptr), "Reset texture upload list");
     D3D12_DESCRIPTOR_HEAP_DESC heap{};
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap.NumDescriptors = static_cast<UINT>(textures.size() + 2);
+    heap.NumDescriptors = static_cast<UINT>(textures.size() + 3);
     heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&textureHeap_)), "Create texture descriptor heap");
     textureDescriptorSize_ = device_->GetDescriptorHandleIncrementSize(heap.Type);
@@ -1018,6 +1770,8 @@ void D3D12Renderer::createTextures(std::span<const TextureAsset> textures)
     device_->CreateShaderResourceView(shadowMap_.Get(), &view, handle);
     shadowTexture_ = textureHeap_->GetGPUDescriptorHandleForHeapStart();
     shadowTexture_.ptr += static_cast<UINT64>(textures.size() + 1) * textureDescriptorSize_;
+    cascadeShadowView_.ptr = handle.ptr + textureDescriptorSize_;
+    writeCascadeShadowView();
     check(commands_->Close(), "Close texture upload command list");
     if (!staging.empty())
     {
@@ -1198,49 +1952,128 @@ XMFLOAT2 D3D12Renderer::updateFrameConstants(const ViewerScene& scene, FXMMATRIX
     // Harmonics give the whole tree a shared gust with a small crosswind component.
     const float gust = 0.70f * std::sin(windPhase) + 0.16f * std::sin(2.0f * windPhase + 0.55f);
     const float crosswind = 0.14f * std::sin(3.0f * windPhase + 0.7f);
-    const float amplitude = windAmplitude_ * scene.windStrength;
+    const float amplitude = scene.branchVoxelView == BranchVoxelView::Off ? windAmplitude_ * scene.windStrength : 0;
     constants.windOffset = {amplitude * (0.94f * gust - 0.34f * crosswind),
                             amplitude * (0.34f * gust + 0.94f * crosswind)};
     constants.windStart = windStart_;
     constants.inverseWindHeight = inverseWindHeight_;
+    constants.useCascades = scene.usesSunCascades();
+    constants.showCascadeColors = scene.showCascadeColors;
+    if (constants.useCascades)
+    {
+        constants.cascadeSplits = {sunCascadeSplits[0], sunCascadeSplits[1], sunCascadeSplits[2], 0};
+        constants.filterCascades = scene.filterSunCascades;
+        if (scene.blendSunCascades)
+            constants.cascadeBlendWidths = {sunCascadeBlendWidths[0], sunCascadeBlendWidths[1], sunCascadeBlendWidths[2], 0};
+        constants.cascadeViewProjections = cascadeViewProjections_;
+        constants.cascadeDepthPerTexel = {cascadeDepthPerTexel_[0], cascadeDepthPerTexel_[1], cascadeDepthPerTexel_[2], 0};
+        constants.lightRight = {sunRotation_._11, sunRotation_._21, sunRotation_._31, 0};
+        constants.cascadeShadowBias = {scene.shadowBias.samplingTexels * cascadeDepthPerTexel_[0],
+                                       scene.shadowBias.samplingTexels * cascadeDepthPerTexel_[1],
+                                       scene.shadowBias.samplingTexels * cascadeDepthPerTexel_[2], 0};
+        constants.cascadeNormalBias = {scene.shadowBias.normalTexels * cascadeWorldUnitsPerTexel_[0],
+                                       scene.shadowBias.normalTexels * cascadeWorldUnitsPerTexel_[1],
+                                       scene.shadowBias.normalTexels * cascadeWorldUnitsPerTexel_[2], 0};
+    }
 
     const D3D12_RANGE noCpuReads{0, 0};
-    const D3D12_RANGE written{0, sizeof(constants)};
+    const D3D12_RANGE written{0, constants.useCascades ? sunCascadeSplits.size() * frameConstantStride + sizeof(constants) :
+                                                     sizeof(constants)};
     void* mapped = nullptr;
     check(frameConstants_->Map(0, &noCpuReads, &mapped), "Map frame constants");
     std::memcpy(mapped, &constants, sizeof(constants));
+    if (constants.useCascades)
+    {
+        auto shadowConstants = constants;
+        for (std::size_t i = 0; i < sunCascadeSplits.size(); ++i)
+        {
+            shadowConstants.lightViewProjection = cascadeViewProjections_[i];
+            std::memcpy(static_cast<std::byte*>(mapped) + (i + 1) * frameConstantStride, &shadowConstants, sizeof(shadowConstants));
+        }
+    }
     frameConstants_->Unmap(0, &written);
     return constants.windOffset;
 }
 
 D3D12Renderer::FrameTiming D3D12Renderer::drawFrame(
     const ViewerScene& scene, const XMFLOAT4X4& view, float windPhase, std::string_view hud,
-    const std::function<void(ID3D12GraphicsCommandList*)>& drawOverlay, std::vector<std::uint32_t>* capture)
+    const std::function<void(ID3D12GraphicsCommandList*)>& drawOverlay, std::vector<std::uint32_t>* capture,
+    const XMFLOAT4X4* cascadeFitView)
 {
     using Clock = std::chrono::steady_clock;
     const auto cpuStart = Clock::now();
     updateShadowPipeline(scene.shadowBias);
+    const bool cascades = scene.usesSunCascades();
+    if (cascades)
+    {
+        if (!cascadeShadowMap_) createCascadeShadowMaps();
+        updateShadowCascades(cascadeFitView ? *cascadeFitView : view, scene);
+    }
     const auto viewProjection = XMLoadFloat4x4(&view) * XMLoadFloat4x4(&projection_);
     const auto windOffset = updateFrameConstants(scene, viewProjection, windPhase);
     prepareVisibility(scene, viewProjection, windOffset);
-    showShadowFactor_ = scene.showShadowFactor;
+    const bool voxelView = scene.branchVoxelView != BranchVoxelView::Off;
+    const bool automaticVoxels = automaticBranchVoxels(scene.branchVoxelView);
+    const bool regional = scene.branchVoxelView == BranchVoxelView::Regional && scene.branchVoxelRegions;
+    const bool experiment = voxelView && !automaticVoxels;
+    showShadowFactor_ = !voxelView && scene.showShadowFactor;
+    branchAppearance_ = voxelView ? scene.branchAppearance : BranchAppearance::Shaded;
+    diagnosticFoliage_ = branchAppearance_ != BranchAppearance::Shaded ? &meshes_[scene.fixedLod->meshIndex] : nullptr;
     double drawListMs = 0.0;
-    if (scene.fixedLod && scene.branchLod == automaticBranchLod)
+    voxelDrawSlot_ = 0;
+    voxelPlacementOffset_ = 0;
+    const auto drawListStart = Clock::now();
+    prepareFoliageGroupVisibility(scene, viewProjection, windOffset);
+    const bool groupDraws = !cameraGroupVisibility_.empty();
+    const bool automaticTriangles = automaticVoxels || scene.branchLod == automaticBranchLod;
+    const bool cascadeCasterLists = scene.usesCascadeCasterLists();
+    std::size_t argumentBytes = 0;
+    shareBranchDraws_ = true;
+    if (!experiment && scene.fixedLod && (automaticTriangles || groupDraws))
     {
-        const auto drawListStart = Clock::now();
-        std::size_t argumentBytes = 0;
-        prepareBranchDraws(scene, cameraVisibility_, cameraBranchDraws_, argumentBytes);
+        bool mixedRegions = false;
+        if (automaticVoxels)
+        {
+            cameraTriangleBranches_.clear();
+            cameraVoxelBranches_.clear();
+            for (auto& visibility : cameraVoxelRegions_) visibility.clear();
+            const auto& cut = scene.branchLodSelection.voxelCut;
+            for (const auto range : cameraVisibility_.ranges)
+            {
+                for (UINT i = range.first; i < range.first + range.count; ++i)
+                {
+                    const auto mask = i < cut.size() ? cut[i] : 0;
+                    if (mask == allVoxelRegions)
+                    {
+                        cameraVoxelBranches_.add(i);
+                        continue;
+                    }
+                    cameraTriangleBranches_.add(i);
+                    if (!regional || !mask) continue;
+                    mixedRegions = true;
+                    for (std::size_t region = 0; region < voxelBranchRegionCount; ++region)
+                        if (mask & (1u << region)) cameraVoxelRegions_[region].add(i);
+                }
+            }
+        }
+        const auto& triangleVisibility = automaticVoxels ? cameraTriangleBranches_ : cameraVisibility_;
+        prepareBranchDraws(scene, triangleVisibility, cameraBranchDraws_, argumentBytes, mixedRegions,
+                           cameraGroupVisibility_, automaticTriangles ? automaticBranchLod : scene.branchLod);
         const bool hasOverride = scene.branchShadowLod >= 0;
-        shareBranchDraws_ = true;
-        if (!hasOverride || scene.shadowLodOffCameraOnly)
+        if (!cascadeCasterLists && automaticTriangles && (!hasOverride || scene.shadowLodOffCameraOnly))
         {
             const auto& matching = hasOverride ? shadowMatchVisibility_ : shadowVisibility_;
-            shareBranchDraws_ = cameraVisibility_.ranges == matching.ranges;
+            shareBranchDraws_ = !mixedRegions && !groupDraws && triangleVisibility.ranges == matching.ranges;
             if (!shareBranchDraws_)
             {
                 prepareBranchDraws(scene, matching, shadowBranchDraws_, argumentBytes);
             }
         }
+        drawListMs = std::chrono::duration<double, std::milli>(Clock::now() - drawListStart).count();
+    }
+    if (cascadeCasterLists)
+    {
+        prepareCascadeCasterDraws(scene, windOffset, argumentBytes);
         drawListMs = std::chrono::duration<double, std::milli>(Clock::now() - drawListStart).count();
     }
     const UINT bufferIndex = swapChain_->GetCurrentBackBufferIndex();
@@ -1260,7 +2093,8 @@ D3D12Renderer::FrameTiming D3D12Renderer::drawFrame(
     commands_->SetDescriptorHeaps(1, heaps);
     commands_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     timestamp(ShadowStart);
-    const auto shadow = drawShadowMap(scene);
+    std::array<PassStats, sunCascadeSplits.size()> shadowCascades{};
+    const auto shadow = cascades ? drawCascadeShadowMaps(scene, shadowCascades) : drawShadowMap(scene);
     timestamp(ShadowEnd);
     commands_->SetPipelineState(mode.pipeline.Get());
     commands_->SetGraphicsRootDescriptorTable(2, shadowTexture_);
@@ -1277,7 +2111,16 @@ D3D12Renderer::FrameTiming D3D12Renderer::drawFrame(
     commands_->RSSetViewports(1, &viewport_);
     commands_->RSSetScissorRects(1, &scissor_);
     commands_->OMSetRenderTargets(1, &colorTarget, FALSE, &mode.depthTarget);
-    const auto camera = drawMeshes(scene, false);
+    auto camera = drawMeshes(scene, false);
+    if (const auto voxelIndex = branchVoxelIndex(scene.branchVoxelView))
+        drawBranchVoxels(scene, voxelLevels_[*voxelIndex], XMLoadFloat4x4(&view), cameraVisibility_, camera, false);
+    else if (automaticVoxels)
+    {
+        drawBranchVoxels(scene, voxelLevels_[automaticBranchVoxelIndex], XMLoadFloat4x4(&view), cameraVoxelBranches_, camera, true);
+        if (regional)
+            for (std::size_t i = 0; i < voxelBranchRegionCount; ++i)
+                drawBranchVoxels(scene, voxelRegionLevels_[i], XMLoadFloat4x4(&view), cameraVoxelRegions_[i], camera, true);
+    }
 
     auto backBufferState = D3D12_RESOURCE_STATE_RENDER_TARGET;
     if (msaaEnabled_)
@@ -1326,6 +2169,7 @@ D3D12Renderer::FrameTiming D3D12Renderer::drawFrame(
     timing.drawCalls = shadow.draws + camera.draws + (hud.empty() ? 0u : 1u);
     timing.camera = camera;
     timing.shadow = shadow;
+    timing.shadowCascades = shadowCascades;
     timing.cpuBranchDrawListMilliseconds = drawListMs;
     readGpuTimes(timing);
     return timing;
@@ -1385,19 +2229,86 @@ D3D12Renderer::PassStats D3D12Renderer::drawShadowMap(const ViewerScene& scene)
     commands_->RSSetViewports(1, &viewport);
     commands_->RSSetScissorRects(1, &scissor);
     commands_->OMSetRenderTargets(0, nullptr, FALSE, &shadowDepthTarget_);
-    const auto stats = drawMeshes(scene, true);
+    const auto voxelIndex = scene.diagnosticVoxelShadowCasters ? branchVoxelIndex(scene.branchVoxelView) : std::nullopt;
+    auto stats = drawMeshes(scene, true, voxelIndex.has_value());
+    if (voxelIndex && scene.meshShadows[scene.fixedLod->meshIndex].cast)
+    {
+        drawBranchVoxels(scene, voxelLevels_[*voxelIndex], XMMatrixIdentity(), shadowVisibility_, stats, false, true);
+        commands_->SetGraphicsRootSignature(rootSignature_.Get());
+        commands_->SetGraphicsRootConstantBufferView(3, frameConstants_->GetGPUVirtualAddress());
+    }
     transitionResource(commands_.Get(), shadowMap_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     return stats;
 }
 
-D3D12Renderer::PassStats D3D12Renderer::drawMeshes(const ViewerScene& scene, bool shadowPass)
+D3D12Renderer::PassStats D3D12Renderer::drawCascadeShadowMaps(const ViewerScene& scene,
+                                                           std::array<PassStats, sunCascadeSplits.size()>& slices)
+{
+    transitionResource(commands_.Get(), cascadeShadowMap_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    const D3D12_VIEWPORT viewport{0.0f, 0.0f, shadowMapSize, shadowMapSize, 0.0f, 1.0f};
+    const D3D12_RECT scissor{0, 0, shadowMapSize, shadowMapSize};
+    commands_->RSSetViewports(1, &viewport);
+    commands_->RSSetScissorRects(1, &scissor);
+    PassStats total;
+    const bool separateCasters = scene.usesCascadeCasterLists();
+    for (std::size_t cascade = 0; cascade < cascadeDepthTargets_.size(); ++cascade)
+    {
+        const auto target = cascadeDepthTargets_[cascade];
+        commands_->OMSetRenderTargets(0, nullptr, FALSE, &target);
+        commands_->ClearDepthStencilView(target, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        commands_->SetGraphicsRootConstantBufferView(3, frameConstants_->GetGPUVirtualAddress() +
+                                                        (cascade + 1) * frameConstantStride);
+        const auto pass = drawMeshes(scene, true, false, separateCasters ? &cascadeCasterDraws_[cascade] : nullptr);
+        slices[cascade] = pass;
+        total.draws += pass.draws;
+        total.foliageDraws += pass.foliageDraws;
+        total.foliageCalls += pass.foliageCalls;
+        total.triangles += pass.triangles;
+        total.foliageTriangles += pass.foliageTriangles;
+        total.proxyFoliageTriangles += pass.proxyFoliageTriangles;
+        total.visibleInstances = pass.visibleInstances;
+        total.shadowLodOverrides = pass.shadowLodOverrides;
+    }
+    if (separateCasters)
+    {
+        total.visibleInstances = static_cast<unsigned>(std::ranges::count_if(cascadeInstanceFlags_,
+            [](auto flags) { return flags & cascadeCasterVisible; }));
+        total.shadowLodOverrides = static_cast<unsigned>(std::ranges::count_if(cascadeInstanceFlags_,
+            [](auto flags) { return flags & cascadeCasterOverride; }));
+    }
+    commands_->SetGraphicsRootConstantBufferView(3, frameConstants_->GetGPUVirtualAddress());
+    transitionResource(commands_.Get(), cascadeShadowMap_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    return total;
+}
+
+D3D12Renderer::PassStats D3D12Renderer::drawMeshes(const ViewerScene& scene, bool shadowPass, bool omitFoliage,
+                                                const CascadeCasterDraws* cascade)
 {
     commands_->IASetVertexBuffers(1, 1, &instanceView_);
-    const auto& visibility = shadowPass ? shadowVisibility_ : cameraVisibility_;
-    const auto& lodDraws = shadowPass && !shareBranchDraws_ ? shadowBranchDraws_ : cameraBranchDraws_;
+    const auto& visibility = cascade ? cascade->instances : (shadowPass ? shadowVisibility_ : cameraVisibility_);
+    const auto& lodDraws = cascade ? cascade->bakedFoliage : (shadowPass && !shareBranchDraws_ ? shadowBranchDraws_ : cameraBranchDraws_);
+    const bool automaticVoxels = automaticBranchVoxels(scene.branchVoxelView);
+    const bool experiment = scene.branchVoxelView != BranchVoxelView::Off && !automaticVoxels;
+    const auto triangleLod = static_cast<int>(fixedLodTwoTriangleLevel);
+    const int cameraLod = experiment ? (scene.branchVoxelView == BranchVoxelView::Source ? sourceBranchLod : triangleLod)
+                                     : (automaticVoxels ? automaticBranchLod : scene.branchLod);
+    const int shadowLod = experiment ? triangleLod : scene.branchShadowLod;
+    const bool offCameraOnly = !experiment && scene.shadowLodOffCameraOnly;
     PassStats stats;
     stats.visibleInstances = visibility.count;
+    if (cascade)
+    {
+        stats.foliageGroupsConsidered = cascade->groupsConsidered;
+        stats.foliageGroupsVisible = cascade->groupsVisible;
+    }
+    if (!shadowPass)
+    {
+        stats.foliageGroupsConsidered = cameraGroupsConsidered_;
+        stats.foliageGroupsVisible = cameraGroupsVisible_;
+    }
     for (std::size_t i = 0; i < meshes_.size(); ++i)
     {
         const auto& flags = scene.meshShadows[i];
@@ -1425,40 +2336,45 @@ D3D12Renderer::PassStats D3D12Renderer::drawMeshes(const ViewerScene& scene, boo
             continue;
         }
 
-        const auto tint = shadowPass ? FixedLodTint::Shaded : scene.lodTint;
-        const UINT highlightedGroup = !shadowPass && scene.highlightLodGroup
+        if (omitFoliage || (!shadowPass && branchVoxelIndex(scene.branchVoxelView))) continue;
+        const auto tint = shadowPass || scene.branchVoxelView != BranchVoxelView::Off ? FixedLodTint::Shaded : scene.lodTint;
+        const UINT highlightedGroup = !shadowPass && scene.branchVoxelView == BranchVoxelView::Off && scene.highlightLodGroup
             ? static_cast<UINT>(scene.inspectedLodGroup) + 1 : 0;
         const auto drawLod = [&](std::size_t level, FixedLodIndexRange range, UINT instances, UINT firstInstance) {
-            record(drawMesh(mesh, material, scene.foliage, flags.receive, instances, firstInstance,
-                            &fixedLodLevels_[level], tint, highlightedGroup, static_cast<UINT>(level), range));
+            const auto triangles = drawMesh(mesh, material, scene.foliage, flags.receive, instances, firstInstance,
+                                            &fixedLodLevels_[level], tint, highlightedGroup, static_cast<UINT>(level), range);
+            record(triangles);
+            if (level == fixedLodTwoTriangleLevel) stats.proxyFoliageTriangles += triangles;
         };
-        const PassVisibility* matching = &visibility;
-        if (shadowPass && scene.branchShadowLod >= 0)
+        if (cascade)
         {
-            const auto& forced = scene.shadowLodOffCameraOnly ? shadowOverrideVisibility_ : visibility;
-            stats.shadowLodOverrides = forced.count;
-            for (const auto range : forced.ranges)
-            {
-                drawLod(static_cast<std::size_t>(scene.branchShadowLod), {}, range.count, range.first + 1);
-            }
-            if (!scene.shadowLodOffCameraOnly) continue;
-            matching = &shadowMatchVisibility_;
-        }
-        if (scene.branchLod == sourceBranchLod)
-        {
-            for (const auto range : matching->ranges)
-            {
+            for (const auto range : cascade->sourceFoliage.ranges)
                 record(drawMesh(mesh, material, scene.foliage, flags.receive, range.count, range.first + 1));
-            }
-            continue;
         }
-        if (scene.branchLod >= 0)
+        else
         {
-            for (const auto range : matching->ranges)
+            const PassVisibility* matching = &visibility;
+            if (shadowPass && shadowLod >= 0)
             {
-                drawLod(static_cast<std::size_t>(scene.branchLod), {}, range.count, range.first + 1);
+                const auto& forced = offCameraOnly ? shadowOverrideVisibility_ : visibility;
+                stats.shadowLodOverrides = forced.count;
+                for (const auto range : forced.ranges)
+                    drawLod(static_cast<std::size_t>(shadowLod), {}, range.count, range.first + 1);
+                if (!offCameraOnly) continue;
+                matching = &shadowMatchVisibility_;
             }
-            continue;
+            if (cameraLod == sourceBranchLod)
+            {
+                for (const auto range : matching->ranges)
+                    record(drawMesh(mesh, material, scene.foliage, flags.receive, range.count, range.first + 1));
+                continue;
+            }
+            if (cameraLod >= 0 && (shadowPass || cameraGroupVisibility_.empty()))
+            {
+                for (const auto range : matching->ranges)
+                    drawLod(static_cast<std::size_t>(cameraLod), {}, range.count, range.first + 1);
+                continue;
+            }
         }
 
         UINT64 argumentOffset = lodDraws.argumentOffset.value_or(0);
@@ -1479,6 +2395,7 @@ D3D12Renderer::PassStats D3D12Renderer::drawMeshes(const ViewerScene& scene, boo
                 ++stats.foliageCalls;
                 stats.triangles += lodDraws.triangles[level];
                 stats.foliageTriangles += lodDraws.triangles[level];
+                if (level == fixedLodTwoTriangleLevel) stats.proxyFoliageTriangles += lodDraws.triangles[level];
                 continue;
             }
             for (const auto& draw : draws)
@@ -1526,7 +2443,10 @@ void D3D12Renderer::bindMesh(const GpuMesh& mesh, const MaterialData& material, 
     constants.highlightedLodGroup = highlightedGroup;
     constants.firstLodTriangle = firstTriangle;
     constants.lodLevel = lodLevel;
-    constants.shadowView = showShadowFactor_ ? (&mesh == &ground_ ? 1u : 2u) : 0u;
+    if (&mesh == diagnosticFoliage_)
+        constants.shadowView = static_cast<UINT>(branchAppearance_) + 2u;
+    else if (showShadowFactor_)
+        constants.shadowView = &mesh == &ground_ ? 1u : 2u;
     if (material.twoSidedTransmission)
     {
         constants.twoSidedNormalSign = mesh.mirrored ? -1 : 1;

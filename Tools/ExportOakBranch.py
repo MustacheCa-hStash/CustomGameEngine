@@ -63,13 +63,7 @@ leaves = bpy.data.objects["Individual curved leaf geometry" if full_tree else "O
 
 bpy.ops.object.select_all(action="DESELECT")
 material = leaves.data.materials[0]
-if full_tree:
-    image = bpy.data.images.new("Oak leaf base color", width=4, height=4)
-    image.colorspace_settings.name = "sRGB"
-    image.pixels = [0.272, 0.373, 0.168, 1.0] * 16
-    image.pack()
-else:
-    image = bake_leaf_base_color(leaves, material)
+image = bake_leaf_base_color(leaves, material)
 
 minimum_z = 0.0 if full_tree else min((bark.matrix_world @ vertex.co).z for vertex in bark.data.vertices)
 for obj in (bark, leaves):

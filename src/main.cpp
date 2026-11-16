@@ -125,11 +125,13 @@ struct OrbitCamera
         zoomLimit = std::max(45.0f * homeDistance / defaultDistance, distantDistance);
     }
 
-    void zoom(float steps)
+    void setDistance(float requested)
     {
         const float scale = homeDistance / defaultDistance;
-        distance = std::clamp(distance * std::pow(0.85f, steps), 1.5f * scale, zoomLimit);
+        if (std::isfinite(requested)) distance = std::clamp(requested, 1.5f * scale, zoomLimit);
     }
+
+    void zoom(float steps) { setDistance(distance * std::pow(0.85f, steps)); }
 
     CameraView currentView() const
     {
@@ -248,13 +250,24 @@ void updateWindowTitle(HWND window, const D3D12Renderer& renderer, const ViewerS
     SetWindowTextW(window, title.c_str());
 }
 
+enum class BranchBenchmarkKind { Triangle, Shadow, Voxel, VoxelNormals, VoxelBounds, Lighting, Transition, Region, OakWalk, OakWalkCull,
+                                 SunCascades, SunCascadeStability, SunCascadeTransition, SunCascadeCasters };
+
 struct LaunchOptions
 {
     SceneKind kind = SceneKind::Cube;
     std::filesystem::path imported;
     bool resetSettings = false;
     std::filesystem::path benchmarkReport;
-    bool shadowBenchmark = false;
+    BranchBenchmarkKind benchmark = BranchBenchmarkKind::Triangle;
+    std::array<std::filesystem::path, 2> farVoxelBakes;
+    VoxelShadingComparison voxelShading = VoxelShadingComparison::None;
+    float voxelEntryPixels = branchVoxelDefaultEntryPixels;
+    bool compareVoxelShadowMidpoint = false;
+    bool compareVoxelShadowCasters = false;
+    unsigned pilotRegion = 0;
+    std::filesystem::path regionCandidate;
+    bool stabilizedCascadeBenchmark = false;
 };
 
 LaunchOptions launchOptions()
@@ -269,20 +282,111 @@ LaunchOptions launchOptions()
     if (count > 1)
     {
         const std::wstring_view option = arguments.get()[1];
-        if (option == L"--branch-benchmark" || option == L"--branch-shadow-benchmark")
+        if (option == L"--sun-cascade-caster-benchmark")
         {
-            if (count != 3 || arguments.get()[2][0] == L'\0')
+            if (count != 3 || !arguments.get()[2][0]) throw std::runtime_error("Supply a CSV output path.");
+            return {SceneKind::ModeledOakWalk, {}, false, arguments.get()[2], BranchBenchmarkKind::SunCascadeCasters};
+        }
+        if (option == L"--sun-cascade-stability-benchmark" || option == L"--sun-cascade-transition-benchmark")
+        {
+            if (count != 3 || !arguments.get()[2][0]) throw std::runtime_error("Supply a CSV output path.");
+            const auto kind = option == L"--sun-cascade-stability-benchmark" ?
+                BranchBenchmarkKind::SunCascadeStability : BranchBenchmarkKind::SunCascadeTransition;
+            return {SceneKind::ModeledOakWalk, {}, false, arguments.get()[2], kind};
+        }
+        if (option == L"--sun-cascade-benchmark")
+        {
+            const bool stabilized = count == 4 && std::wstring_view(arguments.get()[3]) == L"--stable";
+            if ((count != 3 && !stabilized) || !arguments.get()[2][0])
+                throw std::runtime_error("Supply a CSV output path and optional --stable.");
+            LaunchOptions launch{SceneKind::ModeledOakWalk, {}, false, arguments.get()[2], BranchBenchmarkKind::SunCascades};
+            launch.stabilizedCascadeBenchmark = stabilized;
+            return launch;
+        }
+        if (option == L"--oak-walk-benchmark" || option == L"--oak-walk-cull-benchmark")
+        {
+            if (count != 3 || !arguments.get()[2][0]) throw std::runtime_error("Supply a CSV output path.");
+            const auto kind = option == L"--oak-walk-benchmark" ? BranchBenchmarkKind::OakWalk : BranchBenchmarkKind::OakWalkCull;
+            return {SceneKind::ModeledOakWalk, {}, false, arguments.get()[2], kind};
+        }
+        if (option == L"--branch-voxel-bounds-benchmark")
+        {
+            if (count != 3 || !arguments.get()[2][0]) throw std::runtime_error("Supply a CSV output path.");
+            return {SceneKind::OakBranch, {}, false, arguments.get()[2], BranchBenchmarkKind::VoxelBounds};
+        }
+        if (option == L"--branch-transition-benchmark")
+        {
+            if ((count != 3 && count != 4) || !arguments.get()[2][0])
+                throw std::runtime_error("Supply a CSV output path and optional voxel entry limit in pixels.");
+            LaunchOptions launch{SceneKind::OakBranchTransition, {}, false, arguments.get()[2], BranchBenchmarkKind::Transition};
+            if (count == 4)
             {
-                throw std::runtime_error("Supply a CSV output path after the benchmark option.");
+                const std::wstring value = arguments.get()[3];
+                std::size_t consumed = 0;
+                launch.voxelEntryPixels = std::stof(value, &consumed);
+                if (consumed != value.size() || !(launch.voxelEntryPixels >= 0.1f && launch.voxelEntryPixels <= 1.0f))
+                    throw std::runtime_error("Voxel entry limit must be 0.1 to 1.0 pixels.");
             }
-            const bool shadowBenchmark = option == L"--branch-shadow-benchmark";
-            return {shadowBenchmark ? SceneKind::OakBranchGrid : SceneKind::OakBranch, {}, false,
-                    arguments.get()[2], shadowBenchmark};
+            return launch;
+        }
+        if (option == L"--branch-region-benchmark")
+        {
+            if ((count != 4 && count != 5) || !arguments.get()[2][0])
+                throw std::runtime_error("Supply a CSV output path, region index, and optional region voxel bake.");
+            const std::wstring_view region = arguments.get()[3];
+            if (region.size() != 1 || region.front() < L'0' ||
+                region.front() >= L'0' + static_cast<wchar_t>(voxelBranchRegionCount))
+                throw std::runtime_error("The region index is out of range.");
+            LaunchOptions launch{SceneKind::OakBranchTransition, {}, false, arguments.get()[2], BranchBenchmarkKind::Region};
+            launch.pilotRegion = static_cast<unsigned>(region.front() - L'0');
+            if (count == 5) launch.regionCandidate = arguments.get()[4];
+            return launch;
+        }
+        if (option == L"--branch-voxel-normal-benchmark" || option == L"--branch-lighting-diagnostics")
+        {
+            const bool directional = count == 4 && std::wstring_view(arguments.get()[3]) == L"--directional";
+            const auto kind = option == L"--branch-lighting-diagnostics" ? BranchBenchmarkKind::Lighting
+                                                                       : BranchBenchmarkKind::VoxelNormals;
+            const bool shadowReceiver = kind == BranchBenchmarkKind::VoxelNormals && count == 4 &&
+                                        std::wstring_view(arguments.get()[3]) == L"--shadow-receiver";
+            const bool midpoint = kind == BranchBenchmarkKind::Lighting && count == 4 &&
+                                  std::wstring_view(arguments.get()[3]) == L"--midpoint";
+            const bool casterMatrix = kind == BranchBenchmarkKind::Lighting && count == 4 &&
+                                      std::wstring_view(arguments.get()[3]) == L"--caster-matrix";
+            if ((count != 3 && !directional && !shadowReceiver && !midpoint && !casterMatrix) || !arguments.get()[2][0])
+                throw std::runtime_error(kind == BranchBenchmarkKind::Lighting
+                    ? "Supply a CSV output path, optionally followed by --directional, --midpoint, or --caster-matrix."
+                    : "Supply a CSV output path, optionally followed by --directional or --shadow-receiver.");
+            const auto shading = shadowReceiver ? VoxelShadingComparison::ShadowReceiver :
+                (directional ? VoxelShadingComparison::DirectionalNormals : VoxelShadingComparison::PooledNormals);
+            LaunchOptions launch{SceneKind::OakBranch, {}, false, arguments.get()[2], kind, {}, shading};
+            launch.compareVoxelShadowMidpoint = midpoint || casterMatrix;
+            launch.compareVoxelShadowCasters = casterMatrix;
+            return launch;
+        }
+        if (option == L"--branch-benchmark" || option == L"--branch-shadow-benchmark" || option == L"--branch-voxel-benchmark")
+        {
+            const bool farVoxelRoute = option == L"--branch-voxel-benchmark" && count == 5;
+            if ((count != 3 && !farVoxelRoute) || arguments.get()[2][0] == L'\0')
+            {
+                throw std::runtime_error("Supply a CSV output path. The voxel benchmark also accepts two voxel bakes for the far route.");
+            }
+            const auto benchmark = option == L"--branch-shadow-benchmark" ? BranchBenchmarkKind::Shadow :
+                (option == L"--branch-voxel-benchmark" ? BranchBenchmarkKind::Voxel : BranchBenchmarkKind::Triangle);
+            LaunchOptions launch{benchmark == BranchBenchmarkKind::Shadow ? SceneKind::OakBranchGrid : SceneKind::OakBranch,
+                                 {}, false, arguments.get()[2], benchmark};
+            if (farVoxelRoute)
+            {
+                if (!arguments.get()[3][0] || !arguments.get()[4][0])
+                    throw std::runtime_error("Both far voxel bake paths must be nonempty.");
+                launch.farVoxelBakes = {arguments.get()[3], arguments.get()[4]};
+            }
+            return launch;
         }
     }
     if (count > 2)
     {
-        throw std::runtime_error("Usage: CustomGameEngine.exe [--oak | --modeled-oak | --grove | --branch | --branch-grid | --branch-benchmark report.csv | --branch-shadow-benchmark report.csv | path-to-mesh.glb | --reset-settings]");
+        throw std::runtime_error("Usage: CustomGameEngine.exe [--oak | --modeled-oak | --grove | --branch | --branch-grid | --branch-orbit | --branch-benchmark report.csv | --branch-shadow-benchmark report.csv | --branch-voxel-benchmark report.csv | path-to-mesh.glb | --reset-settings]");
     }
     if (count == 2)
     {
@@ -290,8 +394,11 @@ LaunchOptions launchOptions()
         if (option == L"--grove") return {SceneKind::Grove, {}};
         if (option == L"--oak") return {SceneKind::Oak, {}};
         if (option == L"--modeled-oak") return {SceneKind::ModeledOak, {}};
+        if (option == L"--oak-walk") return {SceneKind::ModeledOakWalk, {}};
         if (option == L"--branch") return {SceneKind::OakBranch, {}};
         if (option == L"--branch-grid") return {SceneKind::OakBranchGrid, {}};
+        if (option == L"--branch-orbit") return {SceneKind::OakBranchOrbit, {}};
+        if (option == L"--branch-transition") return {SceneKind::OakBranchTransition, {}};
         if (option == L"--reset-settings") return {SceneKind::Cube, {}, true};
         return {SceneKind::Imported, arguments.get()[1]};
     }
@@ -354,7 +461,31 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
             D3D12Renderer renderer(window);
             if (renderer.msaaEnabled()) renderer.toggleMsaa();
             ShowWindow(window, showCommand);
-            if (launch.shadowBenchmark) return runBranchShadowBenchmark(window, *scene, renderer, launch.benchmarkReport);
+            if (launch.benchmark == BranchBenchmarkKind::Shadow) return runBranchShadowBenchmark(window, *scene, renderer, launch.benchmarkReport);
+            if (launch.benchmark == BranchBenchmarkKind::Lighting)
+                return runBranchLightingDiagnostics(*scene, renderer, launch.benchmarkReport,
+                                                    launch.voxelShading == VoxelShadingComparison::DirectionalNormals,
+                                                    launch.compareVoxelShadowMidpoint, launch.compareVoxelShadowCasters);
+            if (launch.benchmark == BranchBenchmarkKind::Transition)
+                return runBranchTransitionBenchmark(*scene, renderer, launch.benchmarkReport, launch.voxelEntryPixels);
+            if (launch.benchmark == BranchBenchmarkKind::Region)
+                return runBranchRegionBenchmark(*scene, renderer, launch.benchmarkReport, launch.pilotRegion, launch.regionCandidate);
+            if (launch.benchmark == BranchBenchmarkKind::OakWalk)
+                return runOakWalkBenchmark(*scene, renderer, launch.benchmarkReport);
+            if (launch.benchmark == BranchBenchmarkKind::OakWalkCull)
+                return runOakWalkCullBenchmark(*scene, renderer, launch.benchmarkReport);
+            if (launch.benchmark == BranchBenchmarkKind::SunCascades)
+                return runSunCascadeBenchmark(*scene, renderer, launch.benchmarkReport, launch.stabilizedCascadeBenchmark);
+            if (launch.benchmark == BranchBenchmarkKind::SunCascadeStability)
+                return runSunCascadeStabilityBenchmark(*scene, renderer, launch.benchmarkReport);
+            if (launch.benchmark == BranchBenchmarkKind::SunCascadeTransition)
+                return runSunCascadeTransitionBenchmark(*scene, renderer, launch.benchmarkReport);
+            if (launch.benchmark == BranchBenchmarkKind::SunCascadeCasters)
+                return runSunCascadeCasterBenchmark(*scene, renderer, launch.benchmarkReport);
+            if (launch.benchmark == BranchBenchmarkKind::Voxel || launch.benchmark == BranchBenchmarkKind::VoxelNormals ||
+                launch.benchmark == BranchBenchmarkKind::VoxelBounds)
+                return runBranchVoxelBenchmark(window, *scene, renderer, launch.benchmarkReport, launch.farVoxelBakes,
+                                               launch.voxelShading, launch.benchmark == BranchBenchmarkKind::VoxelBounds);
             return runBranchBenchmark(window, *scene, renderer, launch.benchmarkReport);
         }
         settings.apply(*scene);
@@ -368,15 +499,36 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         if (scene->windPaused) wind.togglePause();
         D3D12Renderer::FrameTiming timing{};
         std::optional<Clock::time_point> routeStart;
+        std::optional<Clock::time_point> branchOrbitStart;
+        float orbitSeconds = 0.0f;
         std::string sceneError;
         std::future<ShaderCompilation> shaderReload;
         std::string shaderDiagnostics;
 
-        const auto applyView = [&](CameraPreset preset) {
+        const auto useCameraView = [&](const CameraView& view) {
             routeStart.reset();
-            const float distant = isOakBranchScene(scene->kind)
-                ? scene->cameraView(CameraPreset::Distant).distance : 0.0f;
-            camera.useView(scene->cameraView(preset), scene->cameraView(CameraPreset::Overview).distance, distant);
+            branchOrbitStart.reset();
+            orbitSeconds = 0.0f;
+            const float distant = isOakBranchScene(scene->kind) ? branchVoxelFarDistances.back() : 0.0f;
+            camera.useView(view, scene->cameraView(CameraPreset::Overview).distance, distant);
+        };
+        const auto applyView = [&](CameraPreset preset) {
+            if (scene->kind == SceneKind::ModeledOakWalk) useCameraView(oakWalkView(scene->oakWalkRoute, 0.0f));
+            else useCameraView(isBranchOrbitScene(scene->kind)
+                ? scene->branchOrbitView(0.0f, branchOrbitDistance) : scene->cameraView(preset));
+        };
+        const auto orbitDuration = [&] {
+            return scene->kind == SceneKind::ModeledOakWalk ? oakWalkDuration(scene->oakWalkRoute) : branchOrbitDuration;
+        };
+        const auto toggleOrbit = [&] {
+            if (branchOrbitStart)
+            {
+                branchOrbitStart.reset();
+                return;
+            }
+            if (orbitSeconds >= orbitDuration()) orbitSeconds = 0.0f;
+            branchOrbitStart = Clock::now() - std::chrono::duration_cast<Clock::duration>(
+                std::chrono::duration<float>(orbitSeconds));
         };
         const auto refreshTitle = [&] {
             updateWindowTitle(window, renderer, *scene, routeStart.has_value());
@@ -430,6 +582,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
                 if (initialKeyDown && !SceneInspector::wantsKeyboard())
                 {
                     const bool grove = scene->kind == SceneKind::Grove;
+                    if ((isBranchOrbitScene(scene->kind) || scene->kind == SceneKind::ModeledOakWalk) && message.wParam == 'B')
+                    {
+                        toggleOrbit();
+                        continue;
+                    }
                     if (message.wParam == 'M')
                     {
                         toggleMsaa();
@@ -462,6 +619,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
 
             if (IsIconic(window))
             {
+                branchOrbitStart.reset();
                 settings.save();
                 WaitMessage();
                 hud.reset();
@@ -496,7 +654,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
             }
 
             auto view = camera.currentView();
-            if (routeStart)
+            if (isBranchOrbitScene(scene->kind) || scene->kind == SceneKind::ModeledOakWalk)
+            {
+                if (branchOrbitStart)
+                {
+                    const auto elapsed = std::chrono::duration<float>(Clock::now() - *branchOrbitStart).count();
+                    orbitSeconds = std::min(elapsed, orbitDuration());
+                    if (orbitSeconds == orbitDuration()) branchOrbitStart.reset();
+                }
+                view = scene->kind == SceneKind::ModeledOakWalk ? oakWalkView(scene->oakWalkRoute, orbitSeconds) :
+                                                               scene->branchOrbitView(orbitSeconds, camera.distance);
+            }
+            else if (routeStart)
             {
                 constexpr double routeSeconds = 24.0;
                 const double elapsed = std::chrono::duration<double>(Clock::now() - *routeStart).count();
@@ -506,12 +675,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
                 view.pitch = 0.42f + 0.15f * std::sin(angle);
                 view.distance = 80.0f + 32.0f * std::cos(angle);
             }
+            if (isOakBranchScene(scene->kind))
+            {
+                const bool farView = view.distance >= branchVoxelFarDistances.front();
+                renderer.updateCameraProjection(farView ? branchVoxelFarNearPlane : scene->nearPlane,
+                                                farView ? branchVoxelFarClipPlane : scene->farPlane());
+            }
             const auto viewMatrix = view.matrix();
             renderer.updateBranchLod(*scene, viewMatrix);
             const auto& inspectorError = sceneError.empty() ? settings.error() : sceneError;
             const auto actions = inspector.frame(*scene, renderer, timing, inspectorError,
                                                  launch.kind == SceneKind::Imported, shaderReload.valid(),
-                                                 shaderDiagnostics, view, wind.phase());
+                                                 shaderDiagnostics, view, wind.phase(), orbitSeconds, branchOrbitStart.has_value());
             if (actions.reloadShaders)
             {
                 try
@@ -533,7 +708,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
             timing = renderer.drawFrame(*scene, viewMatrix, wind.phase(), hud.text(),
                 [&](ID3D12GraphicsCommandList* commands) { inspector.draw(commands); });
             hud.record(timing);
-            if (actions.camera)
+            if (actions.transitionGridChanged)
+            {
+                scene->setBranchGrid(scene->instanceCount() == 1 ? branchGridSide : 1);
+                renderer.setScene(*scene);
+            }
+            if (actions.orbitDistance) camera.setDistance(*actions.orbitDistance);
+            if (actions.orbitSeek)
+            {
+                orbitSeconds = *actions.orbitSeek;
+                branchOrbitStart.reset();
+            }
+            else if (actions.restartOrbit)
+            {
+                orbitSeconds = 0.0f;
+                branchOrbitStart = Clock::now();
+            }
+            else if (actions.toggleOrbit)
+            {
+                toggleOrbit();
+            }
+            if (actions.comparisonCamera)
+            {
+                useCameraView(*actions.comparisonCamera);
+                refreshTitle();
+            }
+            else if (actions.camera)
             {
                 applyView(*actions.camera);
                 refreshTitle();

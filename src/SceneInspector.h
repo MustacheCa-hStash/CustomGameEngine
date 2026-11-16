@@ -9,10 +9,16 @@ struct InspectorActions
 {
     std::optional<SceneKind> scene;
     std::optional<CameraPreset> camera;
+    std::optional<CameraView> comparisonCamera;
+    std::optional<float> orbitSeek;
+    std::optional<float> orbitDistance;
+    bool toggleOrbit = false;
+    bool restartOrbit = false;
     bool sunChanged = false;
     bool toggleWind = false;
     bool toggleMsaa = false;
     bool treeCountChanged = false;
+    bool transitionGridChanged = false;
     bool settingsChanged = false;
     bool reloadShaders = false;
 };
@@ -33,7 +39,7 @@ public:
     InspectorActions frame(ViewerScene& scene, const D3D12Renderer& renderer,
                            const D3D12Renderer::FrameTiming& timing, const std::string& sceneError,
                            bool hasImportedScene, bool reloadingShaders, const std::string& shaderDiagnostics,
-                           const CameraView& camera, float windPhase);
+                           const CameraView& camera, float windPhase, float orbitSeconds, bool orbitPlaying);
     void draw(ID3D12GraphicsCommandList* commands) const;
 
 private:

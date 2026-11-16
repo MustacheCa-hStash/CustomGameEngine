@@ -1,4 +1,5 @@
 #include "FixedLod.h"
+#include "SourceFingerprint.h"
 
 #include <algorithm>
 #include <cmath>
@@ -158,20 +159,7 @@ std::filesystem::path fixedLodPath(std::filesystem::path source)
 
 std::uint64_t fixedLodSourceFingerprint(const std::filesystem::path& source)
 {
-    std::ifstream file(source, std::ios::binary);
-    if (!file) throw std::runtime_error("Could not open the fixed LOD source.");
-    std::array<char, 16384> buffer;
-    std::uint64_t hash = 14695981039346656037ull;
-    while (file)
-    {
-        file.read(buffer.data(), buffer.size());
-        for (std::streamsize i = 0; i < file.gcount(); ++i)
-        {
-            hash = (hash ^ static_cast<unsigned char>(buffer[static_cast<std::size_t>(i)])) * 1099511628211ull;
-        }
-    }
-    if (!file.eof()) throw std::runtime_error("Could not read the fixed LOD source.");
-    return hash;
+    return sourceFingerprint(source);
 }
 
 FixedLod readFixedLod(const std::filesystem::path& source, const AssetData& asset)

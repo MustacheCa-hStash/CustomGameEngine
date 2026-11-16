@@ -162,6 +162,254 @@ Across the sampled views, off-camera LOD 6 changed zero branch-receiver pixels. 
 
 The diagnostic projects each sampled bake error through the largest XY magnification of the orthographic light transform in texels. It estimates the footprint of the displacement at rest. For LOD 6 it reached 0.37–0.70 texels in this grid, and that estimate was the same for both scopes even though their image differences were very different. Keep **Match camera cut** as the default and use off-camera LOD 6 as the first candidate to retest on full crowns or larger scenes, especially if the light projection or shadow resolution changes. Compare the same coverage and temporal metrics and check the transition when a caster crosses the camera edge before enabling a runtime policy. Raw reports are `build/phase1/oak-branch-shadow-a.csv` and `build/phase1/oak-branch-shadow-b.csv`.
 
+### Voxel bake phase I
+
+`BakeVoxelFoliage` is an offline C++ tool. It loads a named GLB mesh, finds triangle-cell overlaps, and measures coverage in three axial and four diagonal directions. Each ray is clipped to the cell and counts once even if it hits several triangles. The tool writes an any-overlap control and binary occupancy at the requested cutoffs for the mean of the seven hit fractions. An optional CSV records directional hit counts per candidate cell. See the [bake assumptions](OAK_BRANCH_LOD_ASSUMPTIONS.md).
+
+```powershell
+cmake --build build/phase1 --config Release --target BakeVoxelFoliage VoxelBakeTests
+ctest --test-dir build/phase1 -C Release --output-on-failure
+.\build\phase1\Release\BakeVoxelFoliage.exe .\assets\LowBranchedWhiteOak-SingleBranch.glb 'Oak branch - modeled leaves' .\build\phase1\oak-branch-voxels --cell-size 0.03125 --samples 8 --cell-report
+```
+
+The default run bakes three sizes, doubling the cell edge each time, and sweeps cutoffs of 0.05, 0.10, and 0.20. Repeat `--cutoff` to supply custom values. `--samples` is the number of samples per side of each direction's projected rectangle. Diagonal probes exclude samples outside the projected cell. `voxel-bake.txt` maps the filenames to the cell sizes and cutoffs.
+
+| Cell edge (mesh units) | Any-overlap cells | 0.05 cutoff | 0.10 cutoff | 0.20 cutoff |
+| ---: | ---: | ---: | ---: | ---: |
+| 0.03125 | 138,694 | 97,511 | 81,286 | 57,391 |
+| 0.0625 | 39,731 | 26,254 | 20,753 | 13,410 |
+| 0.125 | 10,815 | 6,959 | 5,263 | 2,989 |
+
+Both Debug and Release passed the fixtures for thin and grid-aligned surfaces, clipped ray depths, layered patches, signed brick coordinates, asset round-tripping, and truncated data rejection. Two Oak Branch runs with 8 × 8 probes produced byte-identical `.voxels` assets and per-cell CSVs across all three sizes. An independent read confirmed the source binding, shared origin, and nested cutoff masks. Moving to 16 × 16 probes changed 1.7–4.3% of occupied cells across the thresholded variants, measured over the union of their occupied cells. The any-overlap masks were identical. Choose cutoffs in Phase II by comparing the locations of gaps and depth differences, with the denser bake as a check on sampling sensitivity.
+
+The files use little-endian `VOXELFOL` version 1. The header stores the source fingerprint, mesh index, origin, cell size, and brick count. Each brick stores three signed coordinates and a 64-bit mask with local bit index `x + 4y + 16z`. The assets contain binary occupancy. Material sampling and the camera rendering path are later phases.
+
+### CPU voxel comparison phase II
+
+`CompareVoxelFoliage` uses the viewer's Oak Branch focus, the 45° vertical FOV, and a fixed route of 18 poses. It traces the original foliage triangles, LOD 6, and each supplied bake at the same sample positions. The triangle path tests the nearest two-sided surface. The voxel path intersects sparse brick bounds and steps through cells to return the first occupied cell entry. Bark clips the same rays in every comparison. These geometry-only measurements trace foliage at rest. They omit lighting, shadows, and ground.
+
+```powershell
+cmake --build build/phase1 --config Release --target CompareVoxelFoliage FoliageTraceTests
+ctest --test-dir build/phase1 -C Release --output-on-failure
+.\build\phase1\Release\CompareVoxelFoliage.exe .\build\phase1\Release\assets .\build\phase1\oak-branch-voxel-compare .\build\phase1\oak-branch-voxels .\build\phase1\oak-branch-voxels-denser --samples 2
+```
+
+The viewport is 800 × 450 and `--samples` sets the number of sample points per pixel side. The main route uses a 2 × 2 grid and includes a retreat from 18 to 240 scene units, an orbit at 60 units, and two held-back angles. `--samples 4 --image-poses-only` reruns the five poses with PNG output using a 4 × 4 grid. PNGs share a crop derived from the source silhouette. Green shows foliage coverage, red shows gained coverage, and blue shows lost coverage. Signed depth images use red for early hits and blue for late hits, with saturation at 0.2 scene units.
+
+The CSV measures over the full viewport. Coverage error is the fraction of sample rays where one version hits and the other misses, among rays hit by either version. Depth error is a difference in nearest hit distance along rays hit by both versions. An enclosed gap is a four-connected group of at least four pixels with at most 25% foliage coverage that never reaches the viewport edge. It counts as closed when fewer than half its pixels are still mostly clear. Gain and loss maps also show changes to openings that connect to the exterior.
+
+LOD 6 matched source coverage more closely than every Phase I voxel variant on all 18 poses. Raising the cutoff on the 0.03125 grid traded excessive density for missing coverage. At a 0.25 cutoff that grid had nearly zero net coverage change on the retreat, while visible coverage still differed on 12.7% of the hit-ray union on average. LOD 6 averaged 8.8% on the same route.
+
+I added one smaller cell size at 0.015625 mesh units and swept 0.20–0.35. The 0.25 cutoff kept the retreat's net coverage close to the reference and closed fewer orbit gaps than the 0.20 cutoff. With the 16 × 16 bake probes and 4 × 4 camera samples, it kept all counted source gaps at the five diagnostic poses. Coverage error for those poses was as follows.
+
+| Pose | LOD 6 | 0.015625 cells, 0.25 cutoff | 0.03125 cells, 0.25 cutoff |
+| --- | ---: | ---: | ---: |
+| Retreat, 40 units | 8.48% | 7.61% | 12.16% |
+| Retreat, 120 units | 8.83% | 7.80% | 12.15% |
+| Orbit, 60 units | 11.08% | 12.76% | 19.35% |
+| Side holdout | 10.58% | 14.41% | 21.62% |
+| Back holdout | 8.41% | 7.35% | 11.66% |
+
+Carry the **0.015625 / 0.25** bake into Phase III as the higher-quality candidate. It has 29,872 bricks and a 597,500-byte file. Also carry **0.03125 / 0.25** as a lower-workload candidate with 7,891 bricks and a 157,880-byte file. The coarser bake's side and orbit errors make it useful for checking what breaks as brick count falls. These are offline file sizes. The GPU timing and resident memory comparisons are still open. The two files are `build/phase1/oak-branch-voxels-finer-denser/level-0-cutoff-2.voxels` and `build/phase1/oak-branch-voxels-higher-cutoffs/level-0-cutoff-1.voxels`.
+
+The full route reports are under `build/phase1/oak-branch-voxel-compare`, `oak-branch-voxel-compare-higher-cutoffs`, and `oak-branch-voxel-compare-finer`. The 4 × 4 validation reports are in `oak-branch-voxel-compare-dense-rays`, `oak-branch-voxel-compare-higher-dense-rays`, and `oak-branch-voxel-compare-finer-dense-rays` under the same build directory. For finer-cell rebakes use `--cell-size 0.015625 --levels 1 --samples 16 --cutoff 0.20 --cutoff 0.25 --cutoff 0.30 --cutoff 0.35`. For the higher-cutoff sweep at the original sizes use `--cell-size 0.03125 --samples 16` with cutoffs 0.25 through 0.45 in 0.05 increments.
+
+### GPU voxel comparison phase III
+
+The Oak Branch and Oak Branch Grid viewers have forced source, LOD 6, fine voxels, and coarse voxels in **Branch LOD → Voxel comparison**. The build bakes the selected 16 × 16 probe recipes at a 25% cutoff. The comparison holds the foliage at rest and uses LOD 6 triangles for foliage casting in all four modes. Bark and ground use the normal depth path. Voxels use average leaf color and simple lighting in shaded view. Use **Coverage view** to compare shape under a shared flat foliage color.
+
+The D3D12 path submits one indexed box per nonempty brick. It rasterizes the far faces as proxies, traverses the brick in the pixel shader, and writes depth at the first occupied cell. Rasters with no hit leave the underlying camera image available. The 4× mode evaluates coverage at each sample. This prototype uploads the brick data once and uses instancing across branch copies. It uses the renderer's upload heaps for the indexed and brick data. The scene's branch frustum test still applies, while individual bricks rely on rasterizer clipping.
+
+```powershell
+Start-Process -FilePath .\build\phase1\Release\CustomGameEngine.exe -ArgumentList '--branch-voxel-benchmark', '.\build\oak-branch-voxel-gpu.csv' -Wait
+```
+
+The benchmark first checks GPU coverage and encoded view depth against the CPU tracer in three poses per voxel size with 1× sampling. The inside-brick case checks every fourth pixel per axis. The route then times LOD 6 and both voxel sizes at 18–300 scene units, with one and 25 branch copies, 1× and 4× sampling, and both coverage and shaded views. Each pose has nine timed samples per mode after warm-up, and the mode order rotates across repetitions. The CSV records camera and shadow times, submitted foliage triangles, and visible branches. The shadow caster set and foliage triangle count are checked for equality across the modes.
+
+Two Release runs on the Ryzen 7 9800X3D and GeForce RTX 5090 matched on all 1,728 non-timing rows per run and reproduced the parity report exactly. Across the six parity checks, coverage disagreement reached at most 0.181% of the hit-ray union. The 99th-percentile absolute depth difference stayed below 0.000354 scene units. The original triangle benchmark also reproduced all 1,024 non-timing rows.
+
+Neither box-proxy voxel bake beat LOD 6 in shaded mode at any sampled distance in either run. The occasional single-copy coverage-only wins with 4× sampling did not repeat. These are pooled medians for the 3200 × 1800 shaded camera pass at 4× sampling.
+
+| Branches in scene | Distance | LOD 6 | Fine voxels | Coarse voxels |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 40 | 0.087 ms | 0.141 ms | 0.122 ms |
+| 1 | 120 | 0.036 ms | 0.063 ms | 0.049 ms |
+| 1 | 300 | 0.034 ms | 0.069 ms | 0.042 ms |
+| 25 | 40 | 0.177 ms | 1.113 ms | 0.687 ms |
+| 25 | 120 | 0.111 ms | 1.089 ms | 0.339 ms |
+| 25 | 300 | 0.090 ms | 1.069 ms | 0.324 ms |
+
+At 120–300 units all 25 copies pass the camera frustum test. They submit 154,000 LOD 6 foliage triangles, 8,961,600 fine proxy triangles, or 2,367,300 coarse proxy triangles. The projected brick footprints shrink on the retreat, while the amount of submitted brick geometry holds steady. Keep LOD 6 as the current runtime choice. Any voxel performance follow-up would need to reduce the per-brick rendering cost and verify the coverage gains again. Raw data are `build/phase1/oak-branch-voxel-gpu-a.csv`, `oak-branch-voxel-gpu-b.csv`, and the matching `*-parity.csv` files.
+
+### Binary voxel far-distance comparison
+
+The Oak Branch and Oak Branch Grid viewers expose all four timed far voxel bakes at the 25% cutoff. Under **Branch LOD → Voxel comparison**, choose **LOD 6 triangles** or a voxel size, then choose a **Camera distance** and angle. The controls use the benchmark's depth range at 300 units and beyond. Compare **Coverage view** first if you want to isolate canopy shape from shading. Use **Copy view data** to capture the pose where a change becomes visible.
+
+The optional far benchmark accepts two source-matched binary bakes and forces each across the foliage of all visible branches in turn. The camera route is 300, 600, 1,200, 1,800, 2,400, and 3,000 scene units. It uses a 20–3,600 depth range for precision in this fixture. The normal viewer uses its existing clip planes. The experiment fixes foliage shadows at LOD 6, holds the branch at rest, and keeps the original bark draw. It checks that all instances remain visible and that triangle and brick submissions match the requested bake.
+
+```powershell
+Start-Process -FilePath .\build\phase1\Release\CustomGameEngine.exe -ArgumentList '--branch-voxel-benchmark', 'far.csv', 'candidate-a.voxels', 'candidate-b.voxels' -Wait
+.\build\phase1\Release\CompareVoxelFoliage.exe .\build\phase1\Release\assets quality-output candidate-directory --far --samples 8
+```
+
+The CPU route traces a centered 192 × 192 window of the same 3200 × 1800 projection and adds side and rear views and two subpixel offsets. Resolve by averaging the sample hits in each pixel. The sum of absolute resolved coverage differences divided by the source's total resolved coverage measures visible gains and losses per pixel. Signed coverage bias measures overall thickening or thinning. The binary occupancy payload and runtime sampling are the same as for Phase III. The 4 × 4 and 8 × 8 CPU grids evaluate coverage offline.
+
+Four GPU runs on the RTX 5090 covered the four cell sizes below at a 25% bake cutoff. Each voxel comparison was timed twice with nine samples per mode, per pose, and per combination of shading, copy count, and MSAA. Each pair reproduced all 1,296 timing-free rows and its GPU/CPU parity report. The 1× parity checks had no coverage disagreements at 3,000 units and a worst 99th-percentile view-depth difference of 0.00925 units. The original GPU benchmark and original CPU route reproduced the checked 1,728 and 234 timing-free rows respectively.
+
+These are pooled medians at 3,000 units for the shaded camera pass with 25 branches and 4× MSAA. Coverage error comes from the five single-branch 3,000-unit views with 64 offline samples per pixel.
+
+| Representation | Bricks per branch | Submitted foliage triangles, 25 branches | GPU camera | Mean / worst resolved coverage error |
+| --- | ---: | ---: | ---: | ---: |
+| LOD 6 | — | 154,000 | 0.079 ms | 5.1% / 7.5% |
+| 0.0625-unit cells | 1,938 | 581,400 | 0.118 ms | 12.9% / 36.9% |
+| 0.125-unit cells | 398 | 119,400 | 0.068 ms | 15.5% / 37.3% |
+| 0.25-unit cells | 60 | 18,000 | 0.056 ms | 22.6% / 23.9% |
+| 0.5-unit cells | 12 | 3,600 | 0.055 ms | 29.1% / 36.5% |
+
+The 0.125- and 0.25-unit bakes were already faster at 300 units on the 25-copy 4× route, the first distance tested with those bakes. At 300 units their resolved coverage errors on the retreat were 24.4% and 38.7%, against 3.9% for LOD 6. At 3,000 units the 0.125-unit bake's retreat error fell to 9.2%, but from the side coverage increased from 3.94 to 5.41 pixel equivalents. The 0.25-unit candidate was less sensitive to that view angle and reduced retreat coverage from 10.58 to 8.48 pixel equivalents. The 0.5-unit bake reduced camera time by about another microsecond while increasing average coverage error. With one branch there was no repeatable timing win. These results establish a cost advantage for batched far branches with the current rasterizer. A visual acceptance distance is still open. The quality measurements cover shape at rest and the GPU preview still uses average leaf color. A tree or stand represented by one aggregate bake needs its own comparison.
+
+To extend the fixed groups, give each group complete triangle and voxel candidates for the same source components, using a representation tag, draw range, projection bounds, and calibrated error. Select the cheapest candidate that passes the group's screen-space error budget, then batch triangle and voxel groups through their existing paths. Include a coverage check when calibrating errors because short surface displacement can still thicken a sparse canopy. A coarse bake across several groups needs one replacement decision covering all child groups. For a future regrouped DAG, store that same replacement set and allow either geometry type in the cut.
+
+Raw results are in `build/phase1/oak-branch-voxel-far-gpu-{a,b,c,d}.csv` and `build/phase1/oak-branch-voxel-far-quality-dense/metrics.csv`. The candidate directory records size and coverage cutoff in the filenames.
+
+### Coverage-optimized binary bake
+
+The optimized 0.25-unit comparison uses the same grid as the original cutoff bake. Its seed is the 25% cutoff mask. An any-overlap bake defines eligible cells. The fitting tool traces the original foliage with bark occlusion at 16 camera poses using 16 rays per pixel. It caches the rays that pass through each eligible cell and counts the active cells on each ray. Adding or removing a cell changes coverage only when that ray's count crosses zero.
+
+The optimizer scores the mean and worst resolved pixel coverage error across fitting views, plus the worst normalized absolute change in total coverage. It keeps improvements from cell edits and tries replacing low-value bricks under a cap of 60 nonempty bricks. The selected mask uses two brick swaps and occupies 60 bricks. The comparison tool measures the result separately on the 11 earlier far views at 64 samples per pixel. The bias penalty was added after the first comparison showed that the side views became denser.
+
+| Resolved coverage error | LOD 6 | 0.25 cutoff | 0.25 coverage optimized |
+| --- | ---: | ---: | ---: |
+| Mean across 11 views | 4.6% | 26.5% | 21.8% |
+| Retreat at 300 units | 3.9% | 38.7% | 37.1% |
+| Retreat at 1,200 units | 3.3% | 28.1% | 21.6% |
+| Retreat at 3,000 units | 4.3% | 23.0% | 15.7% |
+| Side at 3,000 units | 7.5% | 22.2% | 26.2% |
+
+The optimized mask recovers missing area on the retreat. At 300 units its net coverage deficit drops from 20.4% to 6.3%, while the difference in where that coverage lands is still substantial. At 3,000 units the side view gains 14.3% above source coverage, versus 6.3% with the cutoff. The shape comparison is ready for visual review. Quality in motion and a switch distance are still open.
+
+GPU timings used the shaded camera pass with 25 branches and 4× MSAA on the RTX 5090. At 1,200 units the pooled medians were 0.110 ms for LOD 6, 0.071 ms for the cutoff mask, and 0.071 ms for the optimized mask. At 3,000 units they were 0.080, 0.055, and 0.055 ms respectively. Both voxel masks submit 720 proxy triangles per branch. The two runs reproduced all 1,296 timing-free rows and agreed with CPU sample coverage at all three parity poses. A repeated fit reproduced the saved mask and fitting report byte for byte.
+
+Build the viewer and the optional bake target with `cmake --build build/phase1 --config Release --target CustomGameEngine oak_branch_coverage`. The target places the fitted masks beside the other viewer assets. The fit reports are under `build/phase1/Release/bakes/coverage`. The 0.25-unit comparison images and `metrics.csv` are under `build/phase1/oak-branch-coverage-holdout`. GPU runs are `build/phase1/oak-branch-coverage-gpu-a.csv` and `oak-branch-coverage-gpu-b.csv` in the same build directory.
+
+#### Fitting the 0.0625- and 0.125-unit masks
+
+The finer bakes add a fitting route with closer and more oblique side views, based on the difference observed between the 150-unit retreat and rear views and the 1,800-unit side view. The fitting route uses 16 rays per pixel. The comparison uses 64 rays per pixel and 14 poses excluded from fitting, including two views near the 375-unit side preset.
+
+| Cell size | Bricks, cutoff → fitted | Mean pixel coverage error, cutoff → fitted | Side at 375 units, cutoff → fitted |
+| --- | ---: | ---: | ---: |
+| 0.0625 | 1,938 → 1,812 | 20.9% → 15.4% | 31.2% → 18.0% |
+| 0.125 | 398 → 365 | 27.5% → 23.2% | 36.8% → 29.2% |
+
+At 375 units from the side, the fitted masks reduce net over-coverage from 29.5% to 7.8% and from 24.1% to 5.7%, respectively. The 0.0625-unit mask's error at 150 units rises from 15.5% to 21.1% on the retreat and from 15.2% to 20.8% from the rear. The 0.125-unit mask also has a small increase in the near retreat and rear views. Both still have measurable coverage differences from LOD 6. See `build/phase1/oak-branch-coverage-review/metrics.csv` and the corresponding pose directories.
+
+In the visual review, the optimized 0.125-unit bake matched LOD 6 at about 500 units on the retreat and from the rear, 530 units at the side preset, and 700 units at other tested side angles. Use 700 scene units as the conservative whole-branch calibration point for an initial automatic switch on this fixture. Verify the transition through an orbit and calibrate the corresponding screen-space test before applying it to individual groups or other assets.
+
+The **Voxels 0.0625**, **Voxels 0.125**, and **Voxels 0.25** inspector entries load the optimized mask when available and show **Coverage-optimized bake** under the cell size. The 0.25-unit override is byte-identical to the previous coverage-optimized mask. The cutoff assets are retained as inputs and benchmark controls.
+
+In two GPU runs with 25 copies and 4× MSAA, the 0.125-unit fitted mask took 0.078 ms in the shaded camera pass at 1,200 units, versus 0.079 ms for the cutoff mask and 0.107 ms for LOD 6. The 0.0625-unit fitted mask matched the CPU's covered pixels at the GPU parity poses. One depth outlier at 3,000 units was 0.297 units, so the parity gate stopped that run before timing. See the `oak-branch-coverage-eighth-gpu-*.csv` and `oak-branch-coverage-sixteenth-gpu-a-parity.csv` reports.
+
+### Two-normal voxel shading experiment
+
+Open **Oak Branch Orbit**, select **Voxels 0.125**, turn off **Coverage view**, and toggle **Baked leaf normals** at a held pose. Repeat the 700-unit orbit with the default sun azimuth and with the sun on the opposite side. Both modes use the same 365-brick occupancy, fixed LOD 6 triangle shadows, and shared leaf color. Build `oak_branch_normals` to regenerate the optional sidecar.
+
+The bake traces both ends of each of the original seven sets of cell probes and interpolates source vertex normals at the first hit from each end. It clusters the samples into two axes using absolute dot product because the leaves are two-sided. Each occupied cell stores two octahedrally encoded axes and an 8-bit relative weight in 8 bytes. The shader uses the same mixture from all viewing directions, faces each axis toward the camera, evaluates the leaf diffuse and transmission response, and weights the two responses. It samples shadows at the voxel hit and uses the shared leaf color.
+
+The sidecar is 15,124 bytes for 1,888 cells. For 27 cells that no probe sampled, the bake used the normal from an intersecting source face. A repeated bake reproduced the sidecar byte for byte. The optimized occupancy matched the earlier orbit asset byte for byte. A held-pose GPU test at 700 units captured identical Coverage views and different shaded pixels with normals enabled under both sun azimuths. Both timing runs reproduced the same 648 timing-free rows and parity report.
+
+| Shaded GPU camera pass, 25 copies at 4× MSAA | LOD 6 | Shared voxel lighting | Baked leaf normals |
+| --- | ---: | ---: | ---: |
+| 700 units | 0.1086 ms | 0.0839 ms | 0.0847 ms |
+| 1,200 units | 0.1055 ms | 0.0788 ms | 0.0792 ms |
+| 3,000 units | 0.0783 ms | 0.0656 ms | 0.0664 ms |
+
+Run `--branch-voxel-normal-benchmark report.csv` to reproduce the timing. Raw runs are under `build/phase1/oak-branch-normal-gpu-{a,b}.csv`. The shaded orbit still needs visual review for lighting variation and stability.
+
+### Voxel lighting diagnosis
+
+The **Lighting diagnostic** control shows diffuse and backlighting or received shadow visibility. The `--branch-lighting-diagnostics report.csv` command captures LOD 6 and the optimized 0.125 bake with baked normals at seven orbit times, two sun azimuths (−100° and +80°), and distances of 250 and 700 scene units. The comparison uses one branch at rest, LOD 6 shadow casters, and 1× samples in a 3200 × 1800 viewport. Each row uses only samples both representations cover. It decodes base and shaded RGB to linear light and checks that the diffuse capture reproduces the measured unshadowed shading within RGBA8 quantization tolerance. The two runs produced byte-identical reports.
+
+| Distance | Mean voxel base luminance vs. LOD 6 | Mean voxel luminance with shadow receiving off | Mean voxel luminance with shadow receiving on |
+| --- | ---: | ---: | ---: |
+| 250 units | +0.08% | −1.43% | −2.36% |
+| 700 units | 0.00% | −1.42% | −3.20% |
+
+At the 700-unit retreat with the default sun, voxel luminance was 2.31% lower without receiving shadows and 9.65% lower with them. Across all poses the unshadowed difference ranged from 7.09% darker to 4.34% brighter. The direct-light gain needed to match each pose's mean ranged from 0.91 to 1.15. Simulating gains of 2.5%, 5%, 10%, and 15% selectively on the direct-light term increased average per-pixel luminance error in each sweep.
+
+Received voxel shadow visibility averaged 2.11 percentage points below LOD 6. Raising the voxel depth bias by half a shadow texel reduced that mean gap to 0.38 points. One texel raised mean visibility 1.08 points above LOD 6 and reduced mean absolute shadow-visibility error from 0.3282 to 0.3142, but only reduced mean absolute shaded luminance error from 0.01836 to 0.01803. The diagnostics expose the pose-dependent discrepancies and use zero additional bias in normal viewing. Raw paired results are in `build/phase1/oak-branch-lighting-diagnostics.csv`.
+
+### View-dependent voxel normal weights
+
+Enable **View-dependent weights** under **Baked leaf normals** in Oak Branch Orbit to compare the directional and pooled weights. The bake assigns each first-hit normal from the six signed axial probe directions to one of the two existing axes. Each direction uses eight prior samples from the pooled distribution to stabilize weights where few rays hit. The shader selects the three signed weights facing the camera and blends them in proportion to the absolute components of the local view direction. The version 2 sidecar adds 15,104 bytes for 1,888 cells including padding.
+
+Across the 28 paired lighting captures at 250 and 700 units, mean absolute linear luminance error changed from 0.01447 to 0.01450 with shadow receiving off and from 0.01836 to 0.01831 with it on. At the 700-unit retreat with the default sun, the voxels still averaged 2.3% darker than LOD 6 with receiving off and 9.7% darker with it on. Coverage, base color, and shadow visibility matched the pooled run. The viewer defaults to pooled weights.
+
+| Median shaded GPU camera pass on RTX 5090, 25 copies at 4× MSAA | LOD 6 | Pooled weights | Directional weights |
+| --- | ---: | ---: | ---: |
+| 700 units | 0.1083 ms | 0.0850 ms | 0.0856 ms |
+| 1,200 units | 0.1054 ms | 0.0798 ms | 0.0799 ms |
+| 3,000 units | 0.0781 ms | 0.0654 ms | 0.0661 ms |
+
+Append `--directional` after the report path for `--branch-lighting-diagnostics` to capture directional shading or for `--branch-voxel-normal-benchmark` to time pooled and directional shading on the same mask. Raw reports are in `build/phase1/oak-branch-lighting-directional.csv` and `build/phase1/oak-branch-directional-gpu-{a,b}.csv`. Repeated lighting captures matched byte for byte, including across Debug and Release.
+
+### Baked voxel shadow receivers
+
+At pixels covered by both representations, reconstructing voxel color with the LOD 6 shadow visibility and the original voxel base color and diffuse term lowered average shaded luminance error from 0.01836 to 0.00791 across 28 captures. At the 700-unit retreat pose with the default sun, the mean luminance deficit fell from 9.6% to 1.6%. This substitution uses the triangle render as a diagnostic reference.
+
+The receiver bake selects the first-hit sample nearest the weighted centroid of the existing leaf probes in each cell. The version 3 sidecar packs three 5-bit cell-local coordinates and a validity bit into the spare upper half of the last word. It stores a receiver for 1,861 of 1,888 occupied cells. The remaining 27 use cell entry. During rendering, the shader transforms the baked point with the mesh and instance transforms and uses it for the shadow lookup. A paired GPU test matched coverage, camera depth, and unshadowed color byte for byte with the option enabled and disabled.
+
+| Mean absolute shaded luminance error | Cell entry | Baked leaf point | Reference visibility |
+| --- | ---: | ---: | ---: |
+| 250-unit orbit, two sun angles | 0.01850 | 0.01848 | 0.00793 |
+| 700-unit orbit, two sun angles | 0.01821 | 0.01804 | 0.00789 |
+| 700-unit retreat, default sun | 0.02135 | 0.02272 | 0.00910 |
+
+The baked point improved 16 of 28 captures and increased the 700-unit retreat brightness deficit from 9.6% to 12.3%. At 700 units with 25 branches and 4× MSAA, median GPU camera time on RTX 5090 was 0.0855 ms at cell entry, 0.0865 ms with the baked point, and 0.1088 ms for LOD 6. The **Baked leaf shadow positions** inspector toggle defaults off.
+
+Run `--branch-lighting-diagnostics report.csv` for the visibility substitution and receiver comparisons. Run `--branch-voxel-normal-benchmark report.csv --shadow-receiver` for paired GPU timings. The capture and timing reports are under `build/phase1/oak-branch-shadow-receiver-*.csv`.
+
+### Automatic triangle-to-voxel transitions
+
+Use **Oak Branch Transition** with 4× MSAA for the rest-pose comparison. **Automatic branch** lets the existing triangle selector choose LOD 3, 4, or 6, and switches to the coverage-fitted 0.125 bake once the branch qualifies for LOD 6 and its conservative projected cell footprint falls below 0.373 pixels. The exit footprint is 5% higher to avoid rapid switching near the threshold. The selector measures the footprint under the current projection and instance scale. At 3200 × 1800 and a 45° vertical FOV, the single branch switched at sampled distances of 733–736 on retreat and 697–699 on approach. The camera cut and triangle shadow cut are submitted separately. Foliage at the switch continues to cast LOD 6 triangle shadows.
+
+**Automatic regions** divides the 129 spatially ordered triangle groups into four contiguous regions. The baker assigns each occupied cell of the verified whole-branch mask to the region with the strongest sampled source coverage for that cell. It stores one owner byte per cell and references the exact mask and fixed LOD file by fingerprint. Each region tests its own bounds and replaces all its triangle groups together. A fully voxelized copy uses the original whole-branch bake. Different regions can touch the same brick, which increases the number of submitted brick boxes during a partial switch. Whole-branch and regional voxel batches pack visible placements into one draw per active mask and keep the usual indirect triangle lists.
+
+Use **Find mixed regions** with a single branch to land at a pose where both representations are selected. **Tint triangles and voxels** makes the boundary visible. **Freeze cut** holds the selected triangle levels and voxel regions as the camera moves, and **25-branch grid** lets different copies select independently. The current bake and transition use the rest pose.
+
+The transition benchmark tests approach and retreat at seven orbit angles under two suns, checks the automatic whole-branch output against the forced representations, and renders all 16 regional masks against exact submission counts. The all-voxel regional result matches the whole-branch result, and both tints must appear in each selected mixed pose. The four regional masks contain 119, 103, 95, and 88 bricks, against 365 for the whole branch. On a 241-frame moving orbit, the whole branch switched twice and the regional selector made four smaller changes. The largest measured regional switch changed net resolved coverage by 7.3% and average display luminance on comparable foliage pixels by 1.9%. The regional selector had smaller local coverage differences than the whole-branch switch on this route. Review the transitions in motion for perceptibility.
+
+| RTX 5090, 25 branches and 4× MSAA | Triangle-only GPU camera | Automatic GPU camera | Automatic foliage API calls |
+| --- | ---: | ---: | ---: |
+| Mixed across whole branches | 0.109 ms | 0.098 ms | 2 |
+| Mixed within branches | 0.112 ms | 0.100 ms | 5–6 |
+| Fully voxelized, whole-branch policy | 0.110 ms | 0.085 ms | 1 |
+
+Timings are pooled medians across two runs at three orbit angles. Four to six copies had both representations active in the regional grid poses. Median regional mixed CPU render time rose from 0.088 to 0.095 ms, with selection rising from 0.002 to 0.004 ms. The results support a small GPU saving on this fixture. Shaded snapshots and CSV reports are under `build/phase1/oak-branch-mixed-final-*`.
+
+### Region 3 bake A/B
+
+Region 3 covers fixed groups 96–128 and participates in the first mixed cut on the moving orbit. Variant A uses the dominant-owner cells from the fitted whole-branch bake. Variant B starts from that mask and reruns the coverage fitter using only the exact source triangles in those groups. The eligible cells come from those same triangles, so the fit can add cells where the original region contributed geometry. The fitter uses eight isolated training views and keeps the 0.125-unit grid and 88-brick cap. A uses 88 bricks and 490 cells. B uses 87 bricks and 395 cells, with 240 cells shared between the two bakes. B overlaps zero occupied cells from other regions in this asset.
+
+The CPU comparison uses 12 holdout views at 650–1,200 units and 64 samples per pixel. The mixed reference uses LOD 6 for the entire branch, and the mixed candidates swap only region 3. The other foliage, bark occlusion, and camera rays are shared. Resolved pixel error sums absolute coverage differences per pixel and normalizes by reference coverage.
+
+| Comparison | Mean resolved pixel error, A → B | Mean signed coverage bias, A → B |
+| --- | ---: | ---: |
+| Isolated region vs. source triangles | 21.12% → 19.46% | +12.23% → −0.99% |
+| Isolated region vs. LOD 6 | 21.90% → 19.75% | +13.15% → −0.17% |
+| Mixed branch vs. LOD 6 | 4.53% → 4.42% | +2.64% → −0.20% |
+
+In the mixed CPU comparison, gained coverage fell from 5.76% to 5.04% of the reference and lost coverage rose from 3.12% to 5.24%. The GPU comparison uses 4× MSAA and holds the camera at region 3’s entry and exit thresholds, across seven orbit angles and two suns. With the other regions on triangles, the mean absolute net coverage step fell from 3.67% to 2.45%. The mean resolved pixel difference rose from 7.58% to 7.94%. The ten additional captures with some voxel neighbors showed the same tradeoff. The GPU camera pass for 25 copies took 0.0996 ms with A and 0.0989 ms with B. Both used the same triangle shadow casters. Keep the shared-mask bake as the default. The isolated fit corrects density and yields a small change to the placement of foliage in the mixed cut.
+
+From the repository root, use these commands for the CPU bake and the two GPU arms.
+
+```powershell
+.\build\phase1\Release\CompareVoxelFoliage.exe build/phase1/Release/assets build/phase1/oak-branch-region-ab --region-ab 3 --samples 8
+.\build\phase1\Release\CustomGameEngine.exe --branch-region-benchmark build/phase1/oak-branch-region-ab/gpu-shared-a.csv 3
+.\build\phase1\Release\CustomGameEngine.exe --branch-region-benchmark build/phase1/oak-branch-region-ab/gpu-independent-a.csv 3 build/phase1/oak-branch-region-ab/independent.voxels
+```
+
+The bake, metrics, and shaded captures reproduced on repeated runs. Saved results are under `build/phase1/oak-branch-region-ab`. Gain and loss maps are in the retreat, side, and rear 700-unit pose directories.
+
 ### Reuse the branch as a reference
 
 - [x] **Fixed-group selector.** Select one level per group with all representations resident. Verify a mixed-detail cut and hold it across a camera move.
@@ -169,6 +417,9 @@ The diagnostic projects each sampled bake error through the largest XY magnifica
 - [ ] **Area compensation.** Measure the current all-leaf levels against the source with paired canopy masks and ground-shadow captures at several sun angles. Separate missing and gained coverage so a similar total cannot hide shifted gaps. If testing redistribution after whole-leaf removal, compare the same surviving leaves at the same triangle count with and without compensation. Use the all-leaf LOD 6 and the source as controls. Epic's Preserve Area expands open boundaries on the survivors. [Epic's foliage notes](https://dev.epicgames.com/documentation/unreal-engine/working-with-naniteenabled-content#foliage-using-nanite)
 - [x] **Whole-branch frustum culling.** The **Frustum culling** toggle tests each branch against the camera and sun frusta independently. The bounds enclose original and fitted proxy vertices and expand by the frame's wind displacement. A frozen-cut GPU comparison found identical pixels in 49 paired renders at 3200 × 1800, including 1× and 4× sampling, source and forced geometry, both Automatic draw paths, and still and displaced foliage. A diagnostic that removed off-camera branches from shadow submission changed ground pixels in six cases. In one Automatic view at 35 scene units, 19 of 25 branches passed the camera test and camera foliage dropped from 909,001 to 650,350 triangles. All 25 passed the shadow test.
 - [x] **Shadow LOD calibration.** Compare camera-matched shadows with forced shadow geometry on a frozen cut. Record draw work, shadow timing, and visible receiver changes with still foliage and wind. [Results](#shadow-lod-calibration)
+- [x] **Offline binary voxel baker.** Verify coverage sampling and pack three Oak Branch cell sizes with a shared origin. [Results](#voxel-bake-phase-i)
+- [x] **CPU voxel comparison.** Measure gained and lost coverage, openings, and nearest hit depth against source and LOD 6 before selecting forced GPU candidates. [Results](#cpu-voxel-comparison-phase-ii)
+- [x] **Forced GPU voxel comparison.** Verify depth and coverage against the CPU tracer and measure the cost crossover with fixed triangle shadows. [Results](#gpu-voxel-comparison-phase-iii)
 - [ ] **Further culling.** Test a solid occluder, finer visibility bounds, and a larger grove. Compare frame costs, especially the cost of building separate draw lists when the two visibility sets differ. [Culling follow-up](FUTURE_CONSIDERATIONS.md#rendering)
 - [ ] **Voxel foliage.** Use the same source leaves and poses to compare a few forced voxel sizes with full-detail triangles and LOD 6 at distances where typical leaves are near or below a pixel. Compare the positions and sizes of gaps, silhouette, depth under an orbit, relighting, motion, and ground shadows. Test a whole crown next for density and parallax, then a grove for cost. [Epic's Nanite Voxels](https://dev.epicgames.com/documentation/unreal-engine/nanite-foliage#nanite-voxels)
 

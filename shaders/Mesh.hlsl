@@ -27,6 +27,16 @@ cbuffer FrameConstants : register(b1)
     float windStart;
     float inverseWindHeight;
     float normalBiasWorld;
+    uint useCascades;
+    uint showCascadeColors;
+    uint filterCascades;
+    float4 cascadeSplits;
+    row_major float4x4 cascadeViewProjections[3];
+    float4 cascadeShadowBias;
+    float4 cascadeNormalBias;
+    float4 cascadeBlendWidths;
+    float4 cascadeDepthPerTexel;
+    float4 lightRight;
 };
 
 Texture2D<float4> colorTexture : register(t0);
@@ -34,6 +44,7 @@ SamplerState colorSampler : register(s0);
 Texture2D<float> shadowMap : register(t1);
 SamplerComparisonState shadowSampler : register(s1);
 StructuredBuffer<uint3> lodTriangleTags : register(t2);
+Texture2DArray<float> cascadeShadowMaps : register(t3);
 
 struct VertexInput
 {
@@ -50,6 +61,7 @@ struct PixelInput
     float3 worldNormal : NORMAL;
     float2 uv : TEXCOORD0;
     float4 lightPosition : TEXCOORD1;
+    float4 worldPositionAndViewDepth : TEXCOORD2;
 };
 
 struct ShadowInput
@@ -106,6 +118,7 @@ PixelInput VSMain(VertexInput input)
     output.worldNormal.y -= dot(bendSlope, output.worldNormal.xz);
     output.uv = materialUv(input);
     output.lightPosition = mul(world, lightViewProjection);
+    output.worldPositionAndViewDepth = float4(world.xyz, output.position.w);
     return output;
 }
 
@@ -154,6 +167,62 @@ float sunVisibility(float4 lightPosition, float3 worldNormal, float normalToSun)
     return shadowMap.SampleCmpLevelZero(shadowSampler, uv, projected.z - shadowBias);
 }
 
+uint cascadeForDepth(float depth)
+{
+    return uint(depth >= cascadeSplits.x) + uint(depth >= cascadeSplits.y) + uint(depth >= cascadeSplits.z);
+}
+
+float sampleCascade(float3 worldPosition, uint cascade, float3 grazingNormal, float2 receiverSlope)
+{
+    worldPosition += grazingNormal * cascadeNormalBias[cascade];
+    float4 lightPosition = mul(float4(worldPosition, 1), cascadeViewProjections[cascade]);
+    float3 projected = lightPosition.xyz / lightPosition.w;
+    float2 uv = projected.xy * float2(0.5, -0.5) + 0.5;
+    if (any(uv < 0.0) || any(uv > 1.0) || projected.z < 0.0 || projected.z > 1.0) return 1.0;
+    float3 location = float3(uv, cascade);
+    float reference = projected.z - cascadeShadowBias[cascade];
+    [branch] if (filterCascades)
+    {
+        // Compare each bilinear tap at the depth of the receiver plane at that tap.
+        float2 step = receiverSlope * cascadeDepthPerTexel[cascade];
+        return 0.25 * (cascadeShadowMaps.SampleCmpLevelZero(shadowSampler, location, reference - step.x - step.y, int2(-1, -1)) +
+                       cascadeShadowMaps.SampleCmpLevelZero(shadowSampler, location, reference + step.x - step.y, int2( 1, -1)) +
+                       cascadeShadowMaps.SampleCmpLevelZero(shadowSampler, location, reference - step.x + step.y, int2(-1,  1)) +
+                       cascadeShadowMaps.SampleCmpLevelZero(shadowSampler, location, reference + step.x + step.y, int2( 1,  1)));
+    }
+    return cascadeShadowMaps.SampleCmpLevelZero(shadowSampler, location, reference);
+}
+
+float2 shadowReceiverSlope(float3 worldPosition)
+{
+    float3 plane = cross(ddx(worldPosition), ddy(worldPosition));
+    float towardSun = dot(plane, toSun);
+    // Clamp at grazing incidence where the receiver has little area in light space.
+    float divisor = max(abs(towardSun), max(0.2 * length(plane), 1e-12));
+    float3 lightUp = cross(toSun, lightRight.xyz);
+    return float2(dot(plane, lightRight.xyz), -dot(plane, lightUp)) *
+           ((towardSun < 0.0 ? -1.0 : 1.0) / divisor);
+}
+
+float cascadeVisibility(float4 worldPositionAndDepth, uint cascade, float3 worldNormal, float normalToSun,
+                        float2 receiverSlope)
+{
+    if (cascade >= 3) return 1.0;
+    float grazingWeight = sqrt(saturate(1.0 - normalToSun * normalToSun));
+    float3 grazingNormal = (normalToSun < 0.0 ? -worldNormal : worldNormal) * grazingWeight;
+    float visibility = sampleCascade(worldPositionAndDepth.xyz, cascade, grazingNormal, receiverSlope);
+    float width = cascadeBlendWidths[cascade];
+    float end = cascadeSplits[cascade];
+    [branch] if (width > 0.0 && worldPositionAndDepth.w > end - width)
+    {
+        float nextVisibility = 1.0;
+        [branch] if (cascade < 2)
+            nextVisibility = sampleCascade(worldPositionAndDepth.xyz, cascade + 1, grazingNormal, receiverSlope);
+        visibility = lerp(visibility, nextVisibility, smoothstep(end - width, end, worldPositionAndDepth.w));
+    }
+    return visibility;
+}
+
 float3 tintColor(uint id)
 {
     id ^= id >> 16;
@@ -166,8 +235,31 @@ float3 tintColor(uint id)
 
 float4 PSMain(PixelInput input, bool isFrontFace : SV_IsFrontFace, uint primitive : SV_PrimitiveID) : SV_Target
 {
+    if (shadowView == 7 || shadowView == 8)
+    {
+        if (alphaCutoff >= 0.0) applyCutout(sampleBaseColor(input.uv).a);
+        return shadowView == 7 ? 0 : float4(0.22, 0.63, 0.99, 1);
+    }
+    if (shadowView == 3)
+    {
+        if (alphaCutoff >= 0.0) applyCutout(sampleBaseColor(input.uv).a);
+        return float4(0.15, 0.55, 0.32, 1);
+    }
     float4 baseColor = sampleBaseColor(input.uv);
     applyCutout(baseColor.a);
+    uint cascade = 0;
+    if (useCascades)
+    {
+        cascade = cascadeForDepth(input.worldPositionAndViewDepth.w);
+        if (showCascadeColors)
+        {
+            const float3 colors[] = {float3(231, 81, 72), float3(65, 185, 89),
+                                      float3(64, 133, 239), float3(92, 96, 104)};
+            return float4(colors[cascade] / 255.0, 1.0);
+        }
+    }
+    if (shadowView == 4)
+        return float4(hasColorTexture ? encodeSrgb(baseColor.rgb) : baseColor.rgb, 1.0);
     if (shadowView == 0 && (lodTint != 0 || highlightedLodGroup != 0))
     {
         const uint3 tag = lodTriangleTags[firstLodTriangle + primitive];
@@ -196,7 +288,20 @@ float4 PSMain(PixelInput input, bool isFrontFace : SV_IsFrontFace, uint primitiv
     }
     float normalToSun = dot(worldNormal, toSun);
     float diffuse = saturate(normalToSun) + transmission * saturate(-normalToSun);
-    float visibility = receivesShadows ? sunVisibility(input.lightPosition, worldNormal, normalToSun) : 1.0;
+    if (shadowView == 5) return float4(diffuse.xxx, 1.0);
+    float visibility = 1.0;
+    if (receivesShadows)
+    {
+        if (useCascades)
+        {
+            // Derivatives need to run before any cascade-dependent branch.
+            float2 receiverSlope = filterCascades ? shadowReceiverSlope(input.worldPositionAndViewDepth.xyz) : 0.0;
+            visibility = cascadeVisibility(input.worldPositionAndViewDepth, cascade, worldNormal, normalToSun, receiverSlope);
+        }
+        else
+            visibility = sunVisibility(input.lightPosition, worldNormal, normalToSun);
+    }
+    if (shadowView == 6) return float4(visibility.xxx, 1.0);
     if (shadowView != 0)
     {
         // Alpha tags the receiver for measurement. The swap chain displays RGB.

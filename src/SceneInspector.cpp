@@ -5,6 +5,7 @@
 #include <backends/imgui_impl_win32.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <format>
 #include <stdexcept>
@@ -18,7 +19,8 @@ void showVector(const char* label, const DirectX::XMFLOAT3& value)
     ImGui::Text("%s  %.2f, %.2f, %.2f", label, value.x, value.y, value.z);
 }
 
-void inspectBranchLod(ViewerScene& scene, const D3D12Renderer& renderer, const CameraView& camera, float windPhase)
+void inspectBranchLod(ViewerScene& scene, const D3D12Renderer& renderer, const CameraView& camera, float windPhase,
+                      std::optional<CameraView>& comparisonCamera, float routeTime)
 {
     if (!scene.fixedLod)
     {
@@ -27,12 +29,209 @@ void inspectBranchLod(ViewerScene& scene, const D3D12Renderer& renderer, const C
     }
     const auto& lod = *scene.fixedLod;
     const auto& mesh = scene.asset->meshes[lod.meshIndex];
-    constexpr const char* levels[] = {"Source GLB", "LOD 0 - Clustered full detail", "LOD 1 - Reduced",
+    const bool orbit = isBranchOrbitScene(scene.kind);
+    const bool crown = scene.kind == SceneKind::ModeledOakWalk;
+    if (scene.branchVoxelView != BranchVoxelView::Off ||
+        std::ranges::any_of(scene.branchVoxels, [](const auto& bake) { return static_cast<bool>(bake); }))
+    {
+        constexpr const char* voxelViews[]{"Off", "Source triangles", "LOD 6 triangles", "Voxels 0.015625", "Voxels 0.03125",
+                                          "Voxels 0.0625", "Voxels 0.125", "Voxels 0.25", "Voxels 0.5",
+                                          "Automatic branch", "Automatic regions"};
+        static_assert(IM_ARRAYSIZE(voxelViews) == static_cast<int>(BranchVoxelView::Count));
+        if (ImGui::BeginCombo("Voxel comparison", voxelViews[static_cast<int>(scene.branchVoxelView)]))
+        {
+            for (int i = 0; i < IM_ARRAYSIZE(voxelViews); ++i)
+            {
+                const auto view = static_cast<BranchVoxelView>(i);
+                const auto index = branchVoxelIndex(view);
+                if (automaticBranchVoxels(view))
+                {
+                    if (!scene.hasAutomaticBranchVoxels()) continue;
+                    if (view == BranchVoxelView::Regional && !scene.branchVoxelRegions) continue;
+                }
+                else if (orbit && view != BranchVoxelView::Lod6 &&
+                    (view != BranchVoxelView::CellOneEighth || !scene.branchVoxelCoverageOptimized[*index])) continue;
+                if (index && !scene.branchVoxels[*index]) continue;
+                const bool selected = scene.branchVoxelView == view;
+                if (ImGui::Selectable(voxelViews[i], selected))
+                {
+                    scene.branchVoxelView = view;
+                    if (!automaticBranchVoxels(view) && scene.branchAppearance == BranchAppearance::Representation)
+                        scene.branchAppearance = BranchAppearance::Shaded;
+                    renderer.updateBranchLod(scene, camera.matrix());
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (scene.branchVoxelView != BranchVoxelView::Off)
+        {
+            bool coverage = scene.branchAppearance == BranchAppearance::Coverage;
+            if (ImGui::Checkbox("Coverage view", &coverage))
+                scene.branchAppearance = coverage ? BranchAppearance::Coverage : BranchAppearance::Shaded;
+            bool unlit = scene.branchAppearance == BranchAppearance::BaseColor;
+            if (ImGui::Checkbox("Unlit base color", &unlit))
+                scene.branchAppearance = unlit ? BranchAppearance::BaseColor : BranchAppearance::Shaded;
+            int lighting = scene.branchAppearance == BranchAppearance::Diffuse ? 1 :
+                (scene.branchAppearance == BranchAppearance::ReceivedShadows ? 2 : 0);
+            constexpr const char* lightingViews[]{"Off", "Diffuse and backlighting", "Received shadows"};
+            if (ImGui::Combo("Lighting diagnostic", &lighting, lightingViews, IM_ARRAYSIZE(lightingViews)))
+            {
+                constexpr BranchAppearance modes[]{BranchAppearance::Shaded, BranchAppearance::Diffuse,
+                                                    BranchAppearance::ReceivedShadows};
+                scene.branchAppearance = modes[lighting];
+            }
+            const bool automaticVoxels = automaticBranchVoxels(scene.branchVoxelView);
+            if (automaticVoxels)
+            {
+                auto& selection = scene.branchLodSelection;
+                bool update = ImGui::Checkbox("Freeze cut", &selection.frozen);
+                ImGui::BeginDisabled(selection.frozen);
+                update |= ImGui::SliderFloat("Voxel entry limit", &scene.branchVoxelEnterPixels, 0.1f, 1.0f,
+                                             "%.3f px", ImGuiSliderFlags_AlwaysClamp);
+                ImGui::EndDisabled();
+                if (update) renderer.updateBranchLod(scene, camera.matrix());
+                bool tint = scene.branchAppearance == BranchAppearance::Representation;
+                if (ImGui::Checkbox("Tint triangles and voxels", &tint))
+                    scene.branchAppearance = tint ? BranchAppearance::Representation : BranchAppearance::Shaded;
+                const auto triangles = std::ranges::count(selection.voxelCut, std::uint8_t{0});
+                const auto voxels = std::ranges::count(selection.voxelCut, allVoxelRegions);
+                const auto mixed = selection.voxelCut.size() - triangles - voxels;
+                ImGui::Text("Branches: %zu triangles, %zu mixed, %zu voxels",
+                            static_cast<std::size_t>(triangles), mixed, static_cast<std::size_t>(voxels));
+                if (scene.branchVoxelView == BranchVoxelView::Regional)
+                {
+                    unsigned voxelRegions = 0;
+                    for (const auto mask : selection.voxelCut) voxelRegions += std::popcount(mask);
+                    ImGui::Text("Regions: %zu triangles, %u voxels",
+                                selection.voxelCut.size() * voxelBranchRegionCount - voxelRegions, voxelRegions);
+                    ImGui::BeginDisabled(selection.frozen || scene.instanceCount() != 1);
+                    if (ImGui::Button("Find mixed regions"))
+                    {
+                        auto probe = scene;
+                        std::ranges::fill(probe.branchLodSelection.voxelCut, std::uint8_t{0});
+                        const float scale = branchVoxelDefaultEntryPixels / scene.branchVoxelEnterPixels *
+                                            renderer.viewportSize().y / 1800.0f;
+                        unsigned best = 0;
+                        for (int i = 0; i <= 240; ++i)
+                        {
+                            auto candidate = camera;
+                            candidate.distance = (650 + 0.5f * i) * scale;
+                            renderer.updateBranchLod(probe, candidate.matrix());
+                            const auto n = static_cast<unsigned>(std::popcount(probe.branchLodSelection.voxelCut.front()));
+                            const auto balance = std::min(n, static_cast<unsigned>(voxelBranchRegionCount) - n);
+                            if (balance <= best) continue;
+                            comparisonCamera = candidate;
+                            best = balance;
+                        }
+                        if (best) std::ranges::fill(selection.voxelCut, std::uint8_t{0});
+                    }
+                    ImGui::EndDisabled();
+                }
+            }
+            ImGui::TextUnformatted(automaticVoxels ? "Rest pose with triangle shadows" : "Rest pose with LOD 6 triangle shadows");
+            if (orbit)
+            {
+                if (!scene.branchVoxelCoverageOptimized[*branchVoxelIndex(BranchVoxelView::CellOneEighth)])
+                    ImGui::TextWrapped("Build oak_branch_coverage to load the optimized 0.125 bake.");
+            }
+            else
+            {
+                const auto distanceLabel = std::format("{:.1f} units", camera.distance);
+                if (ImGui::BeginCombo("Camera distance", distanceLabel.c_str()))
+                {
+                    for (const float distance : branchVoxelFarDistances)
+                    {
+                        const auto label = std::format("{:.0f} units", distance);
+                        const bool selected = camera.distance == distance;
+                        if (ImGui::Selectable(label.c_str(), selected))
+                            comparisonCamera = CameraView{camera.focus, camera.yaw, camera.pitch, distance};
+                        if (selected) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                const auto setAngle = [&](float yaw, float pitch) {
+                    comparisonCamera = CameraView{camera.focus, DirectX::XMConvertToRadians(yaw),
+                                                  DirectX::XMConvertToRadians(pitch), camera.distance};
+                };
+                if (ImGui::Button("Retreat angle")) setAngle(-125, 68);
+                ImGui::SameLine();
+                if (ImGui::Button("Side angle")) setAngle(32, 8);
+                ImGui::SameLine();
+                if (ImGui::Button("Rear angle")) setAngle(71, 61);
+            }
+            const auto activeIndex = automaticVoxels ? std::optional{automaticBranchVoxelIndex} : branchVoxelIndex(scene.branchVoxelView);
+            const bool hasBakedReceiver = activeIndex && scene.branchVoxelNormals[*activeIndex] &&
+                                          scene.branchVoxelNormals[*activeIndex]->hasShadowReceivers;
+            constexpr const char* receivers[]{"Cell entry", "Baked leaf", "Cell midpoint"};
+            const auto receiver = scene.branchVoxelShadowReceiver == VoxelShadowReceiver::BakedLeaf && !hasBakedReceiver
+                ? VoxelShadowReceiver::CellEntry : scene.branchVoxelShadowReceiver;
+            if (const auto index = activeIndex)
+            {
+                const auto& data = *scene.branchVoxels[*index];
+                ImGui::Text("Cell %.6f mesh units, %zu bricks per copy", data.cellSize, data.bricks.size());
+                if (scene.branchVoxelCoverageOptimized[*index]) ImGui::TextUnformatted("Coverage-optimized bake");
+                if ((scene.branchAppearance == BranchAppearance::Shaded || scene.branchAppearance == BranchAppearance::Diffuse) &&
+                    scene.branchVoxelNormals[*index])
+                {
+                    ImGui::Checkbox("Baked leaf normals", &scene.branchVoxelUseNormals);
+                    if (scene.branchVoxelUseNormals && scene.branchVoxelNormals[*index]->hasDirectionalWeights)
+                        ImGui::Checkbox("View-dependent weights", &scene.branchVoxelDirectionalNormals);
+                }
+                if ((scene.branchAppearance == BranchAppearance::Shaded || scene.branchAppearance == BranchAppearance::ReceivedShadows) &&
+                    ImGui::BeginCombo("Shadow sample position", receivers[static_cast<unsigned>(receiver)]))
+                {
+                    for (unsigned i = 0; i < std::size(receivers); ++i)
+                    {
+                        const auto option = static_cast<VoxelShadowReceiver>(i);
+                        if (option == VoxelShadowReceiver::BakedLeaf && !hasBakedReceiver) continue;
+                        if (ImGui::Selectable(receivers[i], option == receiver)) scene.branchVoxelShadowReceiver = option;
+                    }
+                    ImGui::EndCombo();
+                }
+                if (scene.branchAppearance != BranchAppearance::Coverage) ImGui::TextUnformatted("Preview uses average leaf color");
+            }
+            if (ImGui::Button("Copy view data"))
+            {
+                const auto viewport = renderer.viewportSize();
+                const auto eye = camera.eye();
+                const auto voxelIndex = activeIndex;
+                const bool optimized = voxelIndex && scene.branchVoxelCoverageOptimized[*voxelIndex];
+                const char* appearance = "Shaded";
+                if (scene.branchAppearance == BranchAppearance::Coverage) appearance = "Coverage";
+                else if (scene.branchAppearance == BranchAppearance::BaseColor) appearance = "Unlit base color";
+                else if (scene.branchAppearance == BranchAppearance::Diffuse) appearance = lightingViews[1];
+                else if (scene.branchAppearance == BranchAppearance::ReceivedShadows) appearance = lightingViews[2];
+                else if (voxelIndex && scene.branchVoxelUseNormals && scene.branchVoxelNormals[*voxelIndex])
+                    appearance = scene.branchVoxelDirectionalNormals && scene.branchVoxelNormals[*voxelIndex]->hasDirectionalWeights
+                        ? "Shaded with view-dependent normals" : "Shaded with baked normals";
+                const auto text = std::format("{} | {}{} | {}\nOrbit distance {:.6f} | Yaw {:.4f} deg | Pitch {:.4f} deg\n"
+                                              "Eye ({:.6f}, {:.6f}, {:.6f}) | Focus ({:.6f}, {:.6f}, {:.6f})\n"
+                                              "Viewport {:.0f} x {:.0f} | {}x sampling | Triangle shadows | Rest pose\n"
+                                              "Sun azimuth {:.2f} deg | Elevation {:.2f} deg | Shadow sample: {}",
+                    scene.name(), voxelViews[static_cast<int>(scene.branchVoxelView)], optimized ? " (coverage optimized)" : "",
+                    appearance,
+                    camera.distance, DirectX::XMConvertToDegrees(camera.yaw), DirectX::XMConvertToDegrees(camera.pitch),
+                    eye.x, eye.y, eye.z, camera.focus.x, camera.focus.y, camera.focus.z, viewport.x, viewport.y,
+                    renderer.msaaEnabled() ? 4 : 1, scene.sunAzimuth, scene.sunElevation,
+                    receivers[static_cast<unsigned>(receiver)]);
+                ImGui::SetClipboardText(text.c_str());
+            }
+            return;
+        }
+    }
+    if (!scene.branchVoxelStatus.empty() && ImGui::TreeNode("Voxel bake diagnostics"))
+    {
+        ImGui::TextWrapped("%s", scene.branchVoxelStatus.c_str());
+        ImGui::TreePop();
+    }
+    const char* levels[] = {"Source GLB", "LOD 0 - Clustered full detail", "LOD 1 - Reduced",
                                       "LOD 2 - Locked rims", "LOD 3 - Rim collapse", "LOD 4 - Forced far",
                                       "LOD 5 - Four triangles per leaf", "LOD 6 - Two triangles per leaf",
                                       "Automatic (LOD 3 / 4 / 6)"};
     constexpr int automaticItem = IM_ARRAYSIZE(levels) - 1;
     static_assert(automaticItem == fixedLodLevelCount + 1);
+    if (crown) levels[automaticItem] = "Automatic (LOD 0 / 2 / 3 / 4 / 6)";
     const bool hasProxies = lod.levels.size() == fixedLodLevelCount;
     const auto view = camera.matrix();
     auto& selection = scene.branchLodSelection;
@@ -84,6 +283,7 @@ void inspectBranchLod(ViewerScene& scene, const D3D12Renderer& renderer, const C
         {
             ImGui::BeginDisabled(selection.frozen);
             constexpr auto clamp = ImGuiSliderFlags_AlwaysClamp;
+            if (crown) update |= ImGui::SliderFloat("LOD 2 and 3 limit", &selection.nearPixelLimit, 0.10f, 5.0f, "%.2f px", clamp);
             update |= ImGui::SliderFloat("LOD 4 limit", &selection.farPixelLimit, 0.10f, 5.0f, "%.2f px", clamp);
             update |= ImGui::SliderFloat("LOD 6 limit", &selection.proxyPixelLimit, 0.10f, 5.0f, "%.2f px", clamp);
             ImGui::EndDisabled();
@@ -110,6 +310,12 @@ void inspectBranchLod(ViewerScene& scene, const D3D12Renderer& renderer, const C
                               selection.frozen ? "frozen" : "live", nearGroups, farGroups, proxyGroups,
                               triangles, clusters, selection.farPixelLimit, selection.proxyPixelLimit);
         ImGui::Text("%zu foliage triangles, %zu clusters", triangles, clusters);
+        if (crown)
+        {
+            ImGui::Text("Full detail: %u groups | LOD 2: %u groups", groupCounts[0], groupCounts[2]);
+            cutData += std::format("Full detail: {} groups | LOD 2: {} groups | LOD 2 and 3 limit {:.2f} px\n",
+                                   groupCounts[0], groupCounts[2], selection.nearPixelLimit);
+        }
         ImGui::TextUnformatted("Groups");
         ImGui::SameLine();
         ImGui::TextColored({0.35f, 0.82f, 0.33f, 1.0f}, "LOD 3: %u", nearGroups);
@@ -143,9 +349,11 @@ void inspectBranchLod(ViewerScene& scene, const D3D12Renderer& renderer, const C
     const auto pitch = DirectX::XMConvertToDegrees(camera.pitch);
     const auto verticalFov = DirectX::XMConvertToDegrees(renderer.cameraVerticalFov);
     const auto viewport = renderer.viewportSize();
+    const auto distance = crown ? std::hypot(eye.x, eye.z) : camera.distance;
+    const auto distanceLabel = crown ? "Trunk range" : "Orbit distance";
     if (ImGui::TreeNode("Camera diagnostics"))
     {
-        ImGui::Text("Orbit distance %.3f scene units", camera.distance);
+        ImGui::Text("%s %.3f scene units", distanceLabel, distance);
         ImGui::Text("Yaw %.1f deg  Pitch %.1f deg", yaw, pitch);
         showVector("Eye", eye);
         showVector("Focus", camera.focus);
@@ -230,16 +438,18 @@ void inspectBranchLod(ViewerScene& scene, const D3D12Renderer& renderer, const C
         if (groupOpen) ImGui::TreePop();
         if (copy)
         {
+            const auto route = !crown ? std::string{} :
+                std::format("{} at {:.3f} s\n", scene.oakWalkRoute == OakWalkRoute::Approach ? "Walk and glance" : "Circle trunk", routeTime);
             const auto text = std::format(
                 "{} | {} | {}\n"
-                "Orbit distance {:.6f} scene units | Yaw {:.4f} deg | Pitch {:.4f} deg\n"
+                "{}{} {:.6f} scene units | Yaw {:.4f} deg | Pitch {:.4f} deg\n"
                 "Eye ({:.6f}, {:.6f}, {:.6f}) | Focus ({:.6f}, {:.6f}, {:.6f})\n"
                 "Vertical FOV {:.1f} deg | Viewport {:.0f} x {:.0f} | {}x MSAA\n"
                 "Sun azimuth {:.2f} deg | Elevation {:.2f} deg | Wind strength {:.2f} ({}, phase {:.4f})\n"
                 "Shadow LOD {} | {} | Shadow factor view {}\n"
                 "{}Group {} ({} components) | Projected error estimated at rest\n{}",
                 scene.name(), levels[level], source ? tints[0] : tints[tint],
-                camera.distance, yaw, pitch, eye.x, eye.y, eye.z, camera.focus.x, camera.focus.y, camera.focus.z,
+                route, distanceLabel, distance, yaw, pitch, eye.x, eye.y, eye.z, camera.focus.x, camera.focus.y, camera.focus.z,
                 verticalFov, viewport.x, viewport.y, renderer.msaaEnabled() ? 4 : 1,
                 scene.sunAzimuth, scene.sunElevation, scene.windStrength, scene.windPaused ? "paused" : "running",
                 windPhase, shadowLabels[shadowChoice], scene.shadowLodOffCameraOnly ? "Off-camera only" : "All casters",
@@ -265,7 +475,7 @@ void showMeshIcon()
     ImGui::Dummy(ImVec2(size, lineHeight));
 }
 
-bool inspectShadowBias(ShadowBiasSettings& bias, const D3D12Renderer& renderer)
+bool inspectShadowBias(ShadowBiasSettings& bias, const D3D12Renderer& renderer, bool cascades)
 {
     constexpr auto sliderFlags = ImGuiSliderFlags_AlwaysClamp;
     // Stack the labels so they fit even when the inspector is narrow.
@@ -288,8 +498,11 @@ bool inspectShadowBias(ShadowBiasSettings& bias, const D3D12Renderer& renderer)
     ImGui::SetItemTooltip("Offsets the shadow lookup along the sun-facing world normal.\n"
                           "Zero head-on, full offset at grazing incidence.");
     ImGui::PopItemWidth();
-    ImGui::Text("Sampling offset %.6f in light depth", bias.samplingTexels * renderer.shadowDepthPerTexel());
-    ImGui::Text("Max normal offset %.4f world units", bias.normalTexels * renderer.shadowWorldUnitsPerTexel());
+    if (!cascades)
+    {
+        ImGui::Text("Sampling offset %.6f in light depth", bias.samplingTexels * renderer.shadowDepthPerTexel());
+        ImGui::Text("Max normal offset %.4f world units", bias.normalTexels * renderer.shadowWorldUnitsPerTexel());
+    }
     ImGui::TextWrapped("Draw bias cap %.3f in light depth, after adding both draw terms.",
                        ShadowBiasSettings::drawClamp);
     if (ImGui::Button("Restore default bias"))
@@ -416,7 +629,7 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
                                        const D3D12Renderer::FrameTiming& timing,
                                        const std::string& sceneError, bool hasImportedScene,
                                        bool reloadingShaders, const std::string& shaderDiagnostics,
-                                       const CameraView& camera, float windPhase)
+                                       const CameraView& camera, float windPhase, float orbitSeconds, bool orbitPlaying)
 {
     InspectorActions actions;
     ImGui_ImplDX12_NewFrame();
@@ -446,32 +659,80 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
             {
                 ImGui::TextWrapped("%s", sceneError.c_str());
             }
-            if (isOakBranchScene(scene.kind) &&
-                ImGui::CollapsingHeader("Branch LOD", ImGuiTreeNodeFlags_DefaultOpen))
+            const bool orbit = isBranchOrbitScene(scene.kind);
+            const bool crown = scene.kind == SceneKind::ModeledOakWalk;
+            if (orbit && ImGui::CollapsingHeader("Branch orbit", ImGuiTreeNodeFlags_DefaultOpen))
             {
-                ImGui::Checkbox("Frustum culling", &scene.branchFrustumCulling);
-                inspectBranchLod(scene, renderer, camera, windPhase);
+                actions.toggleOrbit = ImGui::Button(orbitPlaying ? "Pause orbit (B)" : "Play orbit (B)");
+                ImGui::SameLine();
+                actions.restartOrbit = ImGui::Button("Restart orbit");
+                if (ImGui::SliderFloat("Orbit time", &orbitSeconds, 0.0f, branchOrbitDuration, "%.2f s",
+                                       ImGuiSliderFlags_AlwaysClamp))
+                    actions.orbitSeek = orbitSeconds;
+                float orbitDistance = camera.distance;
+                if (ImGui::InputFloat("Orbit distance", &orbitDistance, 0.0f, 0.0f, "%.2f"))
+                    actions.orbitDistance = orbitDistance;
+                if (scene.kind == SceneKind::OakBranchTransition)
+                {
+                    bool grid = scene.instanceCount() > 1;
+                    actions.transitionGridChanged = ImGui::Checkbox("25-branch grid", &grid);
+                }
+            }
+            if (crown && ImGui::CollapsingHeader("Walk route", ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                constexpr const char* routes[]{"Walk and glance", "Circle trunk"};
+                int route = static_cast<int>(scene.oakWalkRoute);
+                if (ImGui::Combo("Camera route", &route, routes, IM_ARRAYSIZE(routes)))
+                {
+                    scene.oakWalkRoute = static_cast<OakWalkRoute>(route);
+                    actions.orbitSeek = 0.0f;
+                    orbitSeconds = 0.0f;
+                }
+                actions.toggleOrbit = ImGui::Button(orbitPlaying ? "Pause route (B)" : "Play route (B)");
+                ImGui::SameLine();
+                actions.restartOrbit = ImGui::Button("Restart route");
+                if (ImGui::SliderFloat("Route time", &orbitSeconds, 0.0f, oakWalkDuration(scene.oakWalkRoute), "%.2f s",
+                                       ImGuiSliderFlags_AlwaysClamp))
+                    actions.orbitSeek = orbitSeconds;
+                const auto eye = camera.eye();
+                ImGui::Text("Eye height %.2f m | Range to trunk %.2f m", eye.y, std::hypot(eye.x, eye.z));
+            }
+            if ((isOakBranchScene(scene.kind) || crown) &&
+                ImGui::CollapsingHeader(crown ? "Foliage LOD" : "Branch LOD", ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                ImGui::Checkbox(crown ? "Whole-tree frustum culling" : "Frustum culling", &scene.branchFrustumCulling);
+                if (crown)
+                {
+                    ImGui::BeginDisabled(!scene.fixedLod || scene.branchLod == sourceBranchLod);
+                    ImGui::Checkbox("Foliage group frustum culling", &scene.branchGroupFrustumCulling);
+                    ImGui::SetItemTooltip("Use a baked level or Automatic to cull foliage groups in the camera pass.");
+                    ImGui::EndDisabled();
+                }
+                inspectBranchLod(scene, renderer, camera, windPhase, actions.comparisonCamera, orbitSeconds);
             }
             if (ImGui::CollapsingHeader("Scene controls", ImGuiTreeNodeFlags_DefaultOpen))
             {
-                if (ImGui::Button("Overview")) actions.camera = CameraPreset::Overview;
-                ImGui::SameLine();
-                if (ImGui::Button("Close-up")) actions.camera = CameraPreset::CloseUp;
-                if (scene.foliage)
+                if (!orbit && !crown)
                 {
+                    if (ImGui::Button("Overview")) actions.camera = CameraPreset::Overview;
                     ImGui::SameLine();
-                    if (ImGui::Button("Under canopy")) actions.camera = CameraPreset::UnderCanopy;
-                }
-                if (isOakBranchScene(scene.kind))
-                {
-                    ImGui::SameLine();
-                    if (ImGui::Button("Distant")) actions.camera = CameraPreset::Distant;
+                    if (ImGui::Button("Close-up")) actions.camera = CameraPreset::CloseUp;
+                    if (scene.foliage)
+                    {
+                        ImGui::SameLine();
+                        if (ImGui::Button("Under canopy")) actions.camera = CameraPreset::UnderCanopy;
+                    }
+                    if (isOakBranchScene(scene.kind))
+                    {
+                        ImGui::SameLine();
+                        if (ImGui::Button("Distant")) actions.camera = CameraPreset::Distant;
+                    }
                 }
                 actions.sunChanged = ImGui::SliderFloat("Sun azimuth", &scene.sunAzimuth, -180, 180, "%.0f deg",
                                                         ImGuiSliderFlags_AlwaysClamp);
                 actions.sunChanged |= ImGui::SliderFloat("Sun elevation", &scene.sunElevation, 25, 85, "%.0f deg",
                                                          ImGuiSliderFlags_AlwaysClamp);
-                if (scene.foliage)
+                if (scene.foliage && !orbit)
                 {
                     actions.settingsChanged |= ImGui::SliderFloat("Wind strength", &scene.windStrength,
                         0.0f, maxWindStrength, "%.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -518,7 +779,35 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
             }
             if (ImGui::CollapsingHeader("Shadow diagnostics"))
             {
-                actions.settingsChanged |= inspectShadowBias(scene.shadowBias, renderer);
+                ImGui::BeginDisabled(scene.branchVoxelView != BranchVoxelView::Off);
+                constexpr const char* maps[]{"Single map", "Three cascades"};
+                int map = scene.useSunCascades ? 1 : 0;
+                if (ImGui::Combo("Sun shadow maps", &map, maps, IM_ARRAYSIZE(maps)))
+                    scene.useSunCascades = map == 1;
+                if (scene.usesSunCascades())
+                {
+                    ImGui::Checkbox("Stabilize cascades", &scene.stabilizeSunCascades);
+                    ImGui::Checkbox("Blend cascade boundaries", &scene.blendSunCascades);
+                    ImGui::Checkbox("Wider shadow filter", &scene.filterSunCascades);
+                    if (crown)
+                    {
+                        ImGui::Checkbox("Cull cascade casters", &scene.cullSunCascadeCasters);
+                        ImGui::SetItemTooltip("Test each tree and baked foliage group against the light volume for each map.");
+                        ImGui::BeginDisabled(!scene.canCoarsenCascadeFoliage());
+                        ImGui::Checkbox("Coarsen shadow LOD per cascade", &scene.coarsenSunCascadeFoliage);
+                        ImGui::SetItemTooltip("With Shadow LOD 4, try LOD 6 below %.2f shadow texels. This can change crown self-shadowing.",
+                                              sunCascadeProxyErrorTexels);
+                        ImGui::EndDisabled();
+                    }
+                    const auto& widths = renderer.sunCascadeTexelWidths();
+                    if (widths.front() > 0.0f)
+                        ImGui::Text("World units per texel %.4f / %.4f / %.4f", widths[0], widths[1], widths[2]);
+                    ImGui::Checkbox("Cascade colors", &scene.showCascadeColors);
+                    if (scene.showCascadeColors)
+                        ImGui::TextUnformatted("Red 0–16 m | Green 16–48 m | Blue 48–120 m | Gray beyond");
+                }
+                ImGui::EndDisabled();
+                actions.settingsChanged |= inspectShadowBias(scene.shadowBias, renderer, scene.usesSunCascades());
             }
             if (ImGui::CollapsingHeader("Rendering"))
             {
@@ -534,12 +823,36 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
                             timing.camera.draws);
                 ImGui::Text("Shadows %llu tris, %u draws", static_cast<unsigned long long>(timing.shadow.triangles),
                             timing.shadow.draws);
-                if (isOakBranchScene(scene.kind))
+                if (crown && scene.usesSunCascades() && ImGui::TreeNode("Shadow cascades"))
                 {
-                    ImGui::Text("Eligible branches %u/%u camera, %u/%u shadows", timing.camera.visibleInstances,
+                    constexpr const char* names[]{"Near", "Middle", "Far"};
+                    for (std::size_t i = 0; i < timing.shadowCascades.size(); ++i)
+                    {
+                        const auto& pass = timing.shadowCascades[i];
+                        ImGui::Text("%s | %u/%u trees | %llu foliage tris", names[i], pass.visibleInstances, scene.instanceCount(),
+                                    static_cast<unsigned long long>(pass.foliageTriangles));
+                        if (pass.foliageGroupsConsidered)
+                            ImGui::Text("%zu/%zu groups", pass.foliageGroupsVisible, pass.foliageGroupsConsidered);
+                        ImGui::Text("%llu LOD 6 tris | %u foliage calls",
+                                    static_cast<unsigned long long>(pass.proxyFoliageTriangles), pass.foliageCalls);
+                    }
+                    ImGui::TreePop();
+                }
+                if (isOakBranchScene(scene.kind) || crown)
+                {
+                    ImGui::Text("Eligible %s %u/%u camera, %u/%u shadows", crown ? "trees" : "branches", timing.camera.visibleInstances,
                                 scene.instanceCount(), timing.shadow.visibleInstances, scene.instanceCount());
                     ImGui::Text("Foliage API calls %u camera, %u shadows", timing.camera.foliageCalls,
                                 timing.shadow.foliageCalls);
+                    if (crown && timing.camera.foliageGroupsConsidered)
+                        ImGui::Text("Foliage groups %zu/%zu camera", timing.camera.foliageGroupsVisible,
+                                    timing.camera.foliageGroupsConsidered);
+                    if (branchVoxelIndex(scene.branchVoxelView))
+                    {
+                        ImGui::Text("Voxel camera %llu bricks, %llu proxy tris",
+                                    static_cast<unsigned long long>(timing.camera.voxelBricks),
+                                    static_cast<unsigned long long>(timing.camera.foliageTriangles));
+                    }
                     ImGui::Text("Shadow foliage %llu tris, %u draws",
                                 static_cast<unsigned long long>(timing.shadow.foliageTriangles), timing.shadow.foliageDraws);
                     ImGui::Text("Shadow LOD overridden on %u branches", timing.shadow.shadowLodOverrides);

@@ -97,7 +97,49 @@ The build finds DXC in the selected Windows SDK and compiles the shaders. The sh
 
 Select **Card Oak** or **Modeled Oak** in the Scene menu. `--oak` still opens Card Oak, and `--modeled-oak` starts directly in Modeled Oak. The scenes share the same Overview, Close-up, and Under canopy framing. Card Oak retains its existing settings and shares materials with Grove. Modeled Oak has its own scene and material settings.
 
-Modeled Oak has 5,297,600 leaf triangles and 425,778 bark triangles. Its full-detail GLB is about 212 MiB. It uses the existing indexed renderer for camera and shadow draws. The full-tree export keeps the bark albedo and uses a flat leaf color with editable backlighting.
+Modeled Oak has 5,297,600 leaf triangles and 425,778 bark triangles. Its full-detail GLB is about 212 MiB. It uses the existing indexed renderer for camera and shadow draws. Modeled Oak and Modeled Oak Walk share the bark albedo and an authored 512 × 512 leaf base-color bake with veins and UV noise. Source and baked levels sample the same leaf material with editable backlighting.
+
+#### Modeled Oak Walk
+
+Open **Modeled Oak Walk** from the Scene menu or launch with `--oak-walk`. **Walk and glance** walks straight towards the trunk at 1.5 m/s. It starts 55.5 m out, glances 31° to either side, and stops 3 m from the trunk. **Circle trunk** walks one level lap at an 8 m radius and keeps looking toward the trunk. Both routes use a 1.88 m eye height for a 2 m character. Press **B** to play or pause, **R** to reset, or drag **Route time** to inspect a held pose. The default view starts paused with wind strength zero.
+
+In **Foliage LOD**, switch between **Automatic** and **Source GLB** at the same route time. The automatic chain uses LOD 0, 2, 3, 4, and 6 across 2,070 fixed groups. **Freeze cut** holds the selected levels while the camera moves, and **Color by → LOD level** shows the selection regions. Bark uses its original mesh. Both camera comparison modes default to the same LOD 4 triangle foliage shadow cut.
+
+Build the full-crown sidecar with the optional `oak_crown_lod` target. For example, `cmake --build build/phase1 --config Release --target CustomGameEngine oak_crown_lod`. Run `--oak-walk-benchmark report.csv` for fixed route poses, paired Source and Automatic renders, and per-pass timings at 4× MSAA.
+
+The bake retains all 132,440 leaves, including at LOD 6 with 264,880 triangles. With whole-tree culling alone, Automatic reduced the 55.5 m start from 5,297,600 to 264,880 foliage triangles and the median GPU camera pass from 0.737 to 0.167 ms. The comparison uses the same 1,456,840 foliage shadow triangles at every pose. Both routes cleared the source geometry in the eye-height trace, and Debug and Release produced identical preview captures and cut counts. The bake report is bundled beside the GLB.
+
+**Foliage group frustum culling** is enabled by default for Automatic and the baked levels. Use **LOD 0** for a grouped full-detail comparison. The camera uses conservative group bounds that enclose both source and proxy vertices and account for the current wind. When the whole tree fits in the camera frustum, all of its groups are accepted together. **Rendering → Foliage groups** reports the camera counts. Single-map shadows test whole trees against the light frustum.
+
+With the Automatic cut held at each pose, two RTX 5090 runs at 3200 × 1800 and 4× MSAA measured the following median camera times. The 40 paired validation captures per run matched pixel for pixel, including 1× and 4× MSAA, wind, forced baked levels, direct and indirect submissions, and camera-matched shadows.
+
+| Walk pose | Groups drawn | Foliage triangles, whole tree → group culling | GPU camera, whole tree → group culling |
+| --- | ---: | ---: | ---: |
+| First side glance, 23.25 m | 765 / 2,070 | 3,308,648 → 1,131,782 | 0.440 → 0.261 ms |
+| Second side glance, 11.25 m | 407 / 2,070 | 4,787,944 → 784,466 | 0.511 → 0.230 ms |
+| End of walk, 3 m | 88 / 2,070 | 5,290,446 → 223,262 | 0.508 → 0.153 ms |
+
+Run `--oak-walk-cull-benchmark report.csv` to reproduce the culling comparison. Saved results are in `build/phase1/oak-walk-cull-a.csv` and `build/phase1/oak-walk-cull-b.csv`.
+
+#### Sun shadow cascade preview
+
+Open **Shadow diagnostics → Sun shadow maps → Three cascades** in Modeled Oak Walk. **Single map** is the launch default and comparison control. **Cascade colors** shows red, green, and blue for camera depths up to 16, 48, and 120 m respectively. Gray marks surfaces beyond the shadow range. Turn the colors off to see the shaded result.
+
+**Stabilize cascades** is on by default with Three cascades. Each 2048² map encloses a camera slice with a fixed-size square in light space and snaps its center to a whole shadow texel. The footprint stays fixed as the camera turns or walks with the same projection and bias settings. The inspector shows the world units per texel for each cascade. Turn stabilization off to compare against the original tight fit, which can use a smaller footprint for some views.
+
+**Blend cascade boundaries** eases between the two maps at camera depths 14–16 m and 44–48 m. Shadow visibility fades to fully lit from 112 to 120 m. The colors show the primary cascade for each depth. **Wider shadow filter** averages four bilinear depth-comparison taps with a receiver-plane depth adjustment at each tap. The blend and filter default on with Three cascades and can be toggled independently.
+
+All three maps share conservative caster depth bounds. In Modeled Oak Walk, **Cull cascade casters** defaults on and tests trees against each map's light-space frustum, including the blend overlap. The renderer accepts fully contained trees together. It tests blocks of 16 contiguous baked foliage groups on trees that cross a map edge, and tests individual groups only when a block crosses that edge. Bounds account for wind. Trees outside the camera frustum can still cast visible shadows. **Rendering → Shadow cascades** shows the tree, foliage group, triangle, and foliage call counts for each map.
+
+**Coarsen shadow LOD per cascade** is an optional preview when **Shadow LOD** is LOD 4 for all casters. It uses LOD 6 for a tree in a map when the larger of its sampled surface and rim deviations from the source projects to at most 0.5 shadow texels. The threshold is evaluated at rest. The walk's original-size tree qualifies in the far cascade. The preview stays off by default because the LOD 6 trial changed self-shadowing on 15.1% of tree receiver pixels at the walk start by at least 8 on the 0–255 visibility scale. The corresponding ground figure was 0.039%.
+
+Run `--sun-cascade-caster-benchmark report.csv` to compare the full caster lists, culling alone, and culling with automatic shadow LOD. Culling alone matched the full lists pixel for pixel in the walk, wind, and low-sun off-camera tests. In two Release runs on the RTX 5090 at 3200 × 1800 and 4× MSAA, it cut the end-of-walk shadow pass from about 0.305 to 0.175 ms. In the six-oak fixture, it cut shadow foliage from 26.22 million to 15.58 million triangles and GPU shadow time from 1.54 to 1.03 ms, while CPU draw-list time rose from about 0.06 to 0.12 ms. Foliage submission stayed at three API calls for that fixture. See `build/phase1/sun-cascade-casters-final.csv` and `build/phase1/sun-cascade-casters-repeat.csv`.
+
+Run `--sun-cascade-transition-benchmark report.csv` for ground receiver probes, a sampling bias sweep at 54.6° and 25° sun elevation, and a fixed **Walk and glance** comparison. With the receiver-plane adjustment and existing 0.5-texel sampling bias, the ground self-shadow fixture recorded zero acne pixels at either sun angle, and the tree retained its contact shadow. At the 120 m cutoff, the average shadow visibility change across the two sampled screen rows dropped from 27.08 to 2.76 on a 0–255 scale. At the first side glance, median GPU camera time was 0.281 ms with hard boundaries and the narrow filter, and 0.294 ms with blending and the wider filter on an RTX 5090 at 3200 × 1800 and 4× MSAA. The shadow pass was about 0.305 ms in both cases. See `build/phase1/sun-cascade-transition-final.csv` and the paired captures beside it.
+
+Run `--sun-cascade-stability-benchmark report.csv` to compare a 24° turn and a 0.60 m walk with wind off at 4× MSAA. A fixed observer samples the same ground points inside each cascade while the camera used to fit the maps moves. The tight fit changed 3.4–4.9% of ground samples per frame by at least 8 on the 0–255 shadow-visibility scale, averaged over each probe and motion. Stabilized maps recorded zero changes at that threshold. Release and Debug reports are in `build/phase1/sun-cascade-stability-a.csv` and `build/phase1/sun-cascade-stability-debug.csv`.
+
+Run `--sun-cascade-benchmark report.csv --stable` for split-selection probes, a shadow check on all three maps, a single-map round trip, and a low-sun fixture with an off-camera oak. This diagnostic uses hard boundaries and the narrow filter. Omit `--stable` to run the tight-fit control. The CSVs and preview images are under `build/phase1/sun-cascade-*`.
 
 For comparison, choose the same preset in each scene and match sun angles, MSAA, and shadow settings. Set wind strength to zero for an exact still comparison. Treat the initial comparison as geometry plus material because Card Oak uses baked crown textures. Compare silhouettes and visible gaps in Overview, leaf edges and overlap in Close-up, and branch visibility and transmission in Under canopy. Then orbit slowly with MSAA off and at 4× to compare shimmer. Record GPU frame time after the HUD settles at the same resolution and camera preset.
 
@@ -126,6 +168,29 @@ Choose **Oak Branch Grid** from the **Scene** menu, or launch `CustomGameEngine.
 For a frustum check, open **Oak Branch Grid**, select **Shaded**, enable **Freeze cut**, and pause the wind. Zoom in until the viewport shows part of the grid. Toggle **Frustum culling** under **Branch LOD** and watch **Eligible branches** under **Rendering**. The camera count should drop while the image and visible ground shadows stay steady. The shadow pass tests the full light frustum, which currently encloses the grid. Resume the wind or orbit along the edge of the grid to check branches entering and leaving the camera view.
 
 To compare only caster geometry, freeze the camera cut and pause wind. Use **Shadow LOD** to switch between **Match camera cut** and a forced level. **Off-camera casters only** limits the override to branches outside the camera frustum. **Shadow factor view** shows received shadows in grayscale. Group diagnostics show the estimated error in shadow texels, and **Rendering** shows the number of overridden branches and the shadow foliage workload. Run `--branch-shadow-benchmark report.csv` to repeat the ground and branch shadow comparisons. [Shadow calibration and results](Documentation/OAK_BRANCH_CLUSTER_LOD_PLAN.md#shadow-lod-calibration)
+
+Under **Branch LOD → Voxel comparison**, choose **Source triangles**, **LOD 6 triangles**, or a binary voxel cell size from 0.015625 to 0.5 mesh units. **Camera distance** sets one of the 300–3,000-unit benchmark distances. **Retreat angle**, **Side angle**, and **Rear angle** set the comparison angles. Switch representations at a held camera pose, or orbit and zoom by hand. **Coverage view** gives foliage the same flat color across modes. Shaded voxels use average leaf color and simple lighting. All comparison modes use the rest pose and fixed LOD 6 triangle shadows. **Copy view data** captures the current representation and camera. **Rendering** reports submitted voxel bricks and box triangles. Use `--branch-voxel-benchmark report.csv` to time the camera pass. Append two `.voxels` paths to use custom bakes on the 300–3,000-unit route. [Far-distance comparison](Documentation/OAK_BRANCH_CLUSTER_LOD_PLAN.md#binary-voxel-far-distance-comparison)
+
+Open **Oak Branch Orbit** in the scene picker or launch with `--branch-orbit` to compare **LOD 6 triangles** and the optimized **Voxels 0.125** on the same 30-second orbit. The scene starts paused at 700 units in Coverage view. Wheel over the viewport to zoom, or type an **Orbit distance** and press **Enter**. Play or pause with **B**, restart the lap at the current distance with **Restart orbit**, and drag **Orbit time** to hold a specific pose. Press **R** to reset to the starting pose and 700 units. The route passes the retreat, side, and rear presets. Check **4x MSAA** in Scene controls before comparing.
+
+With **Voxels 0.125** selected, turn off **Coverage view** to compare shared preview lighting with **Baked leaf normals**. The normal bake uses the same binary occupancy and the same shared leaf color. Build the optional `oak_branch_normals` target to regenerate the data and run `--branch-voxel-normal-benchmark report.csv` to time both shading modes on the same mask.
+
+With **Baked leaf normals** enabled, toggle **View-dependent weights** to compare directional weights against pooled weights at a held pose. Append `--directional` to the normal benchmark to time both baked-normal variants. [Directional weights and results](Documentation/OAK_BRANCH_CLUSTER_LOD_PLAN.md#view-dependent-voxel-normal-weights)
+
+Turn on **Unlit base color** and switch between **LOD 6 triangles** and **Voxels 0.125** at a held pose to compare leaf colors directly. Triangles sample their texture and voxels use their shared leaf color. Sunlight and shadows are bypassed for foliage in this view.
+
+Use **Lighting diagnostic → Diffuse and backlighting** to see the direct-light response in grayscale. **Received shadows** shows light visibility, from black for full shadow to white for full light. Run `--branch-lighting-diagnostics report.csv` for paired LOD 6 and normal-shaded voxel captures on the 250- and 700-unit orbits.
+
+**Baked leaf shadow positions** compares sampling the shadow map at a baked point on the leaf surface and at the voxel entry. The toggle is off by default. Append `--shadow-receiver` to the normal benchmark to time both sampling positions. [Shadow receiving results](Documentation/OAK_BRANCH_CLUSTER_LOD_PLAN.md#baked-voxel-shadow-receivers)
+
+Launch with `--branch-transition` or open **Oak Branch Transition** to compare **Automatic branch**, **Automatic regions**, and forced **LOD 6 triangles**. With one branch and **Automatic regions**, click **Find mixed regions**, enable **Tint triangles and voxels**, and use **Freeze cut** to hold the selection while moving closer. In the tint view, triangles are blue and voxels are orange. **25-branch grid** scatters copies in the fixed benchmark pattern. `oak_branch_voxel_regions` regenerates the region ownership data, and `--branch-transition-benchmark report.csv` records matched 4× MSAA captures and timings.
+
+To build the Debug viewer and generate the normal bake in one invocation, use the `$engineCmake` path from the build instructions above.
+
+```powershell
+& $engineCmake --build build --config Debug --target CustomGameEngine oak_branch_normals
+if ($LASTEXITCODE -eq 0) { .\build\Debug\CustomGameEngine.exe --branch-orbit }
+```
 
 Pause wind and compare LOD 4, 5, and 6 from the same pose. Try **Close-up**, **Under canopy**, and **Distant** (300 scene units). Check individual outlines and veins, openings through the branch, and the ground shadow. Use **Copy view data** to record the nearest acceptable pose. **Camera diagnostics** shows orbit distance, eye and focus positions, yaw, pitch, FOV, and viewport. **Group diagnostics** can highlight a group and displays each level's triangle count and projected error estimate for that group. Turn the highlight off for shaded comparisons. [Experiment and area fit](Documentation/OAK_BRANCH_CLUSTER_LOD_PLAN.md#area-fitted-leaf-representations)
 

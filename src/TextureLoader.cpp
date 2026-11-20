@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <fstream>
 #include <stdexcept>
 
 using Microsoft::WRL::ComPtr;
@@ -225,4 +226,18 @@ TextureData loadColorTexture(std::span<const std::uint8_t> encoded, float covera
         preserveCoverage(mips, coverageCutoff);
     }
     return mips;
+}
+
+TextureData loadColorTexture(const std::filesystem::path& path)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) throw std::runtime_error("Could not open texture: " + path.filename().string());
+    const auto size = static_cast<std::streamoff>(file.tellg());
+    if (size <= 0 || size > MAXDWORD)
+        throw std::runtime_error("Invalid texture size: " + path.filename().string());
+    std::vector<std::uint8_t> encoded(static_cast<std::size_t>(size));
+    file.seekg(0);
+    if (!file.read(reinterpret_cast<char*>(encoded.data()), size))
+        throw std::runtime_error("Could not read texture: " + path.filename().string());
+    return loadColorTexture(encoded, -1.0f);
 }

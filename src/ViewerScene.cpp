@@ -78,14 +78,33 @@ Bounds assetBounds(std::span<const MeshData> meshes)
 {
     auto lower = XMVectorReplicate(std::numeric_limits<float>::max());
     auto upper = -lower;
+    const auto include = [&](FXMVECTOR point) {
+        lower = XMVectorMin(lower, point);
+        upper = XMVectorMax(upper, point);
+    };
     for (const auto& mesh : meshes)
     {
         const auto world = XMLoadFloat4x4(&mesh.localToWorld);
+        if (mesh.instances)
+        {
+            const auto center = XMLoadFloat3(&mesh.localBounds.center);
+            const auto half = XMLoadFloat3(&mesh.localBounds.halfExtent);
+            for (const auto& instance : *mesh.instances)
+            {
+                const auto transform = instance.matrix() * world;
+                for (unsigned corner = 0; corner < 8; ++corner)
+                {
+                    const auto signs = XMVectorSet(corner & 1 ? 1.0f : -1.0f,
+                                                   corner & 2 ? 1.0f : -1.0f,
+                                                   corner & 4 ? 1.0f : -1.0f, 0.0f);
+                    include(XMVector3TransformCoord(center + signs * half, transform));
+                }
+            }
+            continue;
+        }
         for (const auto& vertex : mesh.vertices)
         {
-            const auto position = XMVector3TransformCoord(XMLoadFloat3(&vertex.position), world);
-            lower = XMVectorMin(lower, position);
-            upper = XMVectorMax(upper, position);
+            include(XMVector3TransformCoord(XMLoadFloat3(&vertex.position), world));
         }
     }
     Bounds bounds;
@@ -129,9 +148,26 @@ auto loadBranchVoxelRegions(const ViewerScene& scene, const std::filesystem::pat
 const char* sceneName(SceneKind kind)
 {
     constexpr std::array names{"Cube", "Card Oak", "Modeled Oak", "Modeled Oak Walk", "Grove", "Oak Branch", "Oak Branch Grid", "Oak Branch Orbit",
-                               "Oak Branch Transition", "Imported GLB"};
+                               "Oak Branch Transition", "Forked White Oak", "Imported GLB"};
     static_assert(names.size() == sceneKinds.size());
     return names[static_cast<std::size_t>(kind)];
+}
+
+std::optional<SceneKind> findSceneKind(std::wstring_view name)
+{
+    constexpr std::array<std::wstring_view, sceneKinds.size() - 1> names{
+        L"cube", L"oak", L"modeled-oak", L"oak-walk", L"grove", L"branch", L"branch-grid",
+        L"branch-orbit", L"branch-transition", L"forked-oak"
+    };
+    const auto found = std::find(names.begin(), names.end(), name);
+    if (found == names.end()) return std::nullopt;
+    return sceneKinds[static_cast<std::size_t>(found - names.begin())];
+}
+
+float windPhaseAt(double seconds)
+{
+    constexpr double cycleSeconds = 6.0;
+    return static_cast<float>(std::fmod(seconds, cycleSeconds) * (XM_2PI / cycleSeconds));
 }
 
 const char* ViewerScene::name() const
@@ -164,6 +200,24 @@ void ViewerScene::setBranchGrid(int side)
             const auto id = static_cast<unsigned>(objects.size()) + 1;
             objects.push_back({id, {11.0f * x, 11.0f * z, 0.51f * (3 * x + 2 * z), 1.0f}});
         }
+    }
+    ground = makeGround(*this);
+}
+
+void ViewerScene::setForkedOakCount(unsigned count)
+{
+    const auto side = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(count))));
+    const float spacing = 2.0f * std::max(assetBounds.halfExtent.x, assetBounds.halfExtent.z) + 2.0f;
+    objects.clear();
+    objects.reserve(count);
+    for (unsigned i = 0; i < count; ++i)
+    {
+        const int column = static_cast<int>(i) % side - side / 2;
+        const int row = static_cast<int>(i) / side - side / 2;
+        const float scale = 1.0f + 0.04f * static_cast<float>((i * 7) % 5) - 0.08f;
+        const bool center = column == 0 && row == 0;
+        objects.push_back({i + 1, {spacing * column, spacing * row, center ? 0.0f : 1.25f * (i % 5),
+                                    center ? 1.0f : scale}});
     }
     ground = makeGround(*this);
 }
@@ -223,8 +277,17 @@ CameraView ViewerScene::cameraView(CameraPreset preset) const
 {
     const auto& bounds = cameraBounds ? *cameraBounds : assetBounds;
     const float radius = XMVectorGetX(XMVector3Length(XMLoadFloat3(&bounds.halfExtent)));
-    const float distance = std::max(5.4f, radius * 2.9f);
-    const auto focus = distance > 5.4f ? bounds.center : XMFLOAT3{0.0f, 0.75f, 0.0f};
+    const bool imported = kind == SceneKind::Imported;
+    const float distance = std::max(imported ? minimumOrbitDistance / 0.65f : 5.4f, radius * 2.9f);
+    const auto focus = imported || distance > 5.4f ? bounds.center : XMFLOAT3{0.0f, 0.75f, 0.0f};
+    if (kind == SceneKind::ForkedOak && preset == CameraPreset::Overview)
+    {
+        return {focus, XMConvertToRadians(132.0f), XMConvertToRadians(-5.0f), radius * 2.6f};
+    }
+    if (kind == SceneKind::ForkedOak && preset == CameraPreset::Distant)
+    {
+        return {focus, XMConvertToRadians(132.0f), XMConvertToRadians(-2.235f), 100.0f};
+    }
     if (kind == SceneKind::OakBranchGrid && (preset == CameraPreset::Overview || preset == CameraPreset::Distant))
     {
         const float gridDistance = preset == CameraPreset::Overview ? 42.0f : 120.0f;
@@ -276,6 +339,7 @@ std::filesystem::path ViewerScenes::sourcePath(SceneKind kind, const std::filesy
 {
     if (kind == SceneKind::Imported) return importedPath;
     if (kind == SceneKind::Cube) return assetDirectory_ / L"cube.glb";
+    if (kind == SceneKind::ForkedOak) return assetDirectory_ / L"WhiteOak-ForkedCanopy.glb";
     if (isOakBranchScene(kind)) return assetDirectory_ / L"LowBranchedWhiteOak-SingleBranch.glb";
     if (kind == SceneKind::ModeledOak || kind == SceneKind::ModeledOakWalk)
         return assetDirectory_ / L"LowBranchedWhiteOak-Modeled.glb";
@@ -422,6 +486,53 @@ ViewerScene& ViewerScenes::open(SceneKind kind, const std::filesystem::path& imp
     }
     scene.foliage = std::any_of(scene.asset->materials.begin(), scene.asset->materials.end(),
                                 [](const MaterialData& material) { return material.hasBacklighting; });
+    if (kind == SceneKind::ForkedOak)
+    {
+        try
+        {
+            const auto sources = sprayBoughSources(scene.source);
+            for (std::size_t part = 0; part < scene.sprayLods.size(); ++part)
+                scene.sprayLods[part] = std::make_shared<FixedLod>(readFixedLod(scene.source, sources[part + 1], *scene.asset));
+            const auto leaves = scene.sprayLods[0]->meshIndex;
+            const auto wood = scene.sprayLods[1]->meshIndex;
+            if (leaves == wood || !scene.asset->meshes[leaves].instances ||
+                scene.asset->meshes[leaves].instances != scene.asset->meshes[wood].instances)
+                throw std::runtime_error("Spray bakes must reference the two primitives of the same instanced node.");
+            scene.branchLod = automaticBranchLod;
+        }
+        catch (const std::runtime_error& error)
+        {
+            scene.sprayLods = {};
+            scene.sprayLodStatus = error.what();
+        }
+        if (scene.sprayLods[0])
+        {
+            try
+            {
+                scene.sprayBough = std::make_shared<SprayBough>(
+                    readSprayBough(sprayBoughSources(scene.source), *scene.asset, scene.sprayLods));
+                scene.sprayTraversal = SprayTraversal::BoughProxy;
+            }
+            catch (const std::runtime_error& error)
+            {
+                scene.sprayBoughStatus = error.what();
+            }
+            try
+            {
+                scene.treeHierarchy = std::make_shared<TreeHierarchy>(
+                    readTreeHierarchy(sprayBoughSources(scene.source), *scene.asset));
+                scene.sprayTraversal = SprayTraversal::Hierarchy;
+            }
+            catch (const std::runtime_error& error)
+            {
+                scene.treeHierarchyStatus = error.what();
+            }
+        }
+        scene.sunAzimuth = 102.0f;
+        scene.sunElevation = 49.0f;
+        scene.windStrength = 0.0f;
+        scene.windPaused = true;
+    }
     if (kind == SceneKind::OakBranchGrid)
     {
         scene.sunAzimuth = -100.0f;

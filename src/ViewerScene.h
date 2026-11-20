@@ -1,17 +1,23 @@
 #pragma once
 
 #include "FixedLod.h"
+#include "SprayBough.h"
+#include "TreeHierarchy.h"
 #include "VoxelFoliage.h"
 
 #include <array>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
+#include <string_view>
 
-enum class SceneKind { Cube, Oak, ModeledOak, ModeledOakWalk, Grove, OakBranch, OakBranchGrid, OakBranchOrbit, OakBranchTransition, Imported };
+enum class SceneKind { Cube, Oak, ModeledOak, ModeledOakWalk, Grove, OakBranch, OakBranchGrid, OakBranchOrbit, OakBranchTransition, ForkedOak, Imported };
+enum class CaptureLighting : std::uint32_t { Combined, SunOnly, SkyOnly, Transmission, ShadowVisibility };
+enum class ProbeLightingMode : std::uint32_t { Off, SkyVisibility, GroundBounce };
 inline constexpr std::array sceneKinds{SceneKind::Cube, SceneKind::Oak, SceneKind::ModeledOak, SceneKind::ModeledOakWalk, SceneKind::Grove,
                                       SceneKind::OakBranch, SceneKind::OakBranchGrid, SceneKind::OakBranchOrbit,
-                                      SceneKind::OakBranchTransition, SceneKind::Imported};
+                                      SceneKind::OakBranchTransition, SceneKind::ForkedOak, SceneKind::Imported};
 inline constexpr bool isBranchOrbitScene(SceneKind kind)
 {
     return kind == SceneKind::OakBranchOrbit || kind == SceneKind::OakBranchTransition;
@@ -21,6 +27,7 @@ inline constexpr bool isOakBranchScene(SceneKind kind)
     return kind == SceneKind::OakBranch || kind == SceneKind::OakBranchGrid || isBranchOrbitScene(kind);
 }
 const char* sceneName(SceneKind kind);
+std::optional<SceneKind> findSceneKind(std::wstring_view name);
 enum class CameraPreset { Overview, CloseUp, UnderCanopy, Distant };
 enum class OakWalkRoute { Approach, Circle };
 inline constexpr std::array sunCascadeSplits{16.0f, 48.0f, 120.0f};
@@ -54,6 +61,7 @@ struct CameraView
     DirectX::XMFLOAT4X4 matrix() const;
 };
 CameraView oakWalkView(OakWalkRoute route, float seconds);
+float windPhaseAt(double seconds);
 
 struct SceneObject
 {
@@ -86,6 +94,9 @@ inline constexpr int sourceBranchLod = -1;
 inline constexpr int automaticBranchLod = -2;
 inline constexpr int matchCameraShadowLod = -1;
 
+enum class SprayTraversal { Flat, Grouped, BoughProxy, Hierarchy };
+enum class TreeSubmission { Direct, CpuIndirect, GpuPerPart, GpuBatched };
+
 enum class BranchVoxelView
 {
     Off, Source, Lod6, Fine, Coarse, CellOneSixteenth, CellOneEighth, CellOneQuarter, CellOneHalf, Automatic, Regional, Count
@@ -96,6 +107,7 @@ enum class BranchAppearance { Shaded, Coverage, BaseColor, Diffuse, ReceivedShad
 enum class VoxelShadowReceiver : std::uint32_t { CellEntry, BakedLeaf, CellMidpoint };
 inline constexpr std::array branchVoxelFarDistances{300.0f, 600.0f, 1200.0f, 1800.0f, 2400.0f, 3000.0f};
 inline constexpr float branchVoxelFarNearPlane = 20.0f;
+inline constexpr float minimumOrbitDistance = 0.02f;
 inline constexpr float branchVoxelFarClipPlane = 3600.0f;
 
 inline constexpr std::optional<std::size_t> branchVoxelIndex(BranchVoxelView view)
@@ -159,6 +171,12 @@ struct ViewerScene
     MeshShadows groundShadows{false, true};
     float sunAzimuth = -38.6598f;
     float sunElevation = 54.5715f;
+    static constexpr float minExposureEv = -8.0f;
+    static constexpr float maxExposureEv = 8.0f;
+    float exposureEv = 0.0f;
+    ProbeLightingMode probeLighting = ProbeLightingMode::Off;
+    static constexpr unsigned probeWindMaxInterval = 8;
+    float probeWindRefreshVoxels = 0.125f;
     float windStrength = 1.0f;
     bool windPaused = false;
     bool foliage = false;
@@ -166,6 +184,29 @@ struct ViewerScene
     unsigned treeCount = 100;
     std::shared_ptr<const FixedLod> fixedLod;
     std::string fixedLodStatus;
+    std::array<std::shared_ptr<const FixedLod>, 2> sprayLods;
+    std::string sprayLodStatus;
+    std::shared_ptr<const SprayBough> sprayBough;
+    std::string sprayBoughStatus;
+    std::shared_ptr<const TreeHierarchy> treeHierarchy;
+    std::string treeHierarchyStatus;
+    SprayTraversal sprayTraversal = SprayTraversal::Grouped;
+    TreeSubmission treeSubmission = TreeSubmission::Direct;
+    std::filesystem::path boughVoxelBake;
+    std::filesystem::path liveCut;
+    bool liveCutUnbatched = false;
+    bool liveCutPackAssembly = false;
+    bool cameraPipelineStats = false;
+    float liveCutPixelError = 1.0f;
+    bool treeOcclusion = false;
+    bool treeClusterCulling = false;
+    bool treeBatchOcclusion = false;
+    bool sprayLocalLod = true;
+    bool leafGroupBounds = false;
+    bool sprayFrustumCulling = true;
+    float sprayPixelLimit = 1.0f;
+    float sprayTemplatePixelLimit = 1.0f;
+    bool cullSprayWoodBackfaces = false;
     std::array<std::shared_ptr<const VoxelFoliage>, branchVoxelBakeCount> branchVoxels;
     std::array<std::shared_ptr<const VoxelNormalData>, branchVoxelBakeCount> branchVoxelNormals;
     std::array<bool, branchVoxelBakeCount> branchVoxelCoverageOptimized{};
@@ -188,6 +229,12 @@ struct ViewerScene
     int branchShadowLod = matchCameraShadowLod;
     bool shadowLodOffCameraOnly = false;
     bool showShadowFactor = false;
+    bool captureGeometryMask = false;
+    bool captureBoughMaterials = false;
+    bool captureBoughDepth = false;
+    CaptureLighting captureLighting = CaptureLighting::Combined;
+    bool legacyAmbientForDiagnostics = false;
+    bool captureForceBough = false;
     bool useSunCascades = false;
     bool stabilizeSunCascades = true;
     bool blendSunCascades = true;
@@ -215,6 +262,7 @@ struct ViewerScene
                (cullSunCascadeCasters || (coarsenSunCascadeFoliage && canCoarsenCascadeFoliage()));
     }
     void setBranchGrid(int side);
+    void setForkedOakCount(unsigned count);
     DirectX::XMFLOAT3 sunDirection() const;
     CameraView cameraView(CameraPreset preset) const;
     CameraView branchOrbitView(float elapsedSeconds, float distance) const;

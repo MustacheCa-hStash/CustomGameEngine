@@ -1,5 +1,6 @@
 #include "BranchBenchmark.h"
 #include "D3D12Renderer.h"
+#include "SceneCapture.h"
 #include "SceneInspector.h"
 #include "ViewerSettings.h"
 
@@ -15,6 +16,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 using namespace DirectX;
 
@@ -74,6 +76,12 @@ class WindClock
 public:
     bool paused() const { return paused_; }
 
+    void pauseAt(double seconds)
+    {
+        elapsed_ = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds));
+        paused_ = true;
+    }
+
     void togglePause()
     {
         const auto now = Clock::now();
@@ -89,8 +97,7 @@ public:
     {
         const auto time = paused_ ? elapsed_ : elapsed_ + (Clock::now() - started_);
         const double seconds = std::chrono::duration<double>(time).count();
-        constexpr double cycleSeconds = 6.0;
-        return static_cast<float>(std::fmod(seconds, cycleSeconds) * (XM_2PI / cycleSeconds));
+        return windPhaseAt(seconds);
     }
 
 private:
@@ -109,29 +116,42 @@ struct OrbitCamera
     float yaw = defaultYaw;
     float pitch = defaultPitch;
     float distance = defaultDistance;
-    float homeDistance = defaultDistance;
     float zoomLimit = 45.0f;
     XMFLOAT3 focus{0.0f, 0.75f, 0.0f};
     POINT lastMouse{};
-    bool dragging = false;
+    WPARAM dragButton = 0;
+    bool manuallyMoved = false;
 
-    void useView(const CameraView& view, float overviewDistance, float distantDistance)
+    void setPose(const CameraView& view)
     {
         focus = view.focus;
         yaw = view.yaw;
         pitch = view.pitch;
         distance = view.distance;
-        homeDistance = overviewDistance;
-        zoomLimit = std::max(45.0f * homeDistance / defaultDistance, distantDistance);
+    }
+
+    void useView(const CameraView& view, float overviewDistance, float distantDistance)
+    {
+        setPose(view);
+        zoomLimit = std::max(45.0f * overviewDistance / defaultDistance, distantDistance);
+        manuallyMoved = false;
     }
 
     void setDistance(float requested)
     {
-        const float scale = homeDistance / defaultDistance;
-        if (std::isfinite(requested)) distance = std::clamp(requested, 1.5f * scale, zoomLimit);
+        if (std::isfinite(requested)) distance = std::clamp(requested, minimumOrbitDistance, zoomLimit);
     }
 
     void zoom(float steps) { setDistance(distance * std::pow(0.85f, steps)); }
+
+    void pan(float dx, float dy, float viewHeight)
+    {
+        const float unitsPerPixel = 2.0f * distance * std::tan(D3D12Renderer::cameraVerticalFov * 0.5f) / viewHeight;
+        const auto view = currentView().matrix();
+        const auto cameraToWorld = XMMatrixTranspose(XMLoadFloat4x4(&view));
+        const auto offset = XMVector3TransformNormal(XMVectorSet(-dx, dy, 0.0f, 0.0f), cameraToWorld);
+        XMStoreFloat3(&focus, XMLoadFloat3(&focus) + offset * unitsPerPixel);
+    }
 
     CameraView currentView() const
     {
@@ -161,33 +181,49 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         switch (message)
         {
         case WM_LBUTTONDOWN:
-            camera->dragging = !uiHandled && GetCapture() == window;
-            if (camera->dragging)
+        case WM_MBUTTONDOWN:
+            if (!uiHandled && GetCapture() == window)
             {
+                camera->dragButton = message == WM_LBUTTONDOWN ? MK_LBUTTON : MK_MBUTTON;
                 camera->lastMouse = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             }
             return 0;
         case WM_LBUTTONUP:
+        case WM_MBUTTONUP:
+            if (camera->dragButton == (message == WM_LBUTTONUP ? MK_LBUTTON : MK_MBUTTON))
+                camera->dragButton = 0;
+            return 0;
         case WM_CAPTURECHANGED:
-            camera->dragging = false;
+            camera->dragButton = 0;
             return 0;
         case WM_MOUSEMOVE:
-            if (camera->dragging && GetCapture() == window && (wParam & MK_LBUTTON))
+            if (camera->dragButton && GetCapture() == window && (wParam & camera->dragButton))
             {
                 const POINT mouse{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
                 const float dx = static_cast<float>(mouse.x - camera->lastMouse.x);
                 const float dy = static_cast<float>(mouse.y - camera->lastMouse.y);
-                camera->yaw = std::remainder(camera->yaw - dx * 0.008f, XM_2PI);
-                camera->pitch = std::clamp(camera->pitch + dy * 0.008f, -1.45f, 1.45f);
+                if (camera->dragButton == MK_LBUTTON)
+                {
+                    camera->yaw = std::remainder(camera->yaw - dx * 0.008f, XM_2PI);
+                    camera->pitch = std::clamp(camera->pitch + dy * 0.008f, -1.45f, 1.45f);
+                }
+                else
+                {
+                    RECT client{};
+                    if (GetClientRect(window, &client) && client.bottom > client.top)
+                        camera->pan(dx, dy, static_cast<float>(client.bottom - client.top));
+                }
+                camera->manuallyMoved |= dx != 0 || dy != 0;
                 camera->lastMouse = mouse;
             }
             return 0;
         case WM_MOUSEWHEEL:
         {
-            if (!uiHandled || camera->dragging)
+            if (!uiHandled || camera->dragButton)
             {
                 const float steps = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / WHEEL_DELTA;
                 camera->zoom(steps);
+                camera->manuallyMoved = true;
             }
             return 0;
         }
@@ -213,14 +249,36 @@ HWND createWindow(HINSTANCE instance, OrbitCamera& camera)
         throw std::runtime_error("Could not register the viewer window class.");
     }
 
-    RECT bounds{0, 0, 3200, 1800};
-    if (!AdjustWindowRect(&bounds, windowStyle, FALSE))
+    RECT frame{};
+    if (!AdjustWindowRect(&frame, windowStyle, FALSE))
     {
         throw std::runtime_error("Could not calculate the viewer window size.");
     }
-    HWND window = CreateWindowExW(0, windowClassName, L"Custom Game Engine", windowStyle,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, bounds.right - bounds.left,
-                                  bounds.bottom - bounds.top, nullptr, nullptr, instance, &camera);
+    const int frameWidth = frame.right - frame.left;
+    const int frameHeight = frame.bottom - frame.top;
+    constexpr int clientWidth = D3D12Renderer::defaultRenderWidth;
+    constexpr int clientHeight = D3D12Renderer::defaultRenderHeight;
+    int width = clientWidth + frameWidth;
+    int height = clientHeight + frameHeight;
+    int x = CW_USEDEFAULT;
+    int y = CW_USEDEFAULT;
+    RECT workArea{};
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0))
+    {
+        const int availableWidth = workArea.right - workArea.left;
+        const int availableHeight = workArea.bottom - workArea.top;
+        if (availableWidth > frameWidth && availableHeight > frameHeight)
+        {
+            const double scale = std::min({1.0, static_cast<double>(availableWidth - frameWidth) / clientWidth,
+                                           static_cast<double>(availableHeight - frameHeight) / clientHeight});
+            width = std::max(1, static_cast<int>(clientWidth * scale)) + frameWidth;
+            height = std::max(1, static_cast<int>(clientHeight * scale)) + frameHeight;
+            x = workArea.left + (availableWidth - width) / 2;
+            y = workArea.top + (availableHeight - height) / 2;
+        }
+    }
+    HWND window = CreateWindowExW(0, windowClassName, L"Custom Game Engine", windowStyle, x, y, width, height,
+                                  nullptr, nullptr, instance, &camera);
     if (!window)
     {
         throw std::runtime_error("Could not create the viewer window.");
@@ -237,6 +295,8 @@ void updateWindowTitle(HWND window, const D3D12Renderer& renderer, const ViewerS
         title = renderer.msaaEnabled() ? L"Custom Game Engine | MSAA 4x (M)"
                                        : L"Custom Game Engine | MSAA off (M)";
     }
+    const auto size = renderer.viewportSize();
+    title += std::format(L" | {} x {}", static_cast<UINT>(size.x), static_cast<UINT>(size.y));
     if (scene.foliage)
     {
         title += scene.windPaused ? L" | Wind paused (P)" : L" | Wind running (P)";
@@ -270,58 +330,51 @@ struct LaunchOptions
     bool stabilizedCascadeBenchmark = false;
 };
 
-LaunchOptions launchOptions()
+LaunchOptions launchOptions(int count, wchar_t* const* arguments)
 {
-    int count = 0;
-    const std::unique_ptr<wchar_t*, decltype(&LocalFree)> arguments(
-        CommandLineToArgvW(GetCommandLineW(), &count), LocalFree);
-    if (!arguments)
-    {
-        throw std::runtime_error("Could not read the command line.");
-    }
     if (count > 1)
     {
-        const std::wstring_view option = arguments.get()[1];
+        const std::wstring_view option = arguments[1];
         if (option == L"--sun-cascade-caster-benchmark")
         {
-            if (count != 3 || !arguments.get()[2][0]) throw std::runtime_error("Supply a CSV output path.");
-            return {SceneKind::ModeledOakWalk, {}, false, arguments.get()[2], BranchBenchmarkKind::SunCascadeCasters};
+            if (count != 3 || !arguments[2][0]) throw std::runtime_error("Supply a CSV output path.");
+            return {SceneKind::ModeledOakWalk, {}, false, arguments[2], BranchBenchmarkKind::SunCascadeCasters};
         }
         if (option == L"--sun-cascade-stability-benchmark" || option == L"--sun-cascade-transition-benchmark")
         {
-            if (count != 3 || !arguments.get()[2][0]) throw std::runtime_error("Supply a CSV output path.");
+            if (count != 3 || !arguments[2][0]) throw std::runtime_error("Supply a CSV output path.");
             const auto kind = option == L"--sun-cascade-stability-benchmark" ?
                 BranchBenchmarkKind::SunCascadeStability : BranchBenchmarkKind::SunCascadeTransition;
-            return {SceneKind::ModeledOakWalk, {}, false, arguments.get()[2], kind};
+            return {SceneKind::ModeledOakWalk, {}, false, arguments[2], kind};
         }
         if (option == L"--sun-cascade-benchmark")
         {
-            const bool stabilized = count == 4 && std::wstring_view(arguments.get()[3]) == L"--stable";
-            if ((count != 3 && !stabilized) || !arguments.get()[2][0])
+            const bool stabilized = count == 4 && std::wstring_view(arguments[3]) == L"--stable";
+            if ((count != 3 && !stabilized) || !arguments[2][0])
                 throw std::runtime_error("Supply a CSV output path and optional --stable.");
-            LaunchOptions launch{SceneKind::ModeledOakWalk, {}, false, arguments.get()[2], BranchBenchmarkKind::SunCascades};
+            LaunchOptions launch{SceneKind::ModeledOakWalk, {}, false, arguments[2], BranchBenchmarkKind::SunCascades};
             launch.stabilizedCascadeBenchmark = stabilized;
             return launch;
         }
         if (option == L"--oak-walk-benchmark" || option == L"--oak-walk-cull-benchmark")
         {
-            if (count != 3 || !arguments.get()[2][0]) throw std::runtime_error("Supply a CSV output path.");
+            if (count != 3 || !arguments[2][0]) throw std::runtime_error("Supply a CSV output path.");
             const auto kind = option == L"--oak-walk-benchmark" ? BranchBenchmarkKind::OakWalk : BranchBenchmarkKind::OakWalkCull;
-            return {SceneKind::ModeledOakWalk, {}, false, arguments.get()[2], kind};
+            return {SceneKind::ModeledOakWalk, {}, false, arguments[2], kind};
         }
         if (option == L"--branch-voxel-bounds-benchmark")
         {
-            if (count != 3 || !arguments.get()[2][0]) throw std::runtime_error("Supply a CSV output path.");
-            return {SceneKind::OakBranch, {}, false, arguments.get()[2], BranchBenchmarkKind::VoxelBounds};
+            if (count != 3 || !arguments[2][0]) throw std::runtime_error("Supply a CSV output path.");
+            return {SceneKind::OakBranch, {}, false, arguments[2], BranchBenchmarkKind::VoxelBounds};
         }
         if (option == L"--branch-transition-benchmark")
         {
-            if ((count != 3 && count != 4) || !arguments.get()[2][0])
+            if ((count != 3 && count != 4) || !arguments[2][0])
                 throw std::runtime_error("Supply a CSV output path and optional voxel entry limit in pixels.");
-            LaunchOptions launch{SceneKind::OakBranchTransition, {}, false, arguments.get()[2], BranchBenchmarkKind::Transition};
+            LaunchOptions launch{SceneKind::OakBranchTransition, {}, false, arguments[2], BranchBenchmarkKind::Transition};
             if (count == 4)
             {
-                const std::wstring value = arguments.get()[3];
+                const std::wstring value = arguments[3];
                 std::size_t consumed = 0;
                 launch.voxelEntryPixels = std::stof(value, &consumed);
                 if (consumed != value.size() || !(launch.voxelEntryPixels >= 0.1f && launch.voxelEntryPixels <= 1.0f))
@@ -331,35 +384,35 @@ LaunchOptions launchOptions()
         }
         if (option == L"--branch-region-benchmark")
         {
-            if ((count != 4 && count != 5) || !arguments.get()[2][0])
+            if ((count != 4 && count != 5) || !arguments[2][0])
                 throw std::runtime_error("Supply a CSV output path, region index, and optional region voxel bake.");
-            const std::wstring_view region = arguments.get()[3];
+            const std::wstring_view region = arguments[3];
             if (region.size() != 1 || region.front() < L'0' ||
                 region.front() >= L'0' + static_cast<wchar_t>(voxelBranchRegionCount))
                 throw std::runtime_error("The region index is out of range.");
-            LaunchOptions launch{SceneKind::OakBranchTransition, {}, false, arguments.get()[2], BranchBenchmarkKind::Region};
+            LaunchOptions launch{SceneKind::OakBranchTransition, {}, false, arguments[2], BranchBenchmarkKind::Region};
             launch.pilotRegion = static_cast<unsigned>(region.front() - L'0');
-            if (count == 5) launch.regionCandidate = arguments.get()[4];
+            if (count == 5) launch.regionCandidate = arguments[4];
             return launch;
         }
         if (option == L"--branch-voxel-normal-benchmark" || option == L"--branch-lighting-diagnostics")
         {
-            const bool directional = count == 4 && std::wstring_view(arguments.get()[3]) == L"--directional";
+            const bool directional = count == 4 && std::wstring_view(arguments[3]) == L"--directional";
             const auto kind = option == L"--branch-lighting-diagnostics" ? BranchBenchmarkKind::Lighting
                                                                        : BranchBenchmarkKind::VoxelNormals;
             const bool shadowReceiver = kind == BranchBenchmarkKind::VoxelNormals && count == 4 &&
-                                        std::wstring_view(arguments.get()[3]) == L"--shadow-receiver";
+                                        std::wstring_view(arguments[3]) == L"--shadow-receiver";
             const bool midpoint = kind == BranchBenchmarkKind::Lighting && count == 4 &&
-                                  std::wstring_view(arguments.get()[3]) == L"--midpoint";
+                                  std::wstring_view(arguments[3]) == L"--midpoint";
             const bool casterMatrix = kind == BranchBenchmarkKind::Lighting && count == 4 &&
-                                      std::wstring_view(arguments.get()[3]) == L"--caster-matrix";
-            if ((count != 3 && !directional && !shadowReceiver && !midpoint && !casterMatrix) || !arguments.get()[2][0])
+                                      std::wstring_view(arguments[3]) == L"--caster-matrix";
+            if ((count != 3 && !directional && !shadowReceiver && !midpoint && !casterMatrix) || !arguments[2][0])
                 throw std::runtime_error(kind == BranchBenchmarkKind::Lighting
                     ? "Supply a CSV output path, optionally followed by --directional, --midpoint, or --caster-matrix."
                     : "Supply a CSV output path, optionally followed by --directional or --shadow-receiver.");
             const auto shading = shadowReceiver ? VoxelShadingComparison::ShadowReceiver :
                 (directional ? VoxelShadingComparison::DirectionalNormals : VoxelShadingComparison::PooledNormals);
-            LaunchOptions launch{SceneKind::OakBranch, {}, false, arguments.get()[2], kind, {}, shading};
+            LaunchOptions launch{SceneKind::OakBranch, {}, false, arguments[2], kind, {}, shading};
             launch.compareVoxelShadowMidpoint = midpoint || casterMatrix;
             launch.compareVoxelShadowCasters = casterMatrix;
             return launch;
@@ -367,19 +420,19 @@ LaunchOptions launchOptions()
         if (option == L"--branch-benchmark" || option == L"--branch-shadow-benchmark" || option == L"--branch-voxel-benchmark")
         {
             const bool farVoxelRoute = option == L"--branch-voxel-benchmark" && count == 5;
-            if ((count != 3 && !farVoxelRoute) || arguments.get()[2][0] == L'\0')
+            if ((count != 3 && !farVoxelRoute) || arguments[2][0] == L'\0')
             {
                 throw std::runtime_error("Supply a CSV output path. The voxel benchmark also accepts two voxel bakes for the far route.");
             }
             const auto benchmark = option == L"--branch-shadow-benchmark" ? BranchBenchmarkKind::Shadow :
                 (option == L"--branch-voxel-benchmark" ? BranchBenchmarkKind::Voxel : BranchBenchmarkKind::Triangle);
             LaunchOptions launch{benchmark == BranchBenchmarkKind::Shadow ? SceneKind::OakBranchGrid : SceneKind::OakBranch,
-                                 {}, false, arguments.get()[2], benchmark};
+                                 {}, false, arguments[2], benchmark};
             if (farVoxelRoute)
             {
-                if (!arguments.get()[3][0] || !arguments.get()[4][0])
+                if (!arguments[3][0] || !arguments[4][0])
                     throw std::runtime_error("Both far voxel bake paths must be nonempty.");
-                launch.farVoxelBakes = {arguments.get()[3], arguments.get()[4]};
+                launch.farVoxelBakes = {arguments[3], arguments[4]};
             }
             return launch;
         }
@@ -390,17 +443,13 @@ LaunchOptions launchOptions()
     }
     if (count == 2)
     {
-        const std::wstring_view option = arguments.get()[1];
-        if (option == L"--grove") return {SceneKind::Grove, {}};
-        if (option == L"--oak") return {SceneKind::Oak, {}};
-        if (option == L"--modeled-oak") return {SceneKind::ModeledOak, {}};
-        if (option == L"--oak-walk") return {SceneKind::ModeledOakWalk, {}};
-        if (option == L"--branch") return {SceneKind::OakBranch, {}};
-        if (option == L"--branch-grid") return {SceneKind::OakBranchGrid, {}};
-        if (option == L"--branch-orbit") return {SceneKind::OakBranchOrbit, {}};
-        if (option == L"--branch-transition") return {SceneKind::OakBranchTransition, {}};
+        const std::wstring_view option = arguments[1];
+        if (option.starts_with(L"--"))
+        {
+            if (const auto kind = findSceneKind(option.substr(2))) return {*kind, {}};
+        }
         if (option == L"--reset-settings") return {SceneKind::Cube, {}, true};
-        return {SceneKind::Imported, arguments.get()[1]};
+        return {SceneKind::Imported, arguments[1]};
     }
     return {};
 }
@@ -442,23 +491,58 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     std::filesystem::path assetPath;
     OrbitCamera camera;
     HWND window = nullptr;
+    bool capturing = false;
     try
     {
-        const auto launch = launchOptions();
-        ViewerSettings settings(std::filesystem::path(VIEWER_PROJECT_DIRECTORY) / L"viewer-settings.ini");
+        int count = 0;
+        const std::unique_ptr<wchar_t*, decltype(&LocalFree)> arguments(
+            CommandLineToArgvW(GetCommandLineW(), &count), LocalFree);
+        if (!arguments) throw std::runtime_error("Could not read the command line.");
+        const auto command = count > 1 ? std::wstring_view(arguments.get()[1]) : std::wstring_view{};
+        capturing = command == L"--capture" || command == L"--probe-walk" || command == L"--probe-wind-benchmark";
+        if (capturing)
+        {
+            if (command == L"--probe-walk")
+            {
+                if (count != 3) throw std::runtime_error("--probe-walk requires a new output directory.");
+                captureProbeWalk(arguments.get()[2], assetDirectory());
+            }
+            else if (command == L"--probe-wind-benchmark")
+            {
+                const bool timingsOnly = count == 4 && std::wstring_view(arguments.get()[3]) == L"--timings-only";
+                if (count != 3 && !timingsOnly)
+                    throw std::runtime_error("--probe-wind-benchmark requires a new directory and accepts --timings-only.");
+                captureProbeWind(arguments.get()[2], assetDirectory(), !timingsOnly);
+            }
+            else captureScene(std::span(arguments.get() + 2, static_cast<std::size_t>(count - 2)), assetDirectory());
+            return 0;
+        }
+        const bool reviewLaunch = command == L"--review-capture";
+        auto launch = reviewLaunch ? LaunchOptions{} : launchOptions(count, arguments.get());
+        ViewerSettings settings(reviewLaunch ? std::filesystem::path{} :
+            std::filesystem::path(VIEWER_PROJECT_DIRECTORY) / L"viewer-settings.ini");
         if (launch.resetSettings)
         {
             settings.reset();
             if (!settings.save()) throw std::runtime_error(settings.error());
         }
         const auto directory = assetDirectory();
+        const auto skyPanorama = directory / L"MeadowDaySky.hdr";
         ViewerScenes scenes(directory);
+        std::optional<SceneCaptureReview> review;
+        if (reviewLaunch)
+        {
+            review = prepareSceneCaptureReview(
+                std::span(arguments.get() + 2, static_cast<std::size_t>(count - 2)), scenes);
+            launch.kind = review->scene->kind;
+            if (launch.kind == SceneKind::Imported) launch.imported = review->scene->source;
+        }
         assetPath = scenes.sourcePath(launch.kind, launch.imported);
-        auto* scene = &scenes.open(launch.kind, launch.imported);
+        auto* scene = review ? review->scene : &scenes.open(launch.kind, launch.imported);
         if (!launch.benchmarkReport.empty())
         {
             window = createWindow(instance, camera);
-            D3D12Renderer renderer(window);
+            D3D12Renderer renderer(window, skyPanorama);
             if (renderer.msaaEnabled()) renderer.toggleMsaa();
             ShowWindow(window, showCommand);
             if (launch.benchmark == BranchBenchmarkKind::Shadow) return runBranchShadowBenchmark(window, *scene, renderer, launch.benchmarkReport);
@@ -488,18 +572,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
                                                launch.voxelShading, launch.benchmark == BranchBenchmarkKind::VoxelBounds);
             return runBranchBenchmark(window, *scene, renderer, launch.benchmarkReport);
         }
-        settings.apply(*scene);
+        if (!review) settings.apply(*scene);
         window = createWindow(instance, camera);
-        D3D12Renderer renderer(window);
-        if (!settings.msaaEnabled()) renderer.toggleMsaa();
+        D3D12Renderer renderer(window, skyPanorama, review && review->cullMeshBackfaces);
+        const bool enableMsaa = review ? review->msaa == 4 : settings.msaaEnabled();
+        if (review && enableMsaa && !renderer.supportsMsaa())
+            throw std::runtime_error("The selected D3D12 device does not support 4x MSAA for this renderer.");
+        if (renderer.msaaEnabled() != enableMsaa) renderer.toggleMsaa();
         renderer.setScene(*scene);
         SceneInspector inspector(window, renderer);
         PerformanceHud hud;
         WindClock wind;
-        if (scene->windPaused) wind.togglePause();
+        if (review) wind.pauseAt(review->windTime);
+        else if (scene->windPaused) wind.togglePause();
         D3D12Renderer::FrameTiming timing{};
         std::optional<Clock::time_point> routeStart;
         std::optional<Clock::time_point> branchOrbitStart;
+        bool manualView = false;
         float orbitSeconds = 0.0f;
         std::string sceneError;
         std::future<ShaderCompilation> shaderReload;
@@ -509,6 +598,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
             routeStart.reset();
             branchOrbitStart.reset();
             orbitSeconds = 0.0f;
+            manualView = false;
             const float distant = isOakBranchScene(scene->kind) ? branchVoxelFarDistances.back() : 0.0f;
             camera.useView(view, scene->cameraView(CameraPreset::Overview).distance, distant);
         };
@@ -527,6 +617,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
                 return;
             }
             if (orbitSeconds >= orbitDuration()) orbitSeconds = 0.0f;
+            manualView = false;
             branchOrbitStart = Clock::now() - std::chrono::duration_cast<Clock::duration>(
                 std::chrono::duration<float>(orbitSeconds));
         };
@@ -553,7 +644,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
             refreshTitle();
         };
 
-        applyView(CameraPreset::Overview);
+        if (review) useCameraView(review->camera);
+        else applyView(CameraPreset::Overview);
         refreshTitle();
         ShowWindow(window, showCommand);
 
@@ -653,8 +745,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
                 }
             }
 
+            if (std::exchange(camera.manuallyMoved, false))
+            {
+                manualView = true;
+                if (routeStart)
+                {
+                    routeStart.reset();
+                    refreshTitle();
+                }
+                branchOrbitStart.reset();
+            }
             auto view = camera.currentView();
-            if (isBranchOrbitScene(scene->kind) || scene->kind == SceneKind::ModeledOakWalk)
+            if (!manualView && (isBranchOrbitScene(scene->kind) || scene->kind == SceneKind::ModeledOakWalk))
             {
                 if (branchOrbitStart)
                 {
@@ -675,12 +777,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
                 view.pitch = 0.42f + 0.15f * std::sin(angle);
                 view.distance = 80.0f + 32.0f * std::cos(angle);
             }
-            if (isOakBranchScene(scene->kind))
-            {
-                const bool farView = view.distance >= branchVoxelFarDistances.front();
-                renderer.updateCameraProjection(farView ? branchVoxelFarNearPlane : scene->nearPlane,
-                                                farView ? branchVoxelFarClipPlane : scene->farPlane());
-            }
+            camera.setPose(view);
+            renderer.updateOrbitCameraProjection(*scene, view.distance);
             const auto viewMatrix = view.matrix();
             renderer.updateBranchLod(*scene, viewMatrix);
             const auto& inspectorError = sceneError.empty() ? settings.error() : sceneError;
@@ -713,14 +811,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
                 scene->setBranchGrid(scene->instanceCount() == 1 ? branchGridSide : 1);
                 renderer.setScene(*scene);
             }
-            if (actions.orbitDistance) camera.setDistance(*actions.orbitDistance);
+            if (actions.orbitDistance)
+            {
+                camera.setDistance(*actions.orbitDistance);
+                if (!isBranchOrbitScene(scene->kind)) camera.manuallyMoved = true;
+            }
             if (actions.orbitSeek)
             {
+                manualView = false;
                 orbitSeconds = *actions.orbitSeek;
                 branchOrbitStart.reset();
             }
             else if (actions.restartOrbit)
             {
+                manualView = false;
                 orbitSeconds = 0.0f;
                 branchOrbitStart = Clock::now();
             }
@@ -770,6 +874,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     }
     catch (const std::exception& error)
     {
+        if (capturing)
+        {
+            reportCaptureError(error.what());
+            return 1;
+        }
         if (window)
         {
             DestroyWindow(window);

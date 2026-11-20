@@ -5,6 +5,7 @@
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <type_traits>
 
@@ -12,8 +13,11 @@ namespace
 {
 constexpr std::array<char, 8> fileMagic{'F', 'I', 'X', 'E', 'D', 'L', 'O', 'D'};
 constexpr std::uint32_t fileVersion = 4;
+constexpr std::uint32_t sprayGroupVersion = 5;
+constexpr std::uint32_t wholeSprayVersion = 6;
 static_assert(sizeof(FixedLodGroup) == 220);
 static_assert(sizeof(FixedLodIndexRange) == 8);
+static_assert(sizeof(SprayGroupCut) == 24);
 static_assert(sizeof(Vertex) == 40);
 
 template<class T>
@@ -106,7 +110,7 @@ void validate(const FixedLod& lod, const MeshData& mesh)
     for (std::size_t levelIndex = 0; levelIndex < lod.levels.size(); ++levelIndex)
     {
         const auto& level = lod.levels[levelIndex];
-        const auto vertexCount = levelIndex < fixedLodIndicesOnlyCount ? mesh.vertices.size() : lod.proxyVertices.size();
+        const auto vertexCount = lod.usesProxyVertices(levelIndex) ? lod.proxyVertices.size() : mesh.vertices.size();
         if (level.indices.size() > previousIndexCount ||
             std::any_of(level.indices.begin(), level.indices.end(), [&](auto index) { return index >= vertexCount; }))
         {
@@ -140,6 +144,31 @@ void validate(const FixedLod& lod, const MeshData& mesh)
             throw std::runtime_error("Incomplete fixed LOD cluster ranges.");
         }
     }
+    std::size_t next = 0;
+    const auto validateCuts = [&](const std::vector<SprayGroupCut>& group) {
+        std::uint32_t previous = 0;
+        for (const auto& cut : group)
+        {
+            const auto count = cut.range.indexCount;
+            const auto vertices = cut.fittedVertices ? lod.proxyVertices.size() : mesh.vertices.size();
+            if (!validError(cut.sourceError) || !validError(cut.referenceError) ||
+                cut.fittedVertices > 1 || cut.tintLevel > fixedLodLevelCount + 2 ||
+                cut.range.firstIndex != next || !count || count % 3 != 0 || count < previous ||
+                next + count > lod.sprayGroupIndices.size())
+            {
+                throw std::runtime_error("Invalid fixed LOD spray group cut.");
+            }
+            const auto indices = std::span(lod.sprayGroupIndices).subspan(next, count);
+            if (std::ranges::any_of(indices, [&](auto index) { return index >= vertices; }))
+                throw std::runtime_error("Invalid fixed LOD spray group vertex.");
+            next += count;
+            previous = count;
+        }
+    };
+    for (const auto& group : lod.sprayGroups) validateCuts(group);
+    validateCuts(lod.wholeSprayCuts);
+    if (next != lod.sprayGroupIndices.size())
+        throw std::runtime_error("Incomplete fixed LOD spray group data.");
 }
 }
 
@@ -164,7 +193,12 @@ std::uint64_t fixedLodSourceFingerprint(const std::filesystem::path& source)
 
 FixedLod readFixedLod(const std::filesystem::path& source, const AssetData& asset)
 {
-    std::ifstream file(fixedLodPath(source), std::ios::binary);
+    return readFixedLod(source, fixedLodPath(source), asset);
+}
+
+FixedLod readFixedLod(const std::filesystem::path& source, const std::filesystem::path& bake, const AssetData& asset)
+{
+    std::ifstream file(bake, std::ios::binary);
     if (!file) throw std::runtime_error("Fixed LOD bake missing. Rebuild the viewer to generate it.");
     std::array<char, fileMagic.size()> magic{};
     std::uint32_t version;
@@ -172,7 +206,8 @@ FixedLod readFixedLod(const std::filesystem::path& source, const AssetData& asse
     readValues(file, magic.data(), magic.size());
     readValues(file, &version);
     readValues(file, &fingerprint);
-    if (magic != fileMagic || version != fileVersion || fingerprint != fixedLodSourceFingerprint(source))
+    if (magic != fileMagic || (version != fileVersion && version != sprayGroupVersion && version != wholeSprayVersion) ||
+        fingerprint != fixedLodSourceFingerprint(source))
     {
         throw std::runtime_error("Fixed LOD bake is incompatible with this GLB. Rebuild the viewer.");
     }
@@ -193,7 +228,8 @@ FixedLod readFixedLod(const std::filesystem::path& source, const AssetData& asse
     lod.components = readArray<std::uint32_t>(file, maxTriangles);
     std::uint32_t levelCount;
     readValues(file, &levelCount);
-    if (levelCount != fixedLodIndicesOnlyCount && levelCount != fixedLodLevelCount)
+    if (levelCount != fixedLodIndicesOnlyCount && levelCount != fixedLodSharedCoarseLevelCount &&
+        levelCount != fixedLodLevelCount)
     {
         throw std::runtime_error("Invalid fixed LOD level count.");
     }
@@ -213,6 +249,17 @@ FixedLod readFixedLod(const std::filesystem::path& source, const AssetData& asse
         level.indices = readArray<std::uint32_t>(file, mesh.indices.size());
         level.clusters = readArray<FixedLodIndexRange>(file, maxTriangles);
     }
+    if (version >= sprayGroupVersion)
+    {
+        std::uint32_t groupCount;
+        readValues(file, &groupCount);
+        if (!groupCount || groupCount > maxSprayLodGroups) throw std::runtime_error("Invalid spray group count.");
+        lod.sprayGroups.reserve(groupCount);
+        for (std::uint32_t i = 0; i < groupCount; ++i)
+            lod.sprayGroups.push_back(readArray<SprayGroupCut>(file, maxSprayGroupCuts));
+        if (version == wholeSprayVersion) lod.wholeSprayCuts = readArray<SprayGroupCut>(file, maxWholeSprayCuts);
+        lod.sprayGroupIndices = readArray<std::uint32_t>(file, mesh.indices.size() * (maxSprayGroupCuts + maxWholeSprayCuts));
+    }
     if (file.peek() != std::char_traits<char>::eof())
     {
         throw std::runtime_error("Unexpected data after the fixed LOD bake.");
@@ -226,7 +273,8 @@ void writeFixedLod(const std::filesystem::path& output, std::uint64_t fingerprin
     std::ofstream file(output, std::ios::binary | std::ios::trunc);
     file.exceptions(std::ios::failbit | std::ios::badbit);
     writeValues(file, fileMagic.data(), fileMagic.size());
-    writeValues(file, &fileVersion);
+    const auto version = !lod.wholeSprayCuts.empty() ? wholeSprayVersion : lod.sprayGroups.empty() ? fileVersion : sprayGroupVersion;
+    writeValues(file, &version);
     writeValues(file, &fingerprint);
     writeValues(file, &lod.meshIndex);
     writeValues(file, &lod.triangleCap);
@@ -241,6 +289,14 @@ void writeFixedLod(const std::filesystem::path& output, std::uint64_t fingerprin
     {
         writeArray(file, level.indices);
         writeArray(file, level.clusters);
+    }
+    if (!lod.sprayGroups.empty())
+    {
+        const auto groupCount = static_cast<std::uint32_t>(lod.sprayGroups.size());
+        writeValues(file, &groupCount);
+        for (const auto& group : lod.sprayGroups) writeArray(file, group);
+        if (!lod.wholeSprayCuts.empty()) writeArray(file, lod.wholeSprayCuts);
+        writeArray(file, lod.sprayGroupIndices);
     }
     file.close();
 }

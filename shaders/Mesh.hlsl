@@ -1,3 +1,6 @@
+#include "LeafLighting.hlsli"
+#include "ProbeLighting.hlsli"
+
 cbuffer DrawConstants : register(b0)
 {
     row_major float4x4 model;
@@ -12,9 +15,12 @@ cbuffer DrawConstants : register(b0)
     int twoSidedNormalSign;
     uint lodTint;
     uint highlightedLodGroup;
-    uint firstLodTriangle;
+    uint firstLodTag;
     uint lodLevel;
     uint shadowView;
+    uint usesMeshInstances;
+    float3 transmissionColor;
+    uint transmissionFlags;
 };
 
 cbuffer FrameConstants : register(b1)
@@ -37,14 +43,22 @@ cbuffer FrameConstants : register(b1)
     float4 cascadeBlendWidths;
     float4 cascadeDepthPerTexel;
     float4 lightRight;
+    uint encodedCamera;
+    uint directionalSkylight;
+    uint lightingMode;
+    uint probePadding;
+    float4 probeOriginSpacing;
+    uint4 probeSize;
 };
 
 Texture2D<float4> colorTexture : register(t0);
 SamplerState colorSampler : register(s0);
 Texture2D<float> shadowMap : register(t1);
 SamplerComparisonState shadowSampler : register(s1);
-StructuredBuffer<uint3> lodTriangleTags : register(t2);
+StructuredBuffer<uint3> lodTags : register(t2);
 Texture2DArray<float> cascadeShadowMaps : register(t3);
+Texture2D<float4> transmissionColorTexture : register(t4);
+Texture2D<float4> transmissionStrengthTexture : register(t5);
 
 struct VertexInput
 {
@@ -53,15 +67,19 @@ struct VertexInput
     float2 uv0 : TEXCOORD0;
     float2 uv1 : TEXCOORD1;
     float4 instance : INSTANCE;
+    float3 meshTranslation : MESHINSTANCE0;
+    float4 meshRotation : MESHINSTANCE1;
+    float3 meshScale : MESHINSTANCE2;
 };
 
 struct PixelInput
 {
     float4 position : SV_Position;
     float3 worldNormal : NORMAL;
-    float2 uv : TEXCOORD0;
+    float4 texcoords : TEXCOORD0;
     float4 lightPosition : TEXCOORD1;
     float4 worldPositionAndViewDepth : TEXCOORD2;
+    nointerpolation uint meshInstanceId : TEXCOORD3;
 };
 
 struct ShadowInput
@@ -82,9 +100,20 @@ float2 rotateXZ(float2 xz, float angle)
     return float2(cosine * xz.x + sine * xz.y, -sine * xz.x + cosine * xz.y);
 }
 
+float3 rotateMeshInstance(float3 value, float4 rotation)
+{
+    const float3 twiceCross = 2.0 * cross(rotation.xyz, value);
+    return value + rotation.w * twiceCross + cross(rotation.xyz, twiceCross);
+}
+
 float4 bendPosition(VertexInput input, out float2 bendSlope)
 {
-    float4 asset = mul(float4(input.position, 1.0), model);
+    float3 position = input.position;
+    if (usesMeshInstances)
+    {
+        position = rotateMeshInstance(position * input.meshScale, input.meshRotation) + input.meshTranslation;
+    }
+    float4 asset = mul(float4(position, 1.0), model);
     float4 world = asset;
     world.xz = rotateXZ(asset.xz, input.instance.z);
     world.xyz *= input.instance.w;
@@ -106,19 +135,25 @@ float4 bendPosition(VertexInput input, out float2 bendSlope)
     return world;
 }
 
-PixelInput VSMain(VertexInput input)
+PixelInput VSMain(VertexInput input, uint instanceId : SV_InstanceID)
 {
     PixelInput output;
     float2 bendSlope;
     float4 world = bendPosition(input, bendSlope);
     output.position = mul(world, viewProjection);
-    output.worldNormal = mul(float4(input.normal, 0.0), normalToWorld).xyz;
+    float3 normal = input.normal;
+    if (usesMeshInstances)
+    {
+        normal = rotateMeshInstance(normal / input.meshScale, input.meshRotation);
+    }
+    output.worldNormal = mul(float4(normal, 0.0), normalToWorld).xyz;
     output.worldNormal.xz = rotateXZ(output.worldNormal.xz, input.instance.z);
     // The normal's Y component changes under the horizontal shear.
     output.worldNormal.y -= dot(bendSlope, output.worldNormal.xz);
-    output.uv = materialUv(input);
+    output.texcoords = float4(input.uv0, input.uv1);
     output.lightPosition = mul(world, lightViewProjection);
     output.worldPositionAndViewDepth = float4(world.xyz, output.position.w);
+    output.meshInstanceId = instanceId;
     return output;
 }
 
@@ -235,17 +270,28 @@ float3 tintColor(uint id)
 
 float4 PSMain(PixelInput input, bool isFrontFace : SV_IsFrontFace, uint primitive : SV_PrimitiveID) : SV_Target
 {
+    const float2 uv = textureCoordinateSet == 0 ? input.texcoords.xy : input.texcoords.zw;
+    if (shadowView >= 9)
+    {
+        if (alphaCutoff >= 0.0) applyCutout(sampleBaseColor(uv).a);
+        if (shadowView == 9)
+        {
+            uint value = uint(round(saturate(input.worldPositionAndViewDepth.w / 1000.0) * 16777215.0));
+            return float4(float3(value & 255,(value >> 8) & 255,(value >> 16) & 255) / 255.0,1);
+        }
+        return shadowView == 10 ? float4(0,1,0,1) : float4(1,0,0,1);
+    }
     if (shadowView == 7 || shadowView == 8)
     {
-        if (alphaCutoff >= 0.0) applyCutout(sampleBaseColor(input.uv).a);
+        if (alphaCutoff >= 0.0) applyCutout(sampleBaseColor(uv).a);
         return shadowView == 7 ? 0 : float4(0.22, 0.63, 0.99, 1);
     }
     if (shadowView == 3)
     {
-        if (alphaCutoff >= 0.0) applyCutout(sampleBaseColor(input.uv).a);
+        if (alphaCutoff >= 0.0) applyCutout(sampleBaseColor(uv).a);
         return float4(0.15, 0.55, 0.32, 1);
     }
-    float4 baseColor = sampleBaseColor(input.uv);
+    float4 baseColor = sampleBaseColor(uv);
     applyCutout(baseColor.a);
     uint cascade = 0;
     if (useCascades)
@@ -262,7 +308,13 @@ float4 PSMain(PixelInput input, bool isFrontFace : SV_IsFrontFace, uint primitiv
         return float4(hasColorTexture ? encodeSrgb(baseColor.rgb) : baseColor.rgb, 1.0);
     if (shadowView == 0 && (lodTint != 0 || highlightedLodGroup != 0))
     {
-        const uint3 tag = lodTriangleTags[firstLodTriangle + primitive];
+        if (lodTint == 5)
+            return float4(tintColor(lodTags[firstLodTag + input.meshInstanceId].y), 1.0);
+        if (lodTint == 6)
+            return float4(1.0, 0.66, 0.13, 1.0);
+        uint3 tag = 0;
+        if (lodTint != 4 || highlightedLodGroup != 0)
+            tag = lodTags[firstLodTag + primitive];
         if (highlightedLodGroup == tag.y + 1)
         {
             return float4(1.0, 0.58, 0.12, 1.0);
@@ -290,7 +342,7 @@ float4 PSMain(PixelInput input, bool isFrontFace : SV_IsFrontFace, uint primitiv
     float diffuse = saturate(normalToSun) + transmission * saturate(-normalToSun);
     if (shadowView == 5) return float4(diffuse.xxx, 1.0);
     float visibility = 1.0;
-    if (receivesShadows)
+    if (receivesShadows && lightingMode != skyOnly)
     {
         if (useCascades)
         {
@@ -307,9 +359,33 @@ float4 PSMain(PixelInput input, bool isFrontFace : SV_IsFrontFace, uint primitiv
         // Alpha tags the receiver for measurement. The swap chain displays RGB.
         return float4(visibility.xxx, shadowView == 1 ? 0.25 : 0.75);
     }
-    float3 lit = baseColor.rgb * (0.35 + 0.65 * diffuse * visibility);
-    // Textures are sampled as linear RGB. The current render target stores display RGB.
-    return float4(hasColorTexture ? encodeSrgb(lit) : lit, 1.0);
+    if (lightingMode == shadowVisibility) return float4(visibility.xxx, 1.0);
+
+    // Each texture's selector is 0 for no texture, 1 for TEXCOORD_0, and 2 for TEXCOORD_1.
+    [branch]
+    if (transmissionFlags & 1)
+    {
+        const uint colorUv = (transmissionFlags >> 1) & 3;
+        const uint strengthUv = (transmissionFlags >> 3) & 3;
+        float3 tint = transmissionColor;
+        float fraction = transmission;
+        if (colorUv)
+            tint *= transmissionColorTexture.Sample(colorSampler, colorUv == 1 ? input.texcoords.xy : input.texcoords.zw).rgb;
+        if (strengthUv)
+            fraction *= transmissionStrengthTexture.Sample(colorSampler, strengthUv == 1 ? input.texcoords.xy : input.texcoords.zw).a;
+        LeafIncidentLight light = leafIncidentLight(worldNormal, normalToSun, directionalSkylight);
+        localDiffuse(input.worldPositionAndViewDepth.xyz, worldNormal, probeOriginSpacing,
+                     probeSize.xyz, true, light.skyFront, light.skyBack);
+        return float4(shadeLeaf(light, visibility, lightingMode, baseColor.rgb, tint, fraction), 1.0);
+    }
+    if (lightingMode == transmissionOnly) return float4(0, 0, 0, 1);
+    float3 ambient = lightingMode == sunOnly ? 0.0 : directionalSkylight ? evaluateSkylight(worldNormal) : 0.35;
+    float3 unusedBack = 0;
+    localDiffuse(input.worldPositionAndViewDepth.xyz, worldNormal, probeOriginSpacing, probeSize.xyz,
+                 false, ambient, unusedBack);
+    const float direct = lightingMode == skyOnly ? 0.0 : 0.65 * diffuse * visibility;
+    float3 lit = baseColor.rgb * (ambient + direct);
+    return float4(encodedCamera && hasColorTexture ? encodeSrgb(lit) : lit, 1.0);
 }
 
 ShadowInput ShadowVS(VertexInput input)

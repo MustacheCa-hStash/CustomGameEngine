@@ -634,10 +634,13 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
     InspectorActions actions;
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
+    auto& io = ImGui::GetIO();
+    const auto renderSize = renderer.viewportSize();
+    if (io.DisplaySize.x > 0 && io.DisplaySize.y > 0)
+        io.DisplayFramebufferScale = {renderSize.x / io.DisplaySize.x, renderSize.y / io.DisplaySize.y};
     ImGui::NewFrame();
     if (visible_)
     {
-        const auto& io = ImGui::GetIO();
         const float width = std::min(440.0f * ImGui::GetStyle().FontScaleDpi, io.DisplaySize.x - 24.0f);
         ImGui::SetNextWindowPos({12.0f, 12.0f}, ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize({width, std::min(900.0f, io.DisplaySize.y - 24.0f)}, ImGuiCond_FirstUseEver);
@@ -670,7 +673,7 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
                                        ImGuiSliderFlags_AlwaysClamp))
                     actions.orbitSeek = orbitSeconds;
                 float orbitDistance = camera.distance;
-                if (ImGui::InputFloat("Orbit distance", &orbitDistance, 0.0f, 0.0f, "%.2f"))
+                if (ImGui::InputFloat("Orbit distance", &orbitDistance, 0.0f, 0.0f, "%.3f"))
                     actions.orbitDistance = orbitDistance;
                 if (scene.kind == SceneKind::OakBranchTransition)
                 {
@@ -710,8 +713,81 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
                 }
                 inspectBranchLod(scene, renderer, camera, windPhase, actions.comparisonCamera, orbitSeconds);
             }
+            if (scene.kind == SceneKind::ForkedOak &&
+                ImGui::CollapsingHeader("Spray LOD", ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                if (!scene.sprayLods[0])
+                    ImGui::TextWrapped("%s", scene.sprayLodStatus.c_str());
+                else
+                {
+                    constexpr const char* modes[]{"Automatic (LOD 3 leaf baseline)", "LOD 3", "Source"};
+                    int mode = scene.branchLod == sourceBranchLod ? 2 : scene.branchLod == automaticBranchLod ? 0 : 1;
+                    if (ImGui::Combo("Representation", &mode, modes, IM_ARRAYSIZE(modes)))
+                        scene.branchLod = mode == 0 ? automaticBranchLod : mode == 1 ? static_cast<int>(fixedLodRimLevel) : sourceBranchLod;
+                    constexpr const char* colors[]{"Shaded", "Group", "LOD level"};
+                    constexpr std::array tints{FixedLodTint::Shaded, FixedLodTint::SprayGroup, FixedLodTint::Level};
+                    int color = scene.lodTint == FixedLodTint::SprayGroup ? 1 : scene.lodTint == FixedLodTint::Level ? 2 : 0;
+                    if (ImGui::Combo("Color by", &color, colors, IM_ARRAYSIZE(colors)))
+                        scene.lodTint = tints[color];
+                    ImGui::SetItemTooltip("Group shows stable spatial groups. LOD level shows the active cut. Amber shows replacement geometry.");
+                    constexpr const char* traversal[]{"Flat placements", "Spatial groups", "Single bough proxy", "Geometry hierarchy"};
+                    const auto path = static_cast<int>(scene.sprayTraversal);
+                    if (ImGui::BeginCombo("Traversal", traversal[path]))
+                    {
+                        for (int i = 0; i < IM_ARRAYSIZE(traversal); ++i)
+                        {
+                            ImGui::BeginDisabled((i == 2 && !scene.sprayBough) || (i == 3 && !scene.treeHierarchy));
+                            if (ImGui::Selectable(traversal[i], path == i)) scene.sprayTraversal = static_cast<SprayTraversal>(i);
+                            ImGui::EndDisabled();
+                        }
+                        ImGui::EndCombo();
+                    }
+                    if (!scene.sprayBoughStatus.empty()) ImGui::TextWrapped("%s", scene.sprayBoughStatus.c_str());
+                    if (!scene.treeHierarchyStatus.empty()) ImGui::TextWrapped("%s", scene.treeHierarchyStatus.c_str());
+                    ImGui::Checkbox("Frustum culling", &scene.sprayFrustumCulling);
+                    if (scene.sprayTraversal == SprayTraversal::Hierarchy)
+                    {
+                        ImGui::BeginDisabled(mode != 0);
+                        constexpr const char* choices[]{"CPU direct", "CPU selection + indirect",
+                                                        "GPU selection + indirect", "GPU batched + indirect"};
+                        int submission = static_cast<int>(scene.treeSubmission);
+                        if (ImGui::Combo("Tree submission", &submission, choices, IM_ARRAYSIZE(choices)))
+                            scene.treeSubmission = static_cast<TreeSubmission>(submission);
+                        ImGui::BeginDisabled(scene.treeSubmission != TreeSubmission::GpuPerPart);
+                        ImGui::Checkbox("Depth culling for twig wood", &scene.treeOcclusion);
+                        ImGui::EndDisabled();
+                        ImGui::BeginDisabled(scene.treeSubmission != TreeSubmission::GpuBatched || !scene.sprayFrustumCulling);
+                        ImGui::Checkbox("Camera cluster frustum culling", &scene.treeClusterCulling);
+                        ImGui::EndDisabled();
+                        ImGui::BeginDisabled(scene.treeSubmission != TreeSubmission::GpuBatched);
+                        ImGui::Checkbox("Two-pass camera occlusion", &scene.treeBatchOcclusion);
+                        ImGui::EndDisabled();
+                        ImGui::EndDisabled();
+                    }
+                    if (!scene.sprayLods[0]->sprayGroups.empty() || !scene.sprayLods[1]->sprayGroups.empty())
+                    {
+                        ImGui::BeginDisabled(mode != 0 || scene.sprayTraversal == SprayTraversal::Flat);
+                        ImGui::Checkbox("Per-group leaf and twig LOD", &scene.sprayLocalLod);
+                        ImGui::BeginDisabled(!scene.sprayLocalLod || (scene.sprayTraversal == SprayTraversal::Hierarchy &&
+                            (scene.treeSubmission == TreeSubmission::GpuPerPart || scene.treeSubmission == TreeSubmission::GpuBatched)));
+                        ImGui::Checkbox("Project individual leaf group bounds (CPU)", &scene.leafGroupBounds);
+                        ImGui::EndDisabled();
+                        ImGui::EndDisabled();
+                    }
+                    ImGui::BeginDisabled(mode != 0);
+                    ImGui::SliderFloat("Camera error", &scene.sprayPixelLimit, 0.05f, 4.0f, "%.2f px",
+                                       ImGuiSliderFlags_AlwaysClamp);
+                    ImGui::EndDisabled();
+                }
+            }
             if (ImGui::CollapsingHeader("Scene controls", ImGuiTreeNodeFlags_DefaultOpen))
             {
+                if (!orbit)
+                {
+                    float orbitDistance = camera.distance;
+                    if (ImGui::InputFloat("Orbit distance", &orbitDistance, 0.0f, 0.0f, "%.3f"))
+                        actions.orbitDistance = orbitDistance;
+                }
                 if (!orbit && !crown)
                 {
                     if (ImGui::Button("Overview")) actions.camera = CameraPreset::Overview;
@@ -722,7 +798,7 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
                         ImGui::SameLine();
                         if (ImGui::Button("Under canopy")) actions.camera = CameraPreset::UnderCanopy;
                     }
-                    if (isOakBranchScene(scene.kind))
+                    if (isOakBranchScene(scene.kind) || scene.kind == SceneKind::ForkedOak)
                     {
                         ImGui::SameLine();
                         if (ImGui::Button("Distant")) actions.camera = CameraPreset::Distant;
@@ -732,6 +808,11 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
                                                         ImGuiSliderFlags_AlwaysClamp);
                 actions.sunChanged |= ImGui::SliderFloat("Sun elevation", &scene.sunElevation, 25, 85, "%.0f deg",
                                                          ImGuiSliderFlags_AlwaysClamp);
+                actions.settingsChanged |= ImGui::SliderFloat("Exposure", &scene.exposureEv,
+                    ViewerScene::minExposureEv, ViewerScene::maxExposureEv, "%+.2f EV", ImGuiSliderFlags_AlwaysClamp);
+                auto probeMode = static_cast<int>(scene.probeLighting);
+                if (ImGui::Combo("Probe lighting", &probeMode, "Off\0Canopy sky visibility\0Sky and ground bounce\0"))
+                    scene.probeLighting = static_cast<ProbeLightingMode>(probeMode);
                 if (scene.foliage && !orbit)
                 {
                     actions.settingsChanged |= ImGui::SliderFloat("Wind strength", &scene.windStrength,
@@ -823,6 +904,51 @@ InspectorActions SceneInspector::frame(ViewerScene& scene, const D3D12Renderer& 
                             timing.camera.draws);
                 ImGui::Text("Shadows %llu tris, %u draws", static_cast<unsigned long long>(timing.shadow.triangles),
                             timing.shadow.draws);
+                if (scene.kind == SceneKind::ForkedOak)
+                {
+                    ImGui::Text("Camera sprays %u/%u", timing.camera.visibleSprayPlacements, timing.camera.sprayPlacements);
+                    if (!timing.camera.gpuTreeDispatches)
+                    {
+                        ImGui::Text("Camera tests %u groups, %u spray parts",
+                                    timing.camera.sprayGroupTests, timing.camera.sprayPlacementTests);
+                        ImGui::Text("Coarse wood sprays %u camera, %u shadow",
+                                    timing.camera.sprayWoodByLod[fixedLodSharedCoarseLevel],
+                                    timing.shadow.sprayWoodByLod[fixedLodSharedCoarseLevel]);
+                    }
+                    if (timing.camera.boughProxyPlacements)
+                        ImGui::Text("Bough proxy %u sprays, %llu tris", timing.camera.boughProxyPlacements,
+                                    static_cast<unsigned long long>(timing.camera.boughProxyTriangles));
+                    if (timing.camera.treeNodeTests)
+                    {
+                        ImGui::Text("Hierarchy %u parent cuts / %u node tests",
+                                    timing.camera.treeNodesDrawn, timing.camera.treeNodeTests);
+                        ImGui::Text("Parent cuts replace %u leaf sprays and %u twig sprays",
+                                    timing.camera.treeProxySprays[0], timing.camera.treeProxySprays[1]);
+                        ImGui::Text("Hierarchy %u draws in %u submissions",
+                                    timing.camera.treeDraws, timing.camera.treeSubmissionCalls);
+                        if (timing.camera.gpuTreeDispatches)
+                            ImGui::Text("GPU selection %u dispatches, %u depth rejects",
+                                        timing.camera.gpuTreeDispatches, timing.camera.treeDepthRejects);
+                        if (timing.camera.treeBatchJobs)
+                        {
+                            const auto& ms = timing.camera.treeBatchGpuMilliseconds;
+                            ImGui::Text("GPU batch %u jobs, %u draw instances", timing.camera.treeBatchJobs,
+                                        timing.camera.treeBatchInstances);
+                            ImGui::Text("Traverse %.3f  Select %.3f  Pack %.3f  Draw %.3f ms", ms[0], ms[1], ms[2], ms[3]);
+                            if (timing.camera.treeClusterTests)
+                                ImGui::Text("Cluster bounds %u tested, %u rejected | %.3f ms",
+                                            timing.camera.treeClusterTests, timing.camera.treeClusterRejects,
+                                            timing.camera.treeClusterGpuMilliseconds);
+                            if (timing.camera.treeOcclusionActive)
+                                ImGui::Text("Occlusion %u deferred, %u hidden, %u recovered | depth %.3f ms",
+                                            timing.camera.treeOcclusionDeferred, timing.camera.treeOcclusionRejected,
+                                            timing.camera.treeOcclusionRecovered, timing.camera.treePyramidGpuMilliseconds);
+                        }
+                    }
+                    if (scene.sprayLocalLod && !timing.camera.gpuTreeDispatches)
+                        ImGui::Text("Camera local groups %u leaf, %u twig",
+                                    timing.camera.sprayLocalGroups[0], timing.camera.sprayLocalGroups[1]);
+                }
                 if (crown && scene.usesSunCascades() && ImGui::TreeNode("Shadow cascades"))
                 {
                     constexpr const char* names[]{"Near", "Middle", "Far"};

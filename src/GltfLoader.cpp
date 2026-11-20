@@ -33,6 +33,58 @@ bool readComponents(const cgltf_accessor& accessor, cgltf_size index, std::span<
            });
 }
 
+std::shared_ptr<const std::vector<MeshInstance>> readInstances(const cgltf_mesh_gpu_instancing& extension)
+{
+    const auto attributes = std::span(extension.attributes, extension.attributes_count);
+    const auto count = attributes.front().data->count;
+    if (count == 0 || count > std::numeric_limits<std::uint32_t>::max() / sizeof(MeshInstance))
+    {
+        throw std::runtime_error("Invalid GLB mesh instance count.");
+    }
+    auto instances = std::make_shared<std::vector<MeshInstance>>(count);
+    for (const auto& attribute : attributes)
+    {
+        const auto& accessor = *attribute.data;
+        const std::string_view name(attribute.name);
+        if (name != "TRANSLATION" && name != "ROTATION" && name != "SCALE") continue;
+        const auto expected = name == "ROTATION" ? cgltf_type_vec4 : cgltf_type_vec3;
+        if (accessor.type != expected || accessor.count != count)
+        {
+            throw std::runtime_error("Invalid GLB mesh instance transform accessor.");
+        }
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            auto& instance = (*instances)[i];
+            float values[4]{};
+            if (!readComponents(accessor, i, {values, expected == cgltf_type_vec4 ? 4u : 3u}))
+            {
+                throw std::runtime_error("Could not read a GLB mesh instance transform.");
+            }
+            if (name == "TRANSLATION") instance.translation = DirectX::XMFLOAT3(values);
+            else if (name == "ROTATION")
+            {
+                const DirectX::XMFLOAT4 quaternion(values);
+                const auto rotation = DirectX::XMLoadFloat4(&quaternion);
+                const auto length = DirectX::XMVectorGetX(DirectX::XMVector4LengthSq(rotation));
+                if (!std::isfinite(length) || length == 0.0f)
+                {
+                    throw std::runtime_error("Invalid GLB mesh instance rotation.");
+                }
+                DirectX::XMStoreFloat4(&instance.rotation, DirectX::XMVector4Normalize(rotation));
+            }
+            else
+            {
+                if (values[0] <= 0.0f || values[1] <= 0.0f || values[2] <= 0.0f)
+                {
+                    throw std::runtime_error("GLB mesh instances need positive scales.");
+                }
+                instance.scale = DirectX::XMFLOAT3(values);
+            }
+        }
+    }
+    return instances;
+}
+
 MeshData readPrimitive(const cgltf_primitive& primitive, const DirectX::XMFLOAT4X4& localToWorld)
 {
     if (primitive.type != cgltf_primitive_type_triangles || primitive.has_draco_mesh_compression ||
@@ -116,6 +168,23 @@ MeshData readPrimitive(const cgltf_primitive& primitive, const DirectX::XMFLOAT4
     return mesh;
 }
 
+TransmissionTexture readMaterialTexture(const cgltf_texture_view& view, AssetData& asset,
+                                        std::string_view label, float coverageCutoff = -1.0f)
+{
+    if (view.has_transform || view.texcoord < 0 || view.texcoord > 1)
+        throw std::runtime_error(std::string(label) + " needs untransformed TEXCOORD_0 or TEXCOORD_1.");
+    const auto* image = view.texture->image;
+    if (!image || !image->buffer_view || !image->mime_type ||
+        (std::string_view(image->mime_type) != "image/png" && std::string_view(image->mime_type) != "image/jpeg"))
+        throw std::runtime_error(std::string(label) + " must be an embedded PNG or JPEG image.");
+    const auto* encoded = cgltf_buffer_view_data(image->buffer_view);
+    if (!encoded) throw std::runtime_error("Could not read the embedded material texture.");
+    const auto index = asset.textures.size();
+    asset.textures.push_back({image->name ? std::string(image->name) : std::string(label),
+                              loadColorTexture({encoded, image->buffer_view->size}, coverageCutoff)});
+    return {index, static_cast<std::uint32_t>(view.texcoord)};
+}
+
 MaterialData readMaterial(const cgltf_material& source, AssetData& asset)
 {
     MaterialData material;
@@ -129,9 +198,18 @@ MaterialData readMaterial(const cgltf_material& source, AssetData& asset)
     }
     if (source.has_diffuse_transmission)
     {
-        material.transmission = source.diffuse_transmission.diffuse_transmission_factor;
+        const auto& sourceTransmission = source.diffuse_transmission;
+        material.transmission = sourceTransmission.diffuse_transmission_factor;
         material.hasBacklighting = true;
         material.twoSidedTransmission = source.double_sided;
+        auto& diffuse = material.diffuseTransmission.emplace();
+        diffuse.color = DirectX::XMFLOAT3(sourceTransmission.diffuse_transmission_color_factor);
+        if (sourceTransmission.diffuse_transmission_color_texture.texture)
+            diffuse.colorTexture = readMaterialTexture(sourceTransmission.diffuse_transmission_color_texture, asset,
+                                                       "Diffuse transmission color texture");
+        if (sourceTransmission.diffuse_transmission_texture.texture)
+            diffuse.strengthTexture = readMaterialTexture(sourceTransmission.diffuse_transmission_texture, asset,
+                                                          "Diffuse transmission strength texture");
     }
     if (!source.has_pbr_metallic_roughness)
     {
@@ -144,27 +222,10 @@ MaterialData readMaterial(const cgltf_material& source, AssetData& asset)
     {
         return material;
     }
-    if (view.has_transform || view.texcoord < 0 || view.texcoord > 1)
-    {
-        throw std::runtime_error("A base-color texture needs untransformed TEXCOORD_0 or TEXCOORD_1.");
-    }
-    material.textureCoordinateSet = static_cast<std::uint32_t>(view.texcoord);
-
-    const auto* image = view.texture->image;
-    if (!image || !image->buffer_view || !image->mime_type ||
-        (std::string_view(image->mime_type) != "image/png" && std::string_view(image->mime_type) != "image/jpeg"))
-    {
-        throw std::runtime_error("Base-color textures must be embedded PNG or JPEG images.");
-    }
-    const auto* encoded = cgltf_buffer_view_data(image->buffer_view);
-    if (!encoded)
-    {
-        throw std::runtime_error("Could not read the embedded base-color texture.");
-    }
     const float coverageCutoff = material.color.w > 0.0f ? material.alphaCutoff / material.color.w : -1.0f;
-    material.colorTexture = asset.textures.size();
-    asset.textures.push_back({image->name ? image->name : "Base color",
-                              loadColorTexture({encoded, image->buffer_view->size}, coverageCutoff)});
+    const auto texture = readMaterialTexture(view, asset, "Base color", coverageCutoff);
+    material.colorTexture = texture.index;
+    material.textureCoordinateSet = texture.texcoord;
     return material;
 }
 }
@@ -199,9 +260,10 @@ AssetData loadGlb(const std::filesystem::path& path)
     {
         throw std::runtime_error("Export a self-contained GLB with an embedded mesh buffer.");
     }
-    if (data->extensions_required_count != 0)
+    for (const auto* extension : std::span(data->extensions_required, data->extensions_required_count))
     {
-        throw std::runtime_error("The GLB requires an unsupported glTF extension.");
+        if (std::string_view(extension) != "EXT_mesh_gpu_instancing")
+            throw std::runtime_error("The GLB requires an unsupported glTF extension.");
     }
     checkGltf(cgltf_load_buffers(&options, data.get(), nullptr), "Could not load the embedded mesh buffer.");
     checkGltf(cgltf_validate(data.get()), "The GLB failed glTF validation.");
@@ -232,7 +294,7 @@ AssetData loadGlb(const std::filesystem::path& path)
         {
             continue;
         }
-        if (node.skin || node.has_mesh_gpu_instancing)
+        if (node.skin)
         {
             throw std::runtime_error("Only static mesh nodes are supported.");
         }
@@ -247,10 +309,12 @@ AssetData loadGlb(const std::filesystem::path& path)
         {
             throw std::runtime_error("A mesh node has a non-invertible world transform.");
         }
+        const auto instances = node.has_mesh_gpu_instancing ? readInstances(node.mesh_gpu_instancing) : nullptr;
         for (cgltf_size i = 0; i < node.mesh->primitives_count; ++i)
         {
             const auto& primitive = node.mesh->primitives[i];
             auto mesh = readPrimitive(primitive, localToWorld);
+            mesh.instances = instances;
             mesh.name = node.name ? node.name : "Mesh";
             if (node.mesh->primitives_count > 1)
             {

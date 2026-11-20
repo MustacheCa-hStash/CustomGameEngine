@@ -1,3 +1,6 @@
+#include "LeafLighting.hlsli"
+#include "ProbeLighting.hlsli"
+
 cbuffer Frame : register(b0)
 {
     row_major float4x4 viewProjection;
@@ -20,6 +23,16 @@ cbuffer Frame : register(b0)
     float transmission;
     uint shadowReceiver;
     uint tightBrickProxies;
+    uint encodedCamera;
+    uint directionalSkylight;
+    uint lightingMode;
+    float3 transmissionColor;
+    uint thinLeaf;
+    uint orientedBricks;
+    uint2 probePadding;
+    float4 probeOriginSpacing;
+    uint4 probeSize;
+    float4 boughWind;
 };
 
 cbuffer Draw : register(b1)
@@ -67,10 +80,11 @@ float2 rotateXZ(float2 xz, float angle)
 Pixel VSMain(uint vertex : SV_VertexID, uint instance : SV_InstanceID)
 {
     const Brick brick = bricks[instance % brickCount];
-    const float4 placement = placements[firstPlacement + instance / brickCount];
+    const uint axes = 4 * (instance % brickCount);
+    const float4 placement = orientedBricks ? float4(0,0,0,1) : placements[firstPlacement + instance / brickCount];
     const float3 lower = origin + float3(brick.coordinate) * (4.0 * cellSize);
     // Reverse the winding if the mesh transform mirrors the local grid.
-    const uint corner = vertex ^ mirrored;
+    const uint corner = vertex ^ (orientedBricks ? uint(placements[axes].w) : mirrored);
     Pixel output;
     const uint3 cornerBits = (corner >> uint3(0, 1, 2)) & 1;
     output.backInCells = 4.0 * float3(cornerBits);
@@ -87,6 +101,20 @@ Pixel VSMain(uint vertex : SV_VertexID, uint instance : SV_InstanceID)
     world.xz = rotateXZ(world.xz, placement.z);
     world *= placement.w;
     world.xz += placement.xy;
+    float3 orientedEye = 0;
+    if (orientedBricks)
+    {
+        float3 base = placements[axes].xyz, a = placements[axes+1].xyz;
+        float3 b = placements[axes+2].xyz, c = placements[axes+3].xyz;
+        float height = (base.y - boughWind.z) * boughWind.w;
+        float weight = saturate(height);
+        float2 slope = height > 0 && height < 1 ? 2 * weight * boughWind.w * boughWind.xy : 0;
+        base.xz += weight * weight * boughWind.xy;
+        a.xz += a.y * slope; b.xz += b.y * slope; c.xz += c.y * slope;
+        world = base + output.backInCells.x * a + output.backInCells.y * b + output.backInCells.z * c;
+        float3 delta = eye - base;
+        orientedEye = float3(dot(delta,cross(b,c)),dot(delta,cross(c,a)),dot(delta,cross(a,b))) / dot(a,cross(b,c));
+    }
     output.position = mul(float4(world, 1), viewProjection);
     output.worldAndViewDepth = float4(world, output.position.w);
     // Keep an exit face at the far plane if the last part of a brick extends beyond it.
@@ -94,6 +122,7 @@ Pixel VSMain(uint vertex : SV_VertexID, uint instance : SV_InstanceID)
     float3 assetEye = eye;
     assetEye.xz = rotateXZ(assetEye.xz - placement.xy, -placement.z);
     output.eyeInCells = (mul(float4(assetEye / placement.w, 1), assetToMesh).xyz - lower) / cellSize;
+    if (orientedBricks) output.eyeInCells = orientedEye;
     output.mask = brick.mask;
     output.brickIndex = instance % brickCount;
     output.yawAndScale = placement.zw;
@@ -175,14 +204,18 @@ float ShadowPS(Pixel input) : SV_Depth
     return saturate(backDepth + (0.5 * (hit + hitExit)) * depthPerCell);
 }
 
-float leafDiffuse(uint packedNormal, float yaw, float3 toEye)
+float3 leafNormal(uint packedNormal, float yaw, float3 toEye)
 {
     const float2 xy = float2(packedNormal & 4095, (packedNormal >> 12) & 4095) * (2.0 / 4095.0) - 1.0;
     float3 axis = float3(xy, 1.0 - abs(xy.x) - abs(xy.y));
     if (axis.z < 0) axis.xy = (1.0 - abs(xy.yx)) * (2.0 * float2(xy >= 0) - 1.0);
     axis = normalize(mul(axis, transpose((float3x3)assetToMesh)));
     axis.xz = rotateXZ(axis.xz, yaw);
-    if (dot(axis, toEye) < 0) axis = -axis;
+    return dot(axis, toEye) < 0 ? -axis : axis;
+}
+
+float leafDiffuse(float3 axis)
+{
     const float facing = dot(axis, toSun);
     return saturate(facing) + transmission * saturate(-facing);
 }
@@ -196,10 +229,9 @@ uint cellAttributeAddress(Pixel input, uint bit)
     return brickCount * 4 + cell * 16;
 }
 
-float weightedDiffuse(uint address, float yaw, float3 toEye, float3 localToEye)
+float leafWeight(uint address, uint packedNormal, float3 localToEye)
 {
-    const uint2 packed = cellNormals.Load2(address);
-    float weight = (packed.x >> 24) * (1.0 / 255.0);
+    float weight = (packedNormal >> 24) * (1.0 / 255.0);
     [branch]
     if (useNormals == 2)
     {
@@ -211,7 +243,7 @@ float weightedDiffuse(uint address, float yaw, float3 toEye, float3 localToEye)
         const float3 blend = abs(localToEye);
         weight = dot(values, blend) / (255.0 * (blend.x + blend.y + blend.z));
     }
-    return lerp(leafDiffuse(packed.y, yaw, toEye), leafDiffuse(packed.x, yaw, toEye), weight);
+    return weight;
 }
 
 float3 leafShadowReceiver(Pixel input, uint bit, uint address, float3 entryInCells, float3 worldEntry)
@@ -250,7 +282,7 @@ Output PSMain(Pixel input)
     if (!firstOccupied(input.backInCells, path / lengthToBack,
                        (nearPlane / backViewDepth - 1) * lengthToBack,
                        min(0, (farPlane / backViewDepth - 1) * lengthToBack), input.mask, hit, hitExit, hitBit)) discard;
-    const float offset = hit / lengthToBack;
+    const float offset = (orientedBricks ? 0.5 * (hit + hitExit) : hit) / lengthToBack;
     const float viewDepth = clamp(backViewDepth * (1 + offset), nearPlane, farPlane);
     Output output;
     output.depth = saturate(projectionZScale + projectionZOffset / viewDepth);
@@ -259,9 +291,14 @@ Output PSMain(Pixel input)
         output.color = viewMode == 6 ? 0 : float4(1, 0.56, 0.18, 1);
         return output;
     }
-    if (viewMode == 2)
+    if (viewMode == 8 || viewMode == 9)
     {
-        const uint value = uint(round(saturate(viewDepth / farPlane) * 16777215.0));
+        output.color = viewMode == 8 ? float4(0,1,0,1) : float4(1,0,0,1);
+        return output;
+    }
+    if (viewMode == 2 || viewMode == 10)
+    {
+        const uint value = uint(round(saturate(viewDepth / (viewMode == 10 ? 1000.0 : farPlane)) * 16777215.0));
         output.color = float4(float3(value & 255, (value >> 8) & 255, (value >> 16) & 255) / 255.0, 0.25);
         return output;
     }
@@ -283,15 +320,50 @@ Output PSMain(Pixel input)
     [branch]
     if (useNormals || useBakedReceiver) address = cellAttributeAddress(input, hitBit);
     float diffuse = 0.6; // Shared preview lighting for occupancy-only bakes.
+    // Occupancy-only bakes use the SH mean because they lack a surface normal.
+    float3 ambient = directionalSkylight ? skyIrradiance[0].rgb : 0.35;
+    LeafIncidentLight leafLight = (LeafIncidentLight)0;
     [branch]
-    if (useNormals) diffuse = weightedDiffuse(address, input.yawAndScale.x, eye - worldHit, -path);
+    if (useNormals)
+    {
+        const uint2 packed = cellNormals.Load2(address);
+        const float weight = leafWeight(address, packed.x, -path);
+        const float3 a = leafNormal(packed.x, input.yawAndScale.x, eye - worldHit);
+        const float3 b = leafNormal(packed.y, input.yawAndScale.x, eye - worldHit);
+        diffuse = lerp(leafDiffuse(b), leafDiffuse(a), weight);
+        if (thinLeaf)
+        {
+            LeafIncidentLight lightA = leafIncidentLight(a, dot(a, toSun), directionalSkylight);
+            LeafIncidentLight lightB = leafIncidentLight(b, dot(b, toSun), directionalSkylight);
+            localDiffuse(worldHit, a, probeOriginSpacing, probeSize.xyz, true, lightA.skyFront, lightA.skyBack);
+            localDiffuse(worldHit, b, probeOriginSpacing, probeSize.xyz, true, lightB.skyFront, lightB.skyBack);
+            leafLight.skyFront = lerp(lightB.skyFront, lightA.skyFront, weight);
+            leafLight.skyBack = lerp(lightB.skyBack, lightA.skyBack, weight);
+            leafLight.sunCosines = lerp(lightB.sunCosines, lightA.sunCosines, weight);
+        }
+        else if (directionalSkylight)
+        {
+            float3 aSky = evaluateSkylight(a), bSky = evaluateSkylight(b);
+            float3 unused = 0;
+            localDiffuse(worldHit, a, probeOriginSpacing, probeSize.xyz, false, aSky, unused);
+            localDiffuse(worldHit, b, probeOriginSpacing, probeSize.xyz, false, bSky, unused);
+            ambient = lerp(bSky, aSky, weight);
+        }
+    }
+    else
+    {
+        // With no baked normal, average the six directional corrections.
+        float3 opposite = ambient;
+        localDiffuse(worldHit, 0.57735027.xxx, probeOriginSpacing, probeSize.xyz, true, ambient, opposite);
+        ambient = 0.5 * (ambient + opposite);
+    }
     if (viewMode == 4)
     {
         output.color = float4(diffuse.xxx, 1);
         return output;
     }
     float visibility = 1;
-    if (receivesShadows)
+    if (receivesShadows && lightingMode != skyOnly)
     {
         float3 receiver = worldHit;
         [branch]
@@ -310,7 +382,24 @@ Output PSMain(Pixel input)
         output.color = float4(visibility.xxx, 1);
         return output;
     }
-    float3 lit = saturate(baseColor * (0.35 + 0.65 * diffuse * visibility));
-    output.color = float4(displayColor(lit), 1);
+    if (lightingMode == shadowVisibility)
+    {
+        output.color = float4(visibility.xxx, 1);
+        return output;
+    }
+    if (thinLeaf)
+    {
+        output.color = float4(shadeLeaf(leafLight, visibility, lightingMode, baseColor, transmissionColor, transmission), 1);
+        return output;
+    }
+    if (lightingMode == transmissionOnly)
+    {
+        output.color = float4(0, 0, 0, 1);
+        return output;
+    }
+    if (lightingMode == sunOnly) ambient = 0;
+    const float direct = lightingMode == skyOnly ? 0.0 : 0.65 * diffuse * visibility;
+    float3 lit = baseColor * (ambient + direct);
+    output.color = float4(encodedCamera ? displayColor(saturate(lit)) : lit, 1);
     return output;
 }

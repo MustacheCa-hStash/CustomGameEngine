@@ -533,6 +533,8 @@ int runBranchLightingDiagnostics(ViewerScene& scene, D3D12Renderer& renderer, co
     if (directional && !scene.branchVoxelNormals[voxelIndex]->hasDirectionalWeights)
         throw std::runtime_error("Rebuild oak_branch_normals for view-dependent weights.");
     const bool hasReceivers = scene.branchVoxelNormals[voxelIndex]->hasShadowReceivers;
+    // This diagnostic reconstructs legacy shading from its scalar diffuse and visibility buffers.
+    scene.legacyAmbientForDiagnostics = true;
     scene.branchVoxelUseNormals = true;
     scene.branchVoxelDirectionalNormals = directional;
     scene.branchVoxelShadowReceiver = VoxelShadowReceiver::CellEntry;

@@ -1,0 +1,86 @@
+{
+  "boughs": [
+    7,
+    8
+  ],
+  "members_sha256": {
+    "7": "32e0062d26b6556c5062d70cd5b4d856cd44b79f0a8e546a66af6544fdc7e4a6",
+    "8": "619b192a4ba00fb7e75996cf30dfc6589b42fab0b7a809b37cb9702269a75d03"
+  },
+  "bounds": [
+    [
+      -0.5906275510787964,
+      -0.008750000037252903,
+      -0.1523737758398056
+    ],
+    [
+      0.5075970888137817,
+      0.8419616222381592,
+      0.2913481891155243
+    ]
+  ],
+  "tiers": [
+    [
+      27.2,
+      "mixed-part/100-56.mesh"
+    ],
+    [
+      42,
+      "epic-0.75/level08.mesh"
+    ],
+    [
+      62.0,
+      "mixed-part/41-10.mesh"
+    ],
+    [
+      71.0,
+      "mixed-part/41-32.mesh"
+    ],
+    [
+      81,
+      "epic-0.8/level07-paired.mesh"
+    ],
+    [
+      95,
+      "spray.mesh"
+    ]
+  ],
+  "templates": {
+    "mixed-part/100-56.mesh": {
+      "leaf": "epic-0.5/level04.mesh",
+      "wood": "epic-0.6/level06.mesh",
+      "geometry_sha256": "c4a1810b369a3d5db16f184126b956d0d8e34a08eacf9eaa37c5812dde7bc1f6",
+      "materials_sha256": "027cb67c91cfdec0b40b9615ff986f9464630aefbecfc3d60741d43ee9f7c958"
+    },
+    "epic-0.75/level08.mesh": {
+      "leaf": "epic-0.75/level08.mesh",
+      "wood": "epic-0.75/level08.mesh",
+      "geometry_sha256": "97820bb153591d2dc522839a2d002d32ddc5cd6ade2fa7f73b4bb1a4a4f4655b",
+      "materials_sha256": "059eba8e83bd737e4e62f64cadf6dc87cdb55ea5bc8651a46b87270b4032905a"
+    },
+    "mixed-part/41-10.mesh": {
+      "leaf": "epic-0.38/level02.mesh",
+      "wood": "epic-0.6/level04-paired.mesh",
+      "geometry_sha256": "ef605365e60d7f92eafcc7051e5c1865a11ec6d11b0bcc685f65bbe5ec281e29",
+      "materials_sha256": "4efdc25c9f47db3b99d4c9d356516df6c36e545bf3f3df700315a6d691a1a5db"
+    },
+    "mixed-part/41-32.mesh": {
+      "leaf": "epic-0.8/level07-paired.mesh",
+      "wood": "epic-0.6/level04-paired.mesh",
+      "geometry_sha256": "2cdbd7dc7702591aea7cfb0ffd92c97693c768dbdaf38a2171c007c1c1ae419a",
+      "materials_sha256": "3091b37c3d84dfb2fc5df8f8bc97f13461daa2bb8b09018ec003a77d9f225c0d"
+    },
+    "epic-0.8/level07-paired.mesh": {
+      "leaf": "epic-0.8/level07-paired.mesh",
+      "wood": "epic-0.8/level07-paired.mesh",
+      "geometry_sha256": "e80dec68c6902fc73d659af8bb2e61b64e31dbe18ea9e7865db9a60e69f8b501",
+      "materials_sha256": "b9f16cb3f810ff1292e2f90a3e58768312b04b508d70d04787084964121c3163"
+    },
+    "spray.mesh": {
+      "leaf": "spray.mesh",
+      "wood": "spray.mesh",
+      "geometry_sha256": "f2800513b6eea8d51dce1e226a776ae36f70fe8c6c925ebf9b08eea3984847ba",
+      "materials_sha256": "c0d9860bede2b7102814ef01031691ece0d64a5a7c4feaf23b22b1e88657eae1"
+    }
+  }
+}

@@ -1,6 +1,6 @@
 # Custom Game Engine
 
-The viewer loads a Blender-exported mesh and draws it on a plane through Direct3D 12. Left-drag to orbit, scroll to zoom, and press `R` to reset the camera. Press `M` to compare 4× MSAA with single-sample rendering. On the oak, press `P` to pause or resume the wind. The title bar shows both states. The viewer starts at 4× when the GPU supports it.
+The viewer loads a Blender-exported mesh and draws it on a plane through Direct3D 12. Left-drag to orbit, middle-drag to pan the orbit focus, scroll to zoom, and press `R` to reset the camera. You can move to within 0.02 scene units of the focus or enter a distance in the inspector. Viewport camera input pauses a playing route for manual inspection. Press `M` to compare 4× MSAA with single-sample rendering. On the oak, press `P` to pause or resume the wind. The title bar shows both states. The viewer starts at 4× when the GPU supports it.
 
 ## Build and run
 
@@ -20,9 +20,40 @@ Launch the viewer:
 
 The Scene Inspector opens on the left. Use its **Scene** menu to switch between Cube, Oak, and Grove. Press `F1` to hide or reopen the panel. The top-right performance readout stays visible.
 
+The viewer and scene captures use `assets/MeadowDaySky.hdr`, a scene-linear daytime bake of the **Meadow Day** sky from FirstSettlers' **ForestVarietyPilot** scene. The camera draws the panorama behind scene geometry. Mesh and voxel shading evaluate its upper hemisphere through nine RGB spherical-harmonic coefficients, calibrated to the previous ambient luminance on upward-facing surfaces. The visible sun disk follows the directional light and is drawn separately from the panorama.
+
+**Probe lighting** in Scene controls enables the experimental world-space field. The field stores a six-direction diffuse correction to open sky and uses compact directional distance moments to weight neighboring probes. Compute shaders trace a coverage proxy of the source geometry and can add one diffuse bounce from the ground. Mesh and voxel foliage sample the same field. Each sweep updates probes near the camera frustum first. Wind-driven probe work waits for an eighth of a coverage voxel of displacement from the last refreshed pose or eight rendered frames. Ground and probe rays share the displaced volume, and routine ground updates spread across eight refreshes. A wind pause starts a full sweep at the held pose.
+
+### Windowless scene capture
+
+Run the same engine renderer from PowerShell to save a still or an image sequence. Capture mode uses D3D12 and does not create a viewer window. Use a new output path for each run.
+
+```powershell
+.\build\Debug\CustomGameEngine.exe --capture build\captures\cube.png --width 1280 --height 720 --msaa 4
+.\build\Debug\CustomGameEngine.exe --capture build\captures\oak-orbit --scene branch --camera close-up --frames 180 --fps 60 --orbit-degrees 18 --msaa 4
+.\build\Debug\CustomGameEngine.exe --capture build\captures\oak-wind --scene modeled-oak --frames 120 --fps 60 --animate-wind
+```
+
+- The default still is Cube at 3840 × 2160 and 1× MSAA. The viewer renders at 3840 × 2160 and fits its window to the desktop work area. The title bar shows the render size. `--scene` also accepts `oak`, `modeled-oak`, `oak-walk`, `grove`, `branch`, `branch-grid`, `branch-orbit`, `branch-transition`, `forked-oak`, or a GLB path. Camera presets are `overview`, `close-up`, `under-canopy`, and `distant`.
+- Use `--yaw-degrees`, `--pitch-degrees`, and `--distance` to override the preset pose. `--orbit-degrees` is the total yaw change. Use `--end-distance` and `--end-pitch-degrees` for the final distance and pitch of a frame sequence. Use `--lod auto`, `--lod source`, or a baked triangle level such as `--lod 6` for LOD comparisons.
+- Add `--geometry-mask` to capture the visible asset on black for screen coverage measurements. It colors the selected triangles blue and voxels amber and respects material cutouts.
+- Wind holds at `--wind-time` (zero seconds by default) and advances only with `--animate-wind`. Use `--wind-strength` to set the amplitude, or `--sun-azimuth`, `--sun-elevation`, `--backlighting`, and `--no-leaf-shadow-reception` for lighting comparisons. `--settings path.ini` applies a saved scene configuration before explicit overrides. Capture leaves the INI untouched.
+- Shaded frames use a linear RGBA16F camera target, linear MSAA resolve, and a shared SDR display pass. Set manual exposure with `--exposure-ev` (default 0 EV), and add `--linear-hdr scene.dds` to a shaded still capture to save the half-float scene alongside its PNG. The DDS stores the resolved scene values before exposure and tone mapping. Encoded diagnostic views retain their original values.
+- Use `--lighting sun-only`, `--lighting sky-only`, `--lighting transmission`, or `--lighting shadow-visibility` to inspect lighting components. `--sky-only` is an alias for `--lighting sky-only`. Sun-only and sky-only isolate the light on geometry. Transmission and shadow visibility use a black backdrop.
+- Use `--review-capture` with the same 4K still-capture options, omitting the output path, to open that pose and lighting in the interactive viewer. The review launch reads its settings from the command line and any explicit `--settings` file. Changes during the review stay in that session.
+- Use `--probe-gi off` (default), `--probe-gi sky`, or `--probe-gi bounce` for matched captures with open sky, canopy-filtered sky, or canopy-filtered sky plus one ground bounce. `--probe-walk new-directory` runs at 3840 × 2160 with 4× MSAA and 0 EV. It records the GPU adapter, the grove approach, convergence after a sun change and a wind pause, the branch mesh/voxel sweep, and matched Forked White Oak captures and timings with per-group, bough, and hierarchy cuts. Install the Forked White Oak geometry bakes and the branch eighth-meter coverage and normal bakes from the `oak_branch_normals` target.
+- Use `--probe-wind-voxels 0` to refresh on every moving frame or pass a threshold up to one coverage voxel. `--probe-wind-benchmark new-directory` tests 0, ⅛, ¼, and ½ voxel thresholds at 4K on the Forked White Oak with a fixed under-canopy camera and a crown orbit. It records GPU timings and matched linear frames against a fresh field. Append `--timings-only` to collect GPU timings without image readbacks.
+- A sequence includes `frame-000000.png` onward. The engine renders at the requested playback timestep regardless of how long each frame takes. `frames.csv` records frame time, camera pose, wind time, and MSAA after all images finish. Use a different output directory to retry an interrupted sequence.
+
+Use the lossless PNGs for pixel comparisons. To make a playback copy with FFmpeg, set its input frame rate to the capture rate:
+
+```powershell
+ffmpeg -framerate 60 -i build/captures/oak-orbit/frame-%06d.png -pix_fmt yuv420p build/captures/oak-orbit.mp4
+```
+
 ### Inspect a scene
 
-- **Scene controls** has camera presets, sun direction, wind, MSAA, and the grove tree count.
+- **Scene controls** has camera presets, sun direction, exposure, wind, MSAA, and the grove tree count.
 - **Outliner** lets you select the model, ground, or a particular tree placement in the grove. In **Object**, choose Bark or Foliage to open its **Mesh** details. Follow its assigned **Material**, then open the **Texture** preview to see the bound image and mip count.
 - **Material** changes apply live. Oak and Grove share their oak materials, so a foliage cutoff edit in Oak applies to every tree in Grove, including its shadow. The cutoff uses the existing texture mips, whose alpha coverage was built using the source material cutoff.
 
@@ -88,6 +119,32 @@ The top-right readout averages over roughly half a second:
 With default shadow settings, the grove submits all selected trees at LOD0 with two indexed instanced draws per pass, one for bark and one for foliage. The ground adds one camera draw. This is the baseline before LOD or visibility culling.
 
 Use a self-contained glTF 2.0 binary with uncompressed static triangle meshes, positions, and normals. The viewer applies scene-node transforms and fits larger assets using their world-space bounds. It reads each primitive's base-color factor and optional embedded PNG or JPEG, with UV set 0 or 1 and a fixed trilinear wrap sampler. It renders opaque and alpha-mask materials under a fixed sun. A missing or invalid file opens an error dialog showing its path.
+
+Open **Forked White Oak** from the Scene menu or start with `--forked-oak`. Its source GLB contains the PVE trunk and boughs and places the shared spray through `EXT_mesh_gpu_instancing`. The build bakes the spray's leaf and wood primitives once each and copies both sidecars alongside the GLB.
+
+In the inspector, **Spray LOD** selects **Automatic**, **LOD 3**, or **Source**, sets the camera error, and toggles frustum culling. Automatic uses **Geometry hierarchy** when its bake is available. It can select trunk LODs and replace a range of sprays with a baked parent mesh. Leaves and twig wood select independently. At the ends of the hierarchy, **Per-group leaf and twig LOD** selects cuts within individual sprays and batches placements that share a cut.
+
+The forked oak's leaf and wood `.fixedlod.txt` reports include direct comparisons for every pair of levels in their automatic ranges. The leaf table covers LOD 3–6 and the spray wood table covers LOD 0–5. Each row gives the maximum sampled surface error in each direction in mesh-local units. The leaf table also gives the symmetric open-rim error. Automatic selection uses the source-relative errors. For other bakes, pass `--transition-min-lod N` to `BakeFixedLod` to enable the table from level N through the coarsest baked level.
+
+Forked oak leaf LOD 4 targets 33 triangles per leaf through `BakeFixedLod --lod4-component-triangles N`. With `--lod4-refinement-error F`, the baker retries with more triangles when a simpler candidate exceeds the sampled surface or rim error limit from source. A leaf that needs its regular LOD 4 keeps that geometry. The forked spray bakes 1,504 triangles across all 45 leaves at LOD 4.
+
+Spray wood uses the optional `BakeFixedLod --shared-coarse-triangles N` recipe to produce LOD 5 from the original LOD 4. The `--shared-far-triangles N` option then reduces LOD 4 across the whole spray and checks its prior selection error. `--shared-far-uv-weight F` sets the UV weight for that step. The forked oak uses 950 triangles at wood LOD 4 and 422 at LOD 5. Both levels reuse the source vertex buffer. The inspector's **Rendering** panel reports how many placements selected the coarse wood, and capture CSVs give the full leaf and wood LOD counts for each pass.
+
+Use **Spray LOD → Color by → Group** to see stable spatial placement groups or **LOD level** to see the active cut. The leaves and twig wood of a spray share the same group color. Both views show active parent geometry in amber. For a windowless capture, pass `--spray-color group` or `--spray-color lod`.
+
+The [4K per-group benchmark](Documentation/OAK_LOCAL_GROUP_LOD_4K.md) compares the whole-spray and per-group cuts over the same five camera distances and includes a moving coverage check.
+
+The bough prototype replaces 371 linked sprays when its projected error fits the camera budget. Its bake starts from the fitted LOD 6 leaf meshes and consolidates eligible quads into one area-preserving triangle. It simplifies the combined spray wood and checks sampled distances in both directions. Its membership follows bough 7 of the PVE skeleton and is tied to the exported GLB. The shadow pass checks its own light frustum and uses a 0.75-texel budget. Choose **Scene controls → Distant** for the 100 m comparison. **Rendering** reports draw counts, GPU times, group tests, individual tests, and the number of sprays represented by the active bough proxy.
+
+Use `--bough-bake <file>` in a windowless Forked White Oak capture to compare a compatible alternative proxy. Add `--force-bough` with automatic LOD and bough traversal to hold the proxy active in the camera and shadow captures for a visual comparison. The automatic budget compares geometry error in render-target pixels and therefore depends on the actual render size.
+
+For a source comparison, capture with `--scene forked-oak --lod source --spray-culling off`. For matched automatic runs, use `--scene forked-oak --lod auto --spray-culling on` and pass `--spray-mode flat`, `--spray-mode grouped`, or `--spray-mode bough`. Pass `--spray-local-lod off` for the whole-spray control with the same traversal. Add `--timing-samples 51` to a Release still capture for a sibling `.timings.csv` with GPU timestamps and submitted triangle counts. Timed frames exclude PNG readback and follow two warm-up frames.
+
+In **Spray LOD → Tree submission**, **CPU direct** is the default. **CPU selection + indirect** batches the CPU's draw records. **GPU selection + indirect** traverses one tree part at a time. **GPU batched + indirect** queues spray ranges across the view and instances selected cuts across trees. Use `--spray-mode hierarchy --tree-submit direct|indirect|gpu|batched` in captures. The per-part GPU mode supports **Depth culling for twig wood** through `--tree-hzb on`. Use `--tree-count 16` with `--scene forked-oak` in captures and interactive review to place a stand at the same camera coordinates. Timings include camera and shadow counts and the separate GPU stages for batched mode. [GPU batching replay](Documentation/OAK_TREE_BATCH_4K.md)
+
+With **GPU batched + indirect**, enable **Camera cluster frustum culling** to test smaller ranges inside spray and bough cuts that cross the edge of the camera. The capture equivalent is `--tree-submit batched --tree-clusters on`. It uses the existing projected error budget and reports cluster test time and rejected bounds in the timing CSV. [4K cluster frustum replay](Documentation/OAK_CLUSTER_FRUSTUM_4K.md)
+
+**Two-pass camera occlusion** in the same menu uses the last frame's depth to defer likely-hidden leaf, twig, and trunk geometry. It retests every deferred range against the current frame. Use `--tree-submit batched --tree-occlusion on` for a capture with occlusion enabled. [4K occlusion replay](Documentation/OAK_TWO_PASS_OCCLUSION_4K.md)
 
 The build finds DXC in the selected Windows SDK and compiles the shaders. The shader bytecode is embedded in the executable. If you use a separate DXC installation, pass `-DDXC_EXECUTABLE=<path-to-dxc.exe>` at configure time. The GLB parser is [cgltf v1.15](https://github.com/jkuhlmann/cgltf/releases/tag/v1.15). The inspector uses [Dear ImGui v1.92.5](https://github.com/ocornut/imgui/releases/tag/v1.92.5) with its Win32 and D3D12 backends. Both dependencies are vendored with their license notices.
 

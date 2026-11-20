@@ -74,6 +74,7 @@ Scope scopeFor(const ViewerScene& scene)
     case SceneKind::OakBranchGrid: return {"scene.oak_branch_grid", "asset.oak_branch"};
     case SceneKind::OakBranchOrbit: return {"scene.oak_branch_orbit", "asset.oak_branch"};
     case SceneKind::OakBranchTransition: return {"scene.oak_branch_transition", "asset.oak_branch"};
+    case SceneKind::ForkedOak: return {"scene.forked_oak", "asset.forked_oak"};
     case SceneKind::Imported:
     {
         std::error_code error;
@@ -213,6 +214,7 @@ void ViewerSettings::apply(ViewerScene& scene) const
     const auto get = [&](std::string_view key) { return field(sections_, scope.scene, key); };
     scene.sunAzimuth = number(get("sun_azimuth"), scene.sunAzimuth, -180.0f, 180.0f);
     scene.sunElevation = number(get("sun_elevation"), scene.sunElevation, 25.0f, 85.0f);
+    scene.exposureEv = number(get("exposure_ev"), scene.exposureEv, ViewerScene::minExposureEv, ViewerScene::maxExposureEv);
     scene.windStrength = number(get("wind_strength"), scene.windStrength, 0.0f, maxWindStrength);
     scene.windPaused = boolean(get("wind_paused"), scene.windPaused);
     const auto count = number(get("tree_count"), scene.treeCount, groveCounts.front(), groveCounts.back());
@@ -250,6 +252,7 @@ void ViewerSettings::recordScene(const ViewerScene& scene)
     auto& fields = sections_[scope.scene];
     fields["sun_azimuth"] = formatNumber(scene.sunAzimuth);
     fields["sun_elevation"] = formatNumber(scene.sunElevation);
+    fields["exposure_ev"] = formatNumber(scene.exposureEv);
     fields["wind_strength"] = formatNumber(scene.windStrength);
     fields["wind_paused"] = scene.windPaused ? "true" : "false";
     if (scene.kind == SceneKind::Grove) fields["tree_count"] = formatNumber(scene.treeCount);
@@ -282,7 +285,7 @@ void ViewerSettings::reset()
 
 void ViewerSettings::scheduleSave()
 {
-    saveAt_ = std::chrono::steady_clock::now() + saveDelay;
+    if (!path_.empty()) saveAt_ = std::chrono::steady_clock::now() + saveDelay;
 }
 
 void ViewerSettings::saveIfDue()

@@ -3,6 +3,7 @@
 #include <DirectXMath.h>
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -20,6 +21,19 @@ struct Bounds
     DirectX::XMFLOAT3 halfExtent;
 };
 
+struct MeshInstance
+{
+    DirectX::XMFLOAT3 translation{0.0f, 0.0f, 0.0f};
+    DirectX::XMFLOAT4 rotation{0.0f, 0.0f, 0.0f, 1.0f};
+    DirectX::XMFLOAT3 scale{1.0f, 1.0f, 1.0f};
+
+    DirectX::XMMATRIX matrix() const
+    {
+        return DirectX::XMMatrixAffineTransformation(DirectX::XMLoadFloat3(&scale), DirectX::XMVectorZero(),
+                                                      DirectX::XMLoadFloat4(&rotation), DirectX::XMLoadFloat3(&translation));
+    }
+};
+
 struct MeshData
 {
     std::string name;
@@ -29,6 +43,20 @@ struct MeshData
     Bounds localBounds{};
     std::size_t material = 0;
     std::uint32_t uvMask = 0;
+    std::shared_ptr<const std::vector<MeshInstance>> instances;
+};
+
+struct TransmissionTexture
+{
+    std::size_t index;
+    std::uint32_t texcoord;
+};
+
+struct DiffuseTransmission
+{
+    DirectX::XMFLOAT3 color{1.0f, 1.0f, 1.0f};
+    std::optional<TransmissionTexture> colorTexture;
+    std::optional<TransmissionTexture> strengthTexture;
 };
 
 struct MaterialData
@@ -41,6 +69,7 @@ struct MaterialData
     float transmission = 0.0f;
     bool hasBacklighting = false;
     bool twoSidedTransmission = false;
+    std::optional<DiffuseTransmission> diffuseTransmission;
 };
 
 struct TextureMip

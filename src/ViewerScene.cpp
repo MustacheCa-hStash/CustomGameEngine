@@ -530,6 +530,7 @@ ViewerScene& ViewerScenes::open(SceneKind kind, const std::filesystem::path& imp
         }
         scene.sunAzimuth = 102.0f;
         scene.sunElevation = 49.0f;
+        scene.probeLighting = ProbeLightingMode::GroundBounce;
         scene.windStrength = 0.0f;
         scene.windPaused = true;
     }

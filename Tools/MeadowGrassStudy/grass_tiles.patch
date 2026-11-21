@@ -1,0 +1,268 @@
+--- a/src/D3D12Renderer.h
++++ b/src/D3D12Renderer.h
+@@ -88,6 +88,7 @@
+         PassStats camera;
+         PassStats shadow;
+         std::array<PassStats, sunCascadeSplits.size()> shadowCascades;
++        std::array<double, sunCascadeSplits.size()> cascadeGpuMs{};
+         double cpuBranchDrawListMilliseconds = 0;
+         std::optional<double> gpuProbeMilliseconds;
+         unsigned probesUpdated = 0;
+@@ -203,6 +204,13 @@
+ 
+     struct GpuMesh
+     {
++        struct GrassTile
++        {
++            Bounds bounds;
++            UINT first, count;
++        };
++        std::vector<GrassTile> grassTiles;
++        std::vector<Bounds> diagnosticTuftBounds;
+         ComPtr<ID3D12Resource> vertexBuffer;
+         ComPtr<ID3D12Resource> indexBuffer;
+         D3D12_VERTEX_BUFFER_VIEW vertices;
+@@ -633,6 +641,7 @@
+     DirectX::XMFLOAT4X4 sunRotation_;
+     DirectX::XMFLOAT2 cascadeCasterDepth_;
+     std::array<DirectX::XMFLOAT4X4, sunCascadeSplits.size()> cascadeViewProjections_;
++    DirectX::XMFLOAT2 receiverHeightRange_{};
+     std::array<float, sunCascadeSplits.size()> cascadeWorldUnitsPerTexel_{};
+     std::array<float, sunCascadeSplits.size()> cascadeDepthPerTexel_{};
+     DirectX::XMFLOAT3 toSun_;
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -37,6 +37,7 @@
+ #include <format>
+ #include <fstream>
+ #include <limits>
++#include <map>
+ #include <numeric>
+ #include <stdexcept>
+ #include <utility>
+@@ -275,7 +276,7 @@
+ 
+ enum FrameTimestamp : UINT
+ {
+-    FrameStart, ProbeEnd, ShadowStart, ShadowEnd, AssetStart, LiveCutEnd, AssetEnd, BoughBrickStart, BoughBrickEnd,
++    FrameStart, ProbeEnd, ShadowStart, NearShadowEnd, MiddleShadowEnd, ShadowEnd, AssetStart, LiveCutEnd, AssetEnd, BoughBrickStart, BoughBrickEnd,
+     TreeDepthStart, TreeDepthEnd, CameraEnd, FrameEnd, TimestampCount
+ };
+ static_assert(offsetof(FrameConstants, probes) == 480);
+@@ -1489,6 +1490,8 @@
+     {
+         includeLightPoint(XMLoadFloat3(&vertex.position));
+     }
++    receiverHeightRange_ = {scene.ground.localBounds.center.y - scene.ground.localBounds.halfExtent.y,
++                            scene.ground.localBounds.center.y + scene.ground.localBounds.halfExtent.y};
+     float casterMin = XMVectorGetZ(minimum);
+     float casterMax = XMVectorGetZ(maximum);
+     const BoundingBox casterBounds(branchCullBounds_.center, branchCullBounds_.halfExtent);
+@@ -1500,6 +1503,8 @@
+         maxInstanceScale = std::max(maxInstanceScale, instance.w);
+         const auto placement = object.placementMatrix();
+         BoundingBox lightBounds;
++        receiverHeightRange_.x = std::min(receiverHeightRange_.x, (center.y-half.y)*instance.w);
++        receiverHeightRange_.y = std::max(receiverHeightRange_.y, (center.y+half.y)*instance.w);
+         casterBounds.Transform(lightBounds, placement * rotation);
+         casterMin = std::min(casterMin, lightBounds.Center.z - lightBounds.Extents.z);
+         casterMax = std::max(casterMax, lightBounds.Center.z + lightBounds.Extents.z);
+@@ -2585,7 +2590,42 @@
+     if (mesh.instances)
+     {
+         const auto instanceBytes = static_cast<UINT>(mesh.instances->size() * sizeof(MeshInstance));
+-        gpu.meshInstances = uploadBuffer(mesh.instances->data(), instanceBytes);
++        const bool grass = mesh.name.starts_with("Full grass strip") || mesh.name.starts_with("Short grass");
++        if (grass && !GetEnvironmentVariableW(L"MEADOW_DISABLE_TILES", nullptr, 0))
++        {
++            constexpr float tileMetres = 2.0f;
++            std::map<std::pair<int,int>, std::vector<UINT>> bins;
++            const auto node = XMLoadFloat4x4(&mesh.localToWorld);
++            for (UINT i = 0; i < mesh.instances->size(); ++i)
++            {
++                const auto& tuft = (*mesh.instances)[i];
++                const auto root = XMVector3TransformCoord(XMLoadFloat3(&tuft.translation), node);
++                bins[{int(std::floor(XMVectorGetZ(root) / tileMetres)),
++                      int(std::floor(XMVectorGetX(root) / tileMetres))}].push_back(i);
++            }
++            const BoundingBox primitive(mesh.localBounds.center, mesh.localBounds.halfExtent);
++            std::vector<MeshInstance> ordered;
++            const bool checkTufts = GetEnvironmentVariableW(L"MEADOW_TEST_CAMERA_TUFTS", nullptr, 0) != 0;
++            ordered.reserve(mesh.instances->size());
++            for (const auto& [cell, ids] : bins)
++            {
++                const UINT first = static_cast<UINT>(ordered.size());
++                BoundingBox box;
++                for (UINT id : ids)
++                {
++                    const auto& tuft = (*mesh.instances)[id];
++                    BoundingBox bounds;
++                    primitive.Transform(bounds, tuft.matrix() * node);
++                    if (checkTufts) gpu.diagnosticTuftBounds.push_back({bounds.Center,bounds.Extents});
++                    if (ordered.size() == first) box = bounds;
++                    else BoundingBox::CreateMerged(box, box, bounds);
++                    ordered.push_back(tuft);
++                }
++                gpu.grassTiles.push_back({{box.Center, box.Extents}, first, static_cast<UINT>(ids.size())});
++            }
++            gpu.meshInstances = uploadBuffer(ordered.data(), instanceBytes);
++        }
++        else gpu.meshInstances = uploadBuffer(mesh.instances->data(), instanceBytes);
+         gpu.meshInstanceView = {gpu.meshInstances->GetGPUVirtualAddress(), instanceBytes, sizeof(MeshInstance)};
+         gpu.meshInstanceCount = static_cast<UINT>(mesh.instances->size());
+     }
+@@ -3349,6 +3389,7 @@
+     timestamp(ShadowStart);
+     std::array<PassStats, sunCascadeSplits.size()> shadowCascades{};
+     auto shadow = cascades ? drawCascadeShadowMaps(scene, shadowCascades) : drawShadowMap(scene);
++    if (!cascades) { timestamp(NearShadowEnd); timestamp(MiddleShadowEnd); }
+     timestamp(ShadowEnd);
+     commands_->SetPipelineState(mode.mesh.get(encodedCamera_));
+     commands_->SetGraphicsRootDescriptorTable(2, shadowTexture_);
+@@ -3611,6 +3652,9 @@
+         const auto pass = drawMeshes(scene, true, false, separateCasters ? &cascadeCasterDraws_[cascade] : nullptr,
+                                      cascade);
+         slices[cascade] = pass;
++        if (timestampQueries_ && cascade < 2)
++            commands_->EndQuery(timestampQueries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                cascade == 0 ? NearShadowEnd : MiddleShadowEnd);
+         total.draws += pass.draws;
+         total.foliageDraws += pass.foliageDraws;
+         total.foliageCalls += pass.foliageCalls;
+@@ -4149,6 +4193,89 @@
+                 instanceView_.BufferLocation + (placement + 1ULL) * sizeof(XMFLOAT4), sizeof(XMFLOAT4), 0};
+             commands_->IASetVertexBuffers(1, 1, &scenePlacement);
+             if (spray && leaves) stats.sprayPlacements += mesh.meshInstanceCount;
++            if (!mesh.grassTiles.empty())
++            {
++                const auto& object = scene.objects[placement];
++                const auto tilePlanes = windExpandedLocalPlanes(object.placementMatrix() * viewProjection,
++                    planes, object.placement.w, frameWind_);
++                // Validation control deliberately reproduces the wrong camera-only shadow list.
++                static const bool testCameraShadows = GetEnvironmentVariableW(L"MEADOW_TEST_CAMERA_SHADOWS", nullptr, 0) != 0;
++                static const bool frustumOnly = GetEnvironmentVariableW(L"MEADOW_FRUSTUM_ONLY", nullptr, 0) != 0;
++                static const bool keepAll = GetEnvironmentVariableW(L"MEADOW_TEST_KEEP_ALL_TILES", nullptr, 0) != 0;
++                const auto cameraClip = view * XMLoadFloat4x4(&projection_);
++                const auto cameraPlanes = windExpandedLocalPlanes(object.placementMatrix() * cameraClip,
++                    frustumPlanes(cameraClip), object.placement.w, frameWind_);
++                auto receiverPlanes = frustumPlanes(cameraClip);
++                const bool checkReceivers = shadowPass && shadowSlice && !frustumOnly && toSun_.y > 0.001f;
++                float guard = 0;
++                if (checkReceivers)
++                {
++                    const auto slice = *shadowSlice;
++                    float nearDepth = slice ? scene.shadowSplits[slice-1] : cameraNearPlane_;
++                    if (slice && scene.blendSunCascades) nearDepth -= scene.shadowBlendWidths[slice-1];
++                    const auto forward = -XMMatrixTranspose(view).r[2];
++                    receiverPlanes[4] = forward - XMVectorSet(0,0,0,nearDepth);
++                    receiverPlanes[5] = -forward + XMVectorSet(0,0,0,scene.shadowSplits[slice]);
++                    // Include the 7.5 cm filter disk, comparison taps and normal bias.
++                    guard = 0.075f + (3.0f + scene.shadowBias.normalTexels)*cascadeWorldUnitsPerTexel_[slice];
++                }
++                const auto canReachReceivers = [&](const Bounds& bounds) {
++                    const auto box = worldWindBounds(bounds, object, frameWind_);
++                    const auto half = XMLoadFloat3(&box.Extents) + XMVectorReplicate(guard);
++                    const auto center = XMVectorSetW(XMLoadFloat3(&box.Center),1);
++                    // Sweep along the light through every possible receiver height. Keeping
++                    // both ray directions is conservative even for biased depth comparisons.
++                    const float low = (receiverHeightRange_.x - guard - XMVectorGetY(center+half))/toSun_.y;
++                    const float high = (receiverHeightRange_.y + guard - XMVectorGetY(center-half))/toSun_.y;
++                    for (const auto plane : receiverPlanes)
++                    {
++                        const float along = XMVectorGetX(XMVector3Dot(plane,XMLoadFloat3(&toSun_)));
++                        const float reach = std::max(low*along,high*along);
++                        const float radius = XMVectorGetX(XMVector3Dot(XMVectorAbs(plane),half));
++                        const float distance = XMVectorGetX(XMVector4Dot(plane,center));
++                        const float error = 32*std::numeric_limits<float>::epsilon() *
++                            (1+radius+std::abs(reach)+XMVectorGetX(XMVector4Dot(XMVectorAbs(plane),XMVectorAbs(center))));
++                        if (distance + radius + reach < -error) return false;
++                    }
++                    return true;
++                };
++                bindMesh(mesh, material, scene.foliage, receive, nullptr, tint, 0, 0, 0, 0);
++                UINT first = 0, count = 0;
++                const auto flush = [&] {
++                    if (!count) return;
++                    commands_->DrawIndexedInstanced(mesh.indexCount, count, 0, 0, first);
++                    record(count, std::uint64_t(mesh.indexCount / 3) * count);
++                    count = 0;
++                };
++                for (const auto& tile : mesh.grassTiles)
++                {
++                    const BoundingBox box(tile.bounds.center, tile.bounds.halfExtent);
++                    if (!keepAll && (!intersectsFrustum(box, tilePlanes) ||
++                        (checkReceivers && !canReachReceivers(tile.bounds)) ||
++                        (testCameraShadows && shadowPass && !intersectsFrustum(box, cameraPlanes))))
++                    {
++                        flush();
++                        continue;
++                    }
++                    if (shadowPass && !mesh.diagnosticTuftBounds.empty())
++                    {
++                        for (UINT i = tile.first; i < tile.first + tile.count; ++i)
++                        {
++                            const auto& b = mesh.diagnosticTuftBounds[i];
++                            if (!intersectsFrustum(BoundingBox(b.center,b.halfExtent),cameraPlanes)) { flush(); continue; }
++                            if (!count) first = i;
++                            ++count;
++                        }
++                    }
++                    else
++                    {
++                        if (!count) first = tile.first;
++                        count += tile.count;
++                    }
++                }
++                flush();
++                continue;
++            }
+             if (treePart && scene.treeSubmission == TreeSubmission::GpuPerPart && treePart->gpuNodes &&
+                 (shadowPass || !scene.cullSprayWoodBackfaces))
+             {
+@@ -4576,6 +4703,14 @@
+         if (materialCull || (live && scene.liveCutGpu))
+             commands_->SetPipelineState((materialCull && i == scene.sprayLods[1]->meshIndex ? cameraMode.oneSidedMesh : cameraMode.mesh).get(encodedCamera_));
+         if (shadowPass && !flags.cast) continue;
++        // Camera and shadow ablations are separate so an invisible oak's shadow can be measured.
++        static const bool omitOakCamera = GetEnvironmentVariableW(L"MEADOW_TEST_NO_OAK_CAMERA", nullptr, 0) != 0;
++        static const bool omitOakShadow = GetEnvironmentVariableW(L"MEADOW_TEST_NO_OAK_SHADOW", nullptr, 0) != 0;
++        if (shadowPass ? omitOakShadow : omitOakCamera)
++        {
++            const auto& name = scene.asset->meshes[i].name;
++            if (name.starts_with("Trunk and boughs") || name.starts_with("White oak ")) continue;
++        }
+         if (batchedTrees && treeParts_[i].bake) continue;
+ 
+         const auto& mesh = meshes_[i];
+@@ -4925,6 +5060,9 @@
+     timing.gpuMilliseconds = elapsed(FrameStart, FrameEnd);
+     timing.gpuProbeMilliseconds = elapsed(FrameStart, ProbeEnd);
+     timing.gpuShadowMilliseconds = elapsed(ShadowStart, ShadowEnd);
++    if (std::ranges::any_of(timing.shadowCascades, [](const auto& slice) { return slice.draws != 0; }))
++        timing.cascadeGpuMs = {elapsed(ShadowStart,NearShadowEnd), elapsed(NearShadowEnd,MiddleShadowEnd),
++                               elapsed(MiddleShadowEnd,ShadowEnd)};
+     timing.gpuCameraMilliseconds = elapsed(ShadowEnd, CameraEnd);
+     timing.gpuAssetMilliseconds = elapsed(AssetStart, AssetEnd);
+     if (timing.camera.voxelBricks && !boughVoxelPath_.empty())
+--- a/src/SceneCapture.cpp
++++ b/src/SceneCapture.cpp
+@@ -807,6 +807,8 @@
+                 "camera_spray_group_tests,shadow_spray_group_tests,camera_spray_tests,shadow_spray_tests,"
+                 "camera_bough_triangles,shadow_bough_triangles,camera_bough_sprays,shadow_bough_sprays,"
+                 "camera_coarse_wood_sprays,shadow_coarse_wood_sprays,camera_voxel_bricks,shadow_voxel_bricks,scene_far_m,camera_selection_cpu_ms,camera_mesh_vs_invocations,camera_mesh_ps_invocations,fenced_frame_ms,gpu_asset_ms,gpu_live_cut_ms" + lodColumns;
++            csv.pop_back();
++            csv += ",cascade0_triangles,cascade1_triangles,cascade2_triangles,cascade0_gpu_ms,cascade1_gpu_ms,cascade2_gpu_ms\n";
+             for (UINT sample = 0; sample < options.timingSamples; ++sample)
+             {
+                 const auto frameStart = std::chrono::steady_clock::now();
+@@ -832,6 +834,10 @@
+                                    t.camera.vertexInvocations,t.camera.pixelInvocations);
+                 csv += std::format(",{:.6f},{:.6f},{:.6f}", fencedMs, *t.gpuAssetMilliseconds, *t.gpuLiveCutMilliseconds);
+                 appendSprayLodCounts(csv, t);
++                csv.pop_back();
++                for (const auto& slice : t.shadowCascades) csv += std::format(",{}", slice.triangles);
++                for (double ms : t.cascadeGpuMs) csv += std::format(",{:.6f}", ms);
++                csv += '\n';
+             }
+             writeNewFile(timingPath, std::as_bytes(std::span(csv)));
+         }

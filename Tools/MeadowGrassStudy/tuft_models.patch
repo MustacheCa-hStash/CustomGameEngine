@@ -1,0 +1,206 @@
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -2922,7 +2922,7 @@
+     {
+         const auto instanceBytes = static_cast<UINT>(mesh.instances->size() * sizeof(MeshInstance));
+         gpu.tuftCard = mesh.name.starts_with("Meadow tuft card");
+-        const bool grass = tall || shortGrass || gpu.tuftCard;
++        const bool grass = tall || shortGrass || gpu.tuftCard || mesh.name.starts_with("Near tuft |");
+         if (grass && !GetEnvironmentVariableW(L"MEADOW_DISABLE_TILES", nullptr, 0))
+         {
+             constexpr float tileMetres = 2.0f;
+@@ -4657,7 +4657,8 @@
+                 const auto eye=XMMatrixInverse(nullptr,view).r[3];
+                 const auto localEye=XMVector3TransformCoord(eye,XMMatrixInverse(nullptr,object.placementMatrix()));
+                 static const bool alphaCards=GetEnvironmentVariableW(L"MEADOW_ALPHA_CARDS",nullptr,0)!=0;
+-                const bool selectCards=alphaCards && !shadowPass;
++                static const bool cardsToRoot=GetEnvironmentVariableW(L"MEADOW_CARDS_TO_ROOT",nullptr,0)!=0;
++                const bool selectCards=alphaCards && !shadowPass && !cardsToRoot;
+                 const float placementScale=std::abs(object.placement.w);
+                 UINT first = 0, count = 0, firstIndex=0;
+                 const auto flush = [&] {
+@@ -5195,6 +5196,16 @@
+             commands_->SetPipelineState((materialCull && i == scene.sprayLods[1]->meshIndex ? cameraMode.oneSidedMesh : cameraMode.mesh).get(encodedCamera_));
+         if (shadowPass && !flags.cast) continue;
+         static const bool drawCards=GetEnvironmentVariableW(L"MEADOW_ALPHA_CARDS",nullptr,0)!=0;
++        const auto& tuftName=scene.asset->meshes[i].name;
++        static const bool slices=GetEnvironmentVariableW(L"MEADOW_TUFT_SLICES",nullptr,0)!=0;
++        static const bool pilot=GetEnvironmentVariableW(L"MEADOW_TUFT_PILOT",nullptr,0)!=0;
++        static const bool ribbons=GetEnvironmentVariableW(L"MEADOW_TUFT_RIBBONS",nullptr,0)!=0;
++        static const bool cardsToRoot=GetEnvironmentVariableW(L"MEADOW_CARDS_TO_ROOT",nullptr,0)!=0;
++        const bool nearProxy=tuftName.starts_with("Near tuft |");
++        if (nearProxy && (shadowPass || !(slices && tuftName.starts_with("Near tuft | slices") ||
++            pilot && tuftName.starts_with("Near tuft | pilot") || ribbons && tuftName.starts_with("Near tuft | ribbons")))) continue;
++        if (!shadowPass && (slices || pilot || ribbons || cardsToRoot) &&
++            (tuftName.starts_with("Full grass strip") || tuftName.starts_with("Short grass"))) continue;
+         if (meshes_[i].tuftCard && (shadowPass || !drawCards)) continue;
+         static const bool contactGrass=GetEnvironmentVariableW(L"MEADOW_CONTACT_GRASS_ONLY",nullptr,0)!=0;
+         static const bool nearGrass=GetEnvironmentVariableW(L"MEADOW_NEAR_GRASS_ONLY",nullptr,0)!=0;
+@@ -5220,7 +5231,7 @@
+         {
+             const auto& name = scene.asset->meshes[i].name;
+             if (name.starts_with("Full grass strip") || (hideGrass && name.starts_with("Short grass")) ||
+-                (meshes_[i].tuftCard && (hideGrass || name.find("Full grass strip")!=std::string::npos))) continue;
++                ((meshes_[i].tuftCard || nearProxy) && (hideGrass || name.find("Full grass strip")!=std::string::npos))) continue;
+         }
+         // Camera and shadow ablations are separate so an invisible oak's shadow can be measured.
+         static const bool omitOakCamera = GetEnvironmentVariableW(L"MEADOW_TEST_NO_OAK_CAMERA", nullptr, 0) != 0;
+@@ -5258,10 +5269,10 @@
+         }
+         if (mesh.meshInstanceCount)
+         {
+-            if (mesh.tuftCard && msaaEnabled_)
++            if ((mesh.tuftCard || (nearProxy && material.alphaCutoff >= 0)) && msaaEnabled_)
+                 commands_->SetPipelineState(cameraMode.coverageMesh.get(encodedCamera_));
+             drawInstancedMesh(scene, i, visibility, shadowPass, shadowSlice, stats);
+-            if (mesh.tuftCard && msaaEnabled_)
++            if ((mesh.tuftCard || (nearProxy && material.alphaCutoff >= 0)) && msaaEnabled_)
+                 commands_->SetPipelineState(cameraMode.mesh.get(encodedCamera_));
+             commands_->IASetVertexBuffers(1, 1, &instanceView_);
+             continue;
+@@ -5517,10 +5528,13 @@
+     if (study && material.name == "M_Oak_Twig") constants.transmissionFlags |= 64u;
+     static const bool bladeSurface = !GetEnvironmentVariableW(L"MEADOW_MATERIAL_CONTROL", nullptr, 0);
+     std::optional<std::size_t> bladeNormal;
+-    if (mesh.tuftCard && material.bladeNormal)
++    if (!mesh.grassTiles.empty()) constants.transmissionFlags |= 131072u; // Four-tap grass shadow receiver.
++    const bool slices=material.name.starts_with("Tuft slices");
++    if (msaaEnabled_ && material.name.starts_with("Tuft pilot")) constants.transmissionFlags |= 65536u;
++    if ((mesh.tuftCard || slices) && material.bladeNormal)
+     {
+         bladeNormal=material.bladeNormal->index;
+-        constants.transmissionFlags |= 32768u;
++        constants.transmissionFlags |= slices ? 262144u : 32768u;
+         if (msaaEnabled_) constants.transmissionFlags |= 65536u;
+     }
+     else if (bladeSurface && material.bladeNormal)
+--- a/src/ViewerScene.cpp
++++ b/src/ViewerScene.cpp
+@@ -97,7 +97,7 @@
+     };
+     for (const auto& mesh : meshes)
+     {
+-        if (mesh.name.starts_with("Meadow tuft card")) continue;
++        if (mesh.name.starts_with("Meadow tuft card") || mesh.name.starts_with("Near tuft |")) continue;
+         const auto world = XMLoadFloat4x4(&mesh.localToWorld);
+         if (mesh.instances)
+         {
+@@ -669,7 +669,7 @@
+             scene.asset->textures.push_back({"Thatch and living cover",loadColorTexture(cover,true),true});
+             if (!GetEnvironmentVariableW(L"MEADOW_BASE_COLOUR", nullptr, 0))
+                 for (auto& mat : scene.asset->materials)
+-                    if (mat.name.starts_with("Meadow tuft card") || ((mat.name == "Lamina | blade-green" || mat.name == "Lamina | blade-cool" ||
++                    if (mat.name.starts_with("Meadow tuft card") || mat.name.starts_with("Tuft slices") || ((mat.name == "Lamina | blade-green" || mat.name == "Lamina | blade-cool" ||
+                          mat.name == "Lamina | blade-olive") && mat.diffuseTransmission &&
+                         !mat.diffuseTransmission->strengthTexture))
+                         mat.meadowGrowth = scene.groundMaterial.meadowCover;
+--- a/src/ProbeLighting.cpp
++++ b/src/ProbeLighting.cpp
+@@ -152,7 +152,7 @@
+ 
+     for (const auto& mesh : scene.asset->meshes)
+     {
+-        if (mesh.name.starts_with("Meadow tuft card")) continue; // source tufts already feed the probes
++        if (mesh.name.starts_with("Meadow tuft card") || mesh.name.starts_with("Near tuft |")) continue; // source tufts already feed the probes
+         const auto& material = scene.asset->materials[mesh.material];
+         const bool foliage = material.hasBacklighting;
+         XMFLOAT3 color{material.color.x,material.color.y,material.color.z};
+--- a/src/GltfLoader.cpp
++++ b/src/GltfLoader.cpp
+@@ -217,7 +217,7 @@
+         return material;
+     }
+     const auto& pbr = source.pbr_metallic_roughness;
+-    if ((material.name.starts_with("Lamina |") || material.name.starts_with("Meadow tuft card")) && source.normal_texture.texture)
++    if ((material.name.starts_with("Lamina |") || material.name.starts_with("Meadow tuft card") || material.name.starts_with("Tuft slices")) && source.normal_texture.texture)
+     {
+         material.bladeNormal = readMaterialTexture(source.normal_texture, asset, "Blade normal", -1.0f, true);
+         material.normalScale = source.normal_texture.scale;
+@@ -231,7 +231,7 @@
+     }
+     const float coverageCutoff = material.color.w > 0.0f ? material.alphaCutoff / material.color.w : -1.0f;
+     const auto texture = readMaterialTexture(view, asset, "Base color", coverageCutoff, false,
+-                                              !material.name.starts_with("Meadow tuft card"));
++                                              !material.name.starts_with("Meadow tuft card") && !material.name.starts_with("Tuft "));
+     material.colorTexture = texture.index;
+     material.textureCoordinateSet = texture.texcoord;
+     return material;
+--- a/shaders/Mesh.hlsl
++++ b/shaders/Mesh.hlsl
+@@ -163,6 +163,9 @@
+         input.uv0=(float2(tile%4,tile/4)+input.uv0)*float2(.25,.5);
+         output.cardBlend=.5*smoothstep(.30,.50,abs(viewIndex-azimuth));
+         input.position.xz=rotateXZ(input.position.xz,angle);
++    }
++    if (transmissionFlags & (32768u | 262144u))
++    {
+         const float3 forward=rotateMeshInstance(float3(0,0,1),input.meshRotation);
+         tuftYaw=rotateXZ(forward.xz,input.instance.z);
+     }
+@@ -215,13 +218,13 @@
+     output.worldNormal.xz = rotateXZ(output.worldNormal.xz, input.instance.z);
+     // The normal's Y component changes under the horizontal shear.
+     output.worldNormal.y -= dot(bendSlope, output.worldNormal.xz);
+-    if (transmissionFlags & 32768u)
++    if (transmissionFlags & (32768u | 262144u))
+         output.worldNormal=float3(tuftYaw,input.meshScale.x/input.meshScale.y);
+     output.texcoords = float4(input.uv0, input.uv1);
+     output.lightPosition = mul(world, lightViewProjection);
+     output.worldPositionAndViewDepth = float4(world.xyz, output.position.w);
+     output.meshInstanceId = instanceId;
+-    if (transmissionFlags & 32768u)
++    if (transmissionFlags & (32768u | 65536u | 262144u))
+     {
+         uint key=asuint(input.meshTranslation.x)*0x9e3779b9u ^ asuint(input.meshTranslation.z);
+         key^=key>>16; key*=0x85ebca6bu; key^=key>>13;
+@@ -346,7 +349,7 @@
+     if (any(uv < 0.0) || any(uv > 1.0) || projected.z < 0.0 || projected.z > 1.0) return 1.0;
+     float3 location = float3(uv, cascade);
+     float reference = projected.z - cascadeShadowBias[cascade];
+-    if (meadowCascadeTexels.w && cascade < 2)
++    if (!(transmissionFlags & 131072u) && meadowCascadeTexels.w && cascade < 2)
+     {
+         uint width,height,layers;
+         cascadeShadowMaps.GetDimensions(width,height,layers);
+@@ -476,7 +479,7 @@
+     else applyCutout(baseColor.a);
+     float4 cardSurface=0;
+     float bladeCoverage=0;
+-    if (transmissionFlags & 32768u)
++    if (transmissionFlags & (32768u | 262144u))
+     {
+         cardSurface=detailTexture.Sample(colorSampler,uv);
+         if (input.cardBlend>0)
+@@ -489,7 +492,7 @@
+     {
+         float growth = transmissionStrengthTexture.Sample(colorSampler, saturate((input.worldPositionAndViewDepth.xz + 48) / 80)).b;
+         growthTint = lerp(1.0, float3(1.62, 1.36, 0.82), growth);
+-        if (transmissionFlags & 32768u) growthTint=lerp(1.0,growthTint,bladeCoverage);
++        if (transmissionFlags & (32768u | 262144u)) growthTint=lerp(1.0,growthTint,bladeCoverage);
+         baseColor.rgb *= growthTint;
+     }
+     if (transmissionFlags & 1024u)
+@@ -542,12 +545,13 @@
+     float3 worldNormal = normalize(input.worldNormal);
+     // For thin double-sided leaves, evaluate lighting from the visible side.
+     // A mirrored node reverses winding relative to its transformed normal.
+-    if (transmissionFlags & 32768u)
++    if (transmissionFlags & (32768u | 262144u))
+     {
+         const float2 yaw=input.worldNormal.xy;
+         float3 n=cardSurface.rgb;
+         n.y*=input.worldNormal.z;
+         worldNormal=normalize(float3(n.x*yaw.y+n.z*yaw.x,n.y,-n.x*yaw.x+n.z*yaw.y)+float3(0,.001,0));
++        if ((transmissionFlags & 262144u) && bladeCoverage>.5 && dot(worldNormal,studyEye.xyz-input.worldPositionAndViewDepth.xyz)<0) worldNormal=-worldNormal;
+     }
+     else if (twoSidedNormalSign != 0)
+     {
+@@ -575,7 +579,7 @@
+         return float4(visibility.xxx, shadowView == 1 ? 0.25 : 0.75);
+     }
+     if (lightingMode == shadowVisibility) return float4(visibility.xxx, 1.0);
+-    if (transmissionFlags & 32768u)
++    if (transmissionFlags & (32768u | 262144u))
+     {
+         LeafIncidentLight light=leafIncidentLight(worldNormal,normalToSun,directionalSkylight);
+         localDiffuse(input.worldPositionAndViewDepth.xyz,worldNormal,probeOriginSpacing,probeSize.xyz,

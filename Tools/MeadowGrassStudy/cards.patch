@@ -1,0 +1,581 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -21,6 +21,7 @@
+ set(tree_batch_depth_cs "${CMAKE_CURRENT_BINARY_DIR}/TreeBatchDepthCS.h")
+ set(mesh_vs "${CMAKE_CURRENT_BINARY_DIR}/MeshVS.h")
+ set(mesh_ps "${CMAKE_CURRENT_BINARY_DIR}/MeshPS.h")
++set(grass_ps "${CMAKE_CURRENT_BINARY_DIR}/GrassCoveragePS.h")
+ set(oak_flat_ps "${CMAKE_CURRENT_BINARY_DIR}/OakFlatPS.h")
+ set(oak_early_ps "${CMAKE_CURRENT_BINARY_DIR}/OakEarlyPS.h")
+ set(oak_visibility_ps "${CMAKE_CURRENT_BINARY_DIR}/OakVisibilityPS.h")
+@@ -52,10 +53,11 @@
+ set(display_vs "${CMAKE_CURRENT_BINARY_DIR}/DisplayVS.h")
+ set(display_ps "${CMAKE_CURRENT_BINARY_DIR}/DisplayPS.h")
+ add_custom_command(
+-    OUTPUT "${mesh_vs}" "${mesh_ps}" "${shadow_vs}" "${shadow_ps}"
++    OUTPUT "${mesh_vs}" "${mesh_ps}" "${grass_ps}" "${shadow_vs}" "${shadow_ps}"
+            "${oak_flat_ps}" "${oak_early_ps}" "${oak_visibility_ps}" "${oak_visibility_vs}"
+     COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E VSMain -Fh "${mesh_vs}" -Vn meshVS "${mesh_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -Fh "${mesh_ps}" -Vn meshPS "${mesh_shader}"
++    COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSGrassCoverage -Fh "${grass_ps}" -Vn grassCoveragePS "${mesh_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSOakFlat -Fh "${oak_flat_ps}" -Vn oakFlatPS "${mesh_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -D OAK_PROFILE_EARLY_DEPTH=1 -Fh "${oak_early_ps}" -Vn oakEarlyPS "${mesh_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSOakVisibility -Fh "${oak_visibility_ps}" -Vn oakVisibilityPS "${mesh_shader}"
+@@ -180,6 +182,7 @@
+     src/VoxelFoliage.cpp
+     "${mesh_vs}"
+     "${mesh_ps}"
++    "${grass_ps}"
+     "${oak_flat_ps}"
+     "${oak_early_ps}"
+     "${oak_visibility_ps}"
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -1,5 +1,6 @@
+ #include "D3D12Renderer.h"
+ #include "MeshPS.h"
++#include "GrassCoveragePS.h"
+ #include "OakFlatPS.h"
+ #include "OakEarlyPS.h"
+ #include "OakVisibilityPS.h"
+@@ -2388,6 +2389,9 @@
+         description.SampleDesc = msaaSamples;
+         description.RasterizerState.MultisampleEnable = TRUE;
+         multisample = createCameraPipeline(description, "Create 4x MSAA mesh pipelines");
++        description.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;
++        description.PS={grassCoveragePS,sizeof(grassCoveragePS)};
++        multisample_.coverageMesh=createCameraPipeline(description,"Create grass sample-coverage pipelines");
+     }
+ 
+     // The frame loop fences each submission. Commit the whole set between frames.
+@@ -2721,6 +2725,30 @@
+     return indices;
+ }
+ 
++constexpr UINT oakChunkIndices=384*3;
++
++// Retain source order, including at equal depth. Coalesce consecutive visible
++// sprays or trunk index ranges into draws without changing the shadow list.
++template<class Draw>
++static void visibleOakRanges(const BoundingBox& envelope, const std::vector<BoundingBox>& boxes,
++                             const std::array<XMVECTOR,6>& planes, Draw draw)
++{
++    if (!intersectsFrustum(envelope,planes)) return;
++    const UINT size=static_cast<UINT>(boxes.size());
++    if (insideFrustum(envelope,planes)) { draw(0,size); return; }
++    UINT first=0,count=0;
++    for (UINT i=0;i<size;++i)
++    {
++        if (intersectsFrustum(boxes[i],planes))
++        {
++            if (!count) first=i;
++            ++count;
++        }
++        else if (count) { draw(first,count); count=0; }
++    }
++    if (count) draw(first,count);
++}
++
+ D3D12Renderer::GpuMesh D3D12Renderer::uploadMesh(const MeshData& mesh, const MaterialData* material)
+ {
+     GpuMesh gpu{};
+@@ -2735,6 +2763,41 @@
+     gpu.indices.Format = DXGI_FORMAT_R32_UINT;
+     gpu.indices.SizeInBytes = static_cast<UINT>(indexBytes);
+     gpu.indexCount = static_cast<UINT>(mesh.indices.size());
++    if ((mesh.name.starts_with("Trunk and boughs") || mesh.name.starts_with("White oak ")) &&
++        !GetEnvironmentVariableW(L"MEADOW_UNCULLED_OAK_CAMERA",nullptr,0))
++    {
++        const auto node=XMLoadFloat4x4(&mesh.localToWorld);
++        auto addBox=[&](BoundingBox box) {
++            // Outward pad covers matrix roundoff at the frustum boundary.
++            box.Extents.x+=.001f; box.Extents.y+=.001f; box.Extents.z+=.001f;
++            if (gpu.oakCameraBounds.empty()) gpu.oakCameraEnvelope=box;
++            else BoundingBox::CreateMerged(gpu.oakCameraEnvelope,gpu.oakCameraEnvelope,box);
++            gpu.oakCameraBounds.push_back(box);
++        };
++        if (mesh.instances)
++        {
++            const BoundingBox primitive(mesh.localBounds.center,mesh.localBounds.halfExtent);
++            for (const auto& instance:*mesh.instances)
++            {
++                BoundingBox box;
++                primitive.Transform(box,instance.matrix()*node);
++                addBox(box);
++            }
++        }
++        else for (UINT first=0;first<gpu.indexCount;first+=oakChunkIndices)
++        {
++            auto lo=XMVectorReplicate(FLT_MAX),hi=-lo;
++            const UINT end=std::min(first+oakChunkIndices,gpu.indexCount);
++            for (UINT j=first;j<end;++j)
++            {
++                const auto p=XMVector3TransformCoord(XMLoadFloat3(&mesh.vertices[mesh.indices[j]].position),node);
++                lo=XMVectorMin(lo,p); hi=XMVectorMax(hi,p);
++            }
++            BoundingBox box;
++            BoundingBox::CreateFromPoints(box,lo,hi);
++            addBox(box);
++        }
++    }
+     if (material && mesh.instances && mesh.name.starts_with("Full grass strip") &&
+         !GetEnvironmentVariableW(L"MEADOW_FULL_FAR_SHADOW",nullptr,0))
+     {
+@@ -2858,7 +2921,8 @@
+     if (mesh.instances)
+     {
+         const auto instanceBytes = static_cast<UINT>(mesh.instances->size() * sizeof(MeshInstance));
+-        const bool grass = mesh.name.starts_with("Full grass strip") || mesh.name.starts_with("Short grass");
++        gpu.tuftCard = mesh.name.starts_with("Meadow tuft card");
++        const bool grass = tall || shortGrass || gpu.tuftCard;
+         if (grass && !GetEnvironmentVariableW(L"MEADOW_DISABLE_TILES", nullptr, 0))
+         {
+             constexpr float tileMetres = 2.0f;
+@@ -2871,7 +2935,8 @@
+                 bins[{int(std::floor(XMVectorGetZ(root) / tileMetres)),
+                       int(std::floor(XMVectorGetX(root) / tileMetres))}].push_back(i);
+             }
+-            const BoundingBox primitive(mesh.localBounds.center, mesh.localBounds.halfExtent);
++            BoundingBox primitive(mesh.localBounds.center, mesh.localBounds.halfExtent);
++            if (gpu.tuftCard) primitive.Extents.z = primitive.Extents.x; // the card can rotate about Y
+             std::vector<MeshInstance> ordered;
+             std::vector<MeshInstance> ranked;
+             const bool stratified=GetEnvironmentVariableW(L"MEADOW_SPREAD_TUFTS",nullptr,0)!=0;
+@@ -2895,6 +2960,7 @@
+                     const auto& tuft = (*mesh.instances)[id];
+                     XMFLOAT3 root;
+                     XMStoreFloat3(&root,XMVector3TransformCoord(XMLoadFloat3(&tuft.translation),node));
++                    gpu.grassRootSwitch.push_back({root.x,root.z,4.0f+3.0f*tuftRank(tuft)});
+                     const BoundingBox rootPoint(root,{0,0,0});
+                     if (ordered.size()==first) roots=rootPoint;
+                     else BoundingBox::CreateMerged(roots,roots,rootPoint);
+@@ -4589,6 +4655,10 @@
+                 XMStoreFloat4x4(&placementMatrix, object.placementMatrix());
+                 const XMFLOAT2 wind{frameWind_.x*object.placement.w, frameWind_.y*object.placement.w};
+                 const auto eye=XMMatrixInverse(nullptr,view).r[3];
++                const auto localEye=XMVector3TransformCoord(eye,XMMatrixInverse(nullptr,object.placementMatrix()));
++                static const bool alphaCards=GetEnvironmentVariableW(L"MEADOW_ALPHA_CARDS",nullptr,0)!=0;
++                const bool selectCards=alphaCards && !shadowPass;
++                const float placementScale=std::abs(object.placement.w);
+                 UINT first = 0, count = 0, firstIndex=0;
+                 const auto flush = [&] {
+                     if (!count) return;
+@@ -4609,6 +4679,15 @@
+                         continue;
+                     }
+                     float t=0;
++                    bool splitCardTile=false;
++                    if (selectCards)
++                    {
++                        const float d=std::hypot(tile.rootCellCenter.x-XMVectorGetX(localEye),
++                                                 tile.rootCellCenter.y-XMVectorGetZ(localEye))*placementScale;
++                        const float radius=1.415f*placementScale;
++                        if ((mesh.tuftCard && d+radius<4) || (!mesh.tuftCard && d-radius>7)) { flush(); continue; }
++                        splitCardTile=d+radius>=4 && d-radius<=7;
++                    }
+                     if (sparse || patch)
+                     {
+                         const auto center=XMVector3TransformCoord(XMVectorSet(tile.rootCellCenter.x,0,tile.rootCellCenter.y,1),
+@@ -4647,7 +4726,19 @@
+                         }
+                     }
+                     static const bool farCheckOnly = GetEnvironmentVariableW(L"MEADOW_TEST_FAR_CAMERA_TUFTS",nullptr,0) != 0;
+-                    if (shadowPass && !mesh.diagnosticTuftBounds.empty() && (!farCheckOnly || farProxy))
++                    if (splitCardTile)
++                    {
++                        for (UINT i=tile.first;i<tile.first+tile.count;++i)
++                        {
++                            const auto root=mesh.grassRootSwitch[i];
++                            const float dx=root.x-XMVectorGetX(localEye), dz=root.y-XMVectorGetZ(localEye);
++                            const bool useCard=(dx*dx+dz*dz)*placementScale*placementScale>=root.z*root.z;
++                            if (useCard!=mesh.tuftCard) { flush(); continue; }
++                            if (!count) first=i;
++                            ++count;
++                        }
++                    }
++                    else if (shadowPass && !mesh.diagnosticTuftBounds.empty() && (!farCheckOnly || farProxy))
+                     {
+                         for (UINT i = tile.first; i < tile.first + tile.count; ++i)
+                         {
+@@ -4676,6 +4767,15 @@
+             if (!selectLod && !cull)
+             {
+                 const auto tags = groupTint && lod ? lod->sourceTagBuffer->GetGPUVirtualAddress() : 0;
++                if (!shadowPass && !mesh.oakCameraBounds.empty())
++                {
++                    const auto& object=scene.objects[placement];
++                    const auto local=windExpandedLocalPlanes(object.placementMatrix()*viewProjection,planes,object.placement.w,frameWind_);
++                    visibleOakRanges(mesh.oakCameraEnvelope,mesh.oakCameraBounds,local,[&](UINT first,UINT count) {
++                        record(count,drawMesh(mesh,material,scene.foliage,receive,count,first,nullptr,tint,0,0,{},tags));
++                    });
++                    continue;
++                }
+                 record(mesh.meshInstanceCount,
+                        drawMesh(mesh, material, scene.foliage, receive, mesh.meshInstanceCount, 0,
+                                 nullptr, tint, 0, 0, {}, tags));
+@@ -5094,6 +5194,8 @@
+         if (materialCull || (live && scene.liveCutGpu))
+             commands_->SetPipelineState((materialCull && i == scene.sprayLods[1]->meshIndex ? cameraMode.oneSidedMesh : cameraMode.mesh).get(encodedCamera_));
+         if (shadowPass && !flags.cast) continue;
++        static const bool drawCards=GetEnvironmentVariableW(L"MEADOW_ALPHA_CARDS",nullptr,0)!=0;
++        if (meshes_[i].tuftCard && (shadowPass || !drawCards)) continue;
+         static const bool contactGrass=GetEnvironmentVariableW(L"MEADOW_CONTACT_GRASS_ONLY",nullptr,0)!=0;
+         static const bool nearGrass=GetEnvironmentVariableW(L"MEADOW_NEAR_GRASS_ONLY",nullptr,0)!=0;
+         if (shadowPass && (contactGrass || (nearGrass && shadowSlice && *shadowSlice>0)))
+@@ -5117,7 +5219,8 @@
+         if (!shadowPass && (hideTall || hideGrass))
+         {
+             const auto& name = scene.asset->meshes[i].name;
+-            if (name.starts_with("Full grass strip") || (hideGrass && name.starts_with("Short grass"))) continue;
++            if (name.starts_with("Full grass strip") || (hideGrass && name.starts_with("Short grass")) ||
++                (meshes_[i].tuftCard && (hideGrass || name.find("Full grass strip")!=std::string::npos))) continue;
+         }
+         // Camera and shadow ablations are separate so an invisible oak's shadow can be measured.
+         static const bool omitOakCamera = GetEnvironmentVariableW(L"MEADOW_TEST_NO_OAK_CAMERA", nullptr, 0) != 0;
+@@ -5155,7 +5258,11 @@
+         }
+         if (mesh.meshInstanceCount)
+         {
++            if (mesh.tuftCard && msaaEnabled_)
++                commands_->SetPipelineState(cameraMode.coverageMesh.get(encodedCamera_));
+             drawInstancedMesh(scene, i, visibility, shadowPass, shadowSlice, stats);
++            if (mesh.tuftCard && msaaEnabled_)
++                commands_->SetPipelineState(cameraMode.mesh.get(encodedCamera_));
+             commands_->IASetVertexBuffers(1, 1, &instanceView_);
+             continue;
+         }
+@@ -5216,6 +5323,23 @@
+             }
+             for (const auto range : visibility.ranges)
+             {
++                if (!shadowPass && !mesh.oakCameraBounds.empty())
++                {
++                    const auto clip=XMLoadFloat4x4(&frameView_)*XMLoadFloat4x4(&projection_);
++                    const auto planes=frustumPlanes(clip);
++                    for (UINT id=range.first;id<range.first+range.count;++id)
++                    {
++                        const auto& object=scene.objects[id];
++                        const auto local=windExpandedLocalPlanes(object.placementMatrix()*clip,planes,object.placement.w,frameWind_);
++                        visibleOakRanges(mesh.oakCameraEnvelope,mesh.oakCameraBounds,local,[&](UINT first,UINT count) {
++                            const UINT start=first*oakChunkIndices;
++                            const UINT indices=std::min(count*oakChunkIndices,mesh.indexCount-start);
++                            record(drawMesh(mesh,material,scene.foliage,flags.receive,1,id+1,nullptr,
++                                            FixedLodTint::Shaded,0,0,{start,indices}));
++                        });
++                    }
++                    continue;
++                }
+                 record(drawMesh(mesh, material, scene.foliage, flags.receive, range.count, range.first + 1));
+             }
+             continue;
+@@ -5393,7 +5517,13 @@
+     if (study && material.name == "M_Oak_Twig") constants.transmissionFlags |= 64u;
+     static const bool bladeSurface = !GetEnvironmentVariableW(L"MEADOW_MATERIAL_CONTROL", nullptr, 0);
+     std::optional<std::size_t> bladeNormal;
+-    if (bladeSurface && material.bladeNormal)
++    if (mesh.tuftCard && material.bladeNormal)
++    {
++        bladeNormal=material.bladeNormal->index;
++        constants.transmissionFlags |= 32768u;
++        if (msaaEnabled_) constants.transmissionFlags |= 65536u;
++    }
++    else if (bladeSurface && material.bladeNormal)
+     {
+         bladeNormal = material.bladeNormal->index;
+         constants.transmissionFlags |= (material.bladeNormal->texcoord + 1u) << 7;
+--- a/src/D3D12Renderer.h
++++ b/src/D3D12Renderer.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <DirectXCollision.h>
+ 
+ #include "ShaderCompiler.h"
+ #include "ProbeLighting.h"
+@@ -212,6 +213,10 @@
+             Bounds rootBounds;
+         };
+         std::vector<GrassTile> grassTiles;
++        bool tuftCard = false;
++        std::vector<DirectX::XMFLOAT3> grassRootSwitch; // asset X, Z and switch distance in metres
++        std::vector<DirectX::BoundingBox> oakCameraBounds;
++        DirectX::BoundingBox oakCameraEnvelope;
+         ComPtr<ID3D12Resource> farGrassBuffer;
+         D3D12_INDEX_BUFFER_VIEW farGrassIndices{};
+         UINT farGrassCount = 0;
+@@ -442,6 +447,7 @@
+         D3D12_CPU_DESCRIPTOR_HANDLE depthTarget{};
+         CameraPipeline mesh;
+         CameraPipeline oneSidedMesh;
++        CameraPipeline coverageMesh;
+         CameraPipeline sky;
+         CameraPipeline voxel;
+     };
+--- a/src/GltfLoader.cpp
++++ b/src/GltfLoader.cpp
+@@ -169,7 +169,8 @@
+ }
+ 
+ TransmissionTexture readMaterialTexture(const cgltf_texture_view& view, AssetData& asset,
+-                                        std::string_view label, float coverageCutoff = -1.0f, bool linearData = false)
++                                        std::string_view label, float coverageCutoff = -1.0f, bool linearData = false,
++                                        bool rescaleMask = true)
+ {
+     if (view.has_transform || view.texcoord < 0 || view.texcoord > 1)
+         throw std::runtime_error(std::string(label) + " needs untransformed TEXCOORD_0 or TEXCOORD_1.");
+@@ -181,7 +182,7 @@
+     if (!encoded) throw std::runtime_error("Could not read the embedded material texture.");
+     const auto index = asset.textures.size();
+     asset.textures.push_back({image->name ? std::string(image->name) : std::string(label),
+-                              loadColorTexture({encoded, image->buffer_view->size}, coverageCutoff, linearData), linearData});
++                              loadColorTexture({encoded, image->buffer_view->size}, coverageCutoff, linearData, rescaleMask), linearData});
+     return {index, static_cast<std::uint32_t>(view.texcoord)};
+ }
+ 
+@@ -216,7 +217,7 @@
+         return material;
+     }
+     const auto& pbr = source.pbr_metallic_roughness;
+-    if (material.name.starts_with("Lamina |") && source.normal_texture.texture)
++    if ((material.name.starts_with("Lamina |") || material.name.starts_with("Meadow tuft card")) && source.normal_texture.texture)
+     {
+         material.bladeNormal = readMaterialTexture(source.normal_texture, asset, "Blade normal", -1.0f, true);
+         material.normalScale = source.normal_texture.scale;
+@@ -229,7 +230,8 @@
+         return material;
+     }
+     const float coverageCutoff = material.color.w > 0.0f ? material.alphaCutoff / material.color.w : -1.0f;
+-    const auto texture = readMaterialTexture(view, asset, "Base color", coverageCutoff);
++    const auto texture = readMaterialTexture(view, asset, "Base color", coverageCutoff, false,
++                                              !material.name.starts_with("Meadow tuft card"));
+     material.colorTexture = texture.index;
+     material.textureCoordinateSet = texture.texcoord;
+     return material;
+--- a/src/ProbeLighting.cpp
++++ b/src/ProbeLighting.cpp
+@@ -152,6 +152,7 @@
+ 
+     for (const auto& mesh : scene.asset->meshes)
+     {
++        if (mesh.name.starts_with("Meadow tuft card")) continue; // source tufts already feed the probes
+         const auto& material = scene.asset->materials[mesh.material];
+         const bool foliage = material.hasBacklighting;
+         XMFLOAT3 color{material.color.x,material.color.y,material.color.z};
+--- a/src/ViewerScene.cpp
++++ b/src/ViewerScene.cpp
+@@ -97,6 +97,7 @@
+     };
+     for (const auto& mesh : meshes)
+     {
++        if (mesh.name.starts_with("Meadow tuft card")) continue;
+         const auto world = XMLoadFloat4x4(&mesh.localToWorld);
+         if (mesh.instances)
+         {
+@@ -668,9 +669,9 @@
+             scene.asset->textures.push_back({"Thatch and living cover",loadColorTexture(cover,true),true});
+             if (!GetEnvironmentVariableW(L"MEADOW_BASE_COLOUR", nullptr, 0))
+                 for (auto& mat : scene.asset->materials)
+-                    if ((mat.name == "Lamina | blade-green" || mat.name == "Lamina | blade-cool" ||
++                    if (mat.name.starts_with("Meadow tuft card") || ((mat.name == "Lamina | blade-green" || mat.name == "Lamina | blade-cool" ||
+                          mat.name == "Lamina | blade-olive") && mat.diffuseTransmission &&
+-                        !mat.diffuseTransmission->strengthTexture)
++                        !mat.diffuseTransmission->strengthTexture))
+                         mat.meadowGrowth = scene.groundMaterial.meadowCover;
+         }
+     }
+--- a/src/TextureLoader.cpp
++++ b/src/TextureLoader.cpp
+@@ -212,7 +212,7 @@
+ }
+ }
+ 
+-TextureData loadColorTexture(std::span<const std::uint8_t> encoded, float coverageCutoff, bool linearData)
++TextureData loadColorTexture(std::span<const std::uint8_t> encoded, float coverageCutoff, bool linearData, bool rescaleMask)
+ {
+     TextureData mips;
+     mips.push_back(decodeImage(encoded));
+@@ -221,7 +221,7 @@
+     {
+         mips.push_back(downsample(mips.back(), masked, linearData));
+     }
+-    if (masked)
++    if (masked && rescaleMask)
+     {
+         preserveCoverage(mips, coverageCutoff);
+     }
+--- a/src/TextureLoader.h
++++ b/src/TextureLoader.h
+@@ -5,5 +5,6 @@
+ #include <filesystem>
+ #include <span>
+ 
+-TextureData loadColorTexture(std::span<const std::uint8_t> encoded, float coverageCutoff, bool linearData = false);
++TextureData loadColorTexture(std::span<const std::uint8_t> encoded, float coverageCutoff, bool linearData = false,
++                             bool rescaleMask = true);
+ TextureData loadColorTexture(const std::filesystem::path& path, bool linearData = false);
+--- a/shaders/Mesh.hlsl
++++ b/shaders/Mesh.hlsl
+@@ -86,6 +86,7 @@
+     float4 lightPosition : TEXCOORD1;
+     float4 worldPositionAndViewDepth : TEXCOORD2;
+     nointerpolation uint meshInstanceId : TEXCOORD3;
++    nointerpolation float cardBlend : TEXCOORD4;
+ };
+ 
+ struct ShadowInput
+@@ -144,6 +145,27 @@
+ PixelInput VSMain(VertexInput input, uint instanceId : SV_InstanceID)
+ {
+     PixelInput output;
++    output.cardBlend=0;
++    float2 tuftYaw=0;
++    if (transmissionFlags & 32768u)
++    {
++        const float4 root=mul(float4(input.meshTranslation,1),model);
++        const float2 rootXZ=rotateXZ(root.xz,input.instance.z)*input.instance.w+input.instance.xy;
++        const float2 direction=rotateXZ(studyEye.xz-rootXZ,-input.instance.z);
++        const float3 local=rotateMeshInstance(float3(direction.x,0,direction.y),
++                                               float4(-input.meshRotation.xyz,input.meshRotation.w));
++        const float angle=atan2(local.x,local.z);
++        const float viewIndex=angle*(4/3.14159265);
++        const int azimuth=(int)floor(viewIndex+.5);
++        const uint tile=uint(azimuth)&7u;
++        const uint neighbor=uint(azimuth+(viewIndex<azimuth ? -1 : 1))&7u;
++        input.uv1=(float2(neighbor%4,neighbor/4)+input.uv0)*float2(.25,.5);
++        input.uv0=(float2(tile%4,tile/4)+input.uv0)*float2(.25,.5);
++        output.cardBlend=.5*smoothstep(.30,.50,abs(viewIndex-azimuth));
++        input.position.xz=rotateXZ(input.position.xz,angle);
++        const float3 forward=rotateMeshInstance(float3(0,0,1),input.meshRotation);
++        tuftYaw=rotateXZ(forward.xz,input.instance.z);
++    }
+     if (lodLevel & 0xc0000000u)
+     {
+         float4 root=mul(float4(input.meshTranslation,1),model);
+@@ -193,10 +215,18 @@
+     output.worldNormal.xz = rotateXZ(output.worldNormal.xz, input.instance.z);
+     // The normal's Y component changes under the horizontal shear.
+     output.worldNormal.y -= dot(bendSlope, output.worldNormal.xz);
++    if (transmissionFlags & 32768u)
++        output.worldNormal=float3(tuftYaw,input.meshScale.x/input.meshScale.y);
+     output.texcoords = float4(input.uv0, input.uv1);
+     output.lightPosition = mul(world, lightViewProjection);
+     output.worldPositionAndViewDepth = float4(world.xyz, output.position.w);
+     output.meshInstanceId = instanceId;
++    if (transmissionFlags & 32768u)
++    {
++        uint key=asuint(input.meshTranslation.x)*0x9e3779b9u ^ asuint(input.meshTranslation.z);
++        key^=key>>16; key*=0x85ebca6bu; key^=key>>13;
++        output.meshInstanceId=key;
++    }
+     return output;
+ }
+ 
+@@ -239,6 +269,18 @@
+     {
+         clip(alpha - alphaCutoff);
+     }
++}
++
++float4 sampleTuftColor(PixelInput input,float2 uv)
++{
++    float4 a=sampleBaseColor(uv);
++    if (input.cardBlend>0)
++    {
++        float4 b=sampleBaseColor(input.texcoords.zw);
++        const float alpha=lerp(a.a,b.a,input.cardBlend);
++        a=float4(lerp(a.rgb*a.a,b.rgb*b.a,input.cardBlend)/max(alpha,1e-5),alpha);
++    }
++    return a;
+ }
+ 
+ float3 bladeShadingNormal(float3 position, float3 n, float2 uv)
+@@ -429,12 +471,25 @@
+         if (alphaCutoff >= 0.0) applyCutout(sampleBaseColor(uv).a);
+         return float4(0.15, 0.55, 0.32, 1);
+     }
+-    float4 baseColor = sampleBaseColor(uv);
++    float4 baseColor = sampleTuftColor(input,uv);
++    if (transmissionFlags & 65536u) clip(baseColor.a-.002);
++    else applyCutout(baseColor.a);
++    float4 cardSurface=0;
++    float bladeCoverage=0;
++    if (transmissionFlags & 32768u)
++    {
++        cardSurface=detailTexture.Sample(colorSampler,uv);
++        if (input.cardBlend>0)
++            cardSurface=lerp(cardSurface,detailTexture.Sample(colorSampler,input.texcoords.zw),input.cardBlend);
++        cardSurface.rgb=2*cardSurface.rgb-1;
++        bladeCoverage=saturate(cardSurface.a/max(.01,length(cardSurface.rgb)));
++    }
+     float3 growthTint = 1.0;
+     if (transmissionFlags & 2048u)
+     {
+         float growth = transmissionStrengthTexture.Sample(colorSampler, saturate((input.worldPositionAndViewDepth.xz + 48) / 80)).b;
+         growthTint = lerp(1.0, float3(1.62, 1.36, 0.82), growth);
++        if (transmissionFlags & 32768u) growthTint=lerp(1.0,growthTint,bladeCoverage);
+         baseColor.rgb *= growthTint;
+     }
+     if (transmissionFlags & 1024u)
+@@ -446,7 +501,6 @@
+         const float3 thatch = straw * float3(1.28,1.02,0.52);
+         baseColor.rgb = lerp(lerp(baseColor.rgb,thatch,weights.r),sward,weights.g);
+     }
+-    applyCutout(baseColor.a);
+     uint cascade = 0;
+     if (useCascades)
+     {
+@@ -488,7 +542,14 @@
+     float3 worldNormal = normalize(input.worldNormal);
+     // For thin double-sided leaves, evaluate lighting from the visible side.
+     // A mirrored node reverses winding relative to its transformed normal.
+-    if (twoSidedNormalSign != 0)
++    if (transmissionFlags & 32768u)
++    {
++        const float2 yaw=input.worldNormal.xy;
++        float3 n=cardSurface.rgb;
++        n.y*=input.worldNormal.z;
++        worldNormal=normalize(float3(n.x*yaw.y+n.z*yaw.x,n.y,-n.x*yaw.x+n.z*yaw.y)+float3(0,.001,0));
++    }
++    else if (twoSidedNormalSign != 0)
+     {
+         worldNormal *= (isFrontFace ? 1.0 : -1.0) * twoSidedNormalSign;
+     }
+@@ -514,6 +575,17 @@
+         return float4(visibility.xxx, shadowView == 1 ? 0.25 : 0.75);
+     }
+     if (lightingMode == shadowVisibility) return float4(visibility.xxx, 1.0);
++    if (transmissionFlags & 32768u)
++    {
++        LeafIncidentLight light=leafIncidentLight(worldNormal,normalToSun,directionalSkylight);
++        localDiffuse(input.worldPositionAndViewDepth.xyz,worldNormal,probeOriginSpacing,probeSize.xyz,
++                     true,light.skyFront,light.skyBack);
++        float3 shaded=shadeLeaf(light,visibility,lightingMode,baseColor.rgb,baseColor.rgb,.28*bladeCoverage);
++        if (lightingMode!=skyOnly && lightingMode!=transmissionOnly)
++            shaded+=bladeCoverage*visibility*bladeSunReflection(worldNormal,
++                normalize(studyEye.xyz-input.worldPositionAndViewDepth.xyz),.50);
++        return float4(shaded,(transmissionFlags & 65536u) ? baseColor.a : 1);
++    }
+ 
+     // Each texture's selector is 0 for no texture, 1 for TEXCOORD_0, and 2 for TEXCOORD_1.
+     [branch]
+@@ -573,6 +645,21 @@
+     return float4(encodedCamera && hasColorTexture ? encodeSrgb(lit) : lit, 1.0);
+ }
+ 
++float4 PSGrassCoverage(PixelInput input, bool front : SV_IsFrontFace, uint primitive : SV_PrimitiveID,
++                       uint raster : SV_Coverage, out uint samples : SV_Coverage) : SV_Target
++{
++    // Sample priority must vary between plants. Otherwise overlapping fine stems
++    // all cover the same MSAA subsamples, leaving sky visible through a dense stand.
++    const float alpha=sampleTuftColor(input,input.texcoords.xy).a;
++    const uint key=input.meshInstanceId;
++    const uint count=min(4u,(uint)(4*alpha+float(key>>8)*(1.0/16777216)));
++    const uint lowMask=(1u<<count)-1u;
++    const uint shift=key&3u;
++    samples=raster & ((lowMask<<shift)|(lowMask>>(4u-shift)));
++    clip(float(samples)-.5);
++    return PSMain(input,front,primitive);
++}
++
+ ShadowInput ShadowVS(VertexInput input)
+ {
+     ShadowInput output;

@@ -1,11 +1,19 @@
 #include "D3D12Renderer.h"
 #include "MeshPS.h"
+#include "OakFlatPS.h"
+#include "OakEarlyPS.h"
+#include "OakVisibilityPS.h"
+#include "OakVisibilityVS.h"
 #include "MeshVS.h"
 #include "ShadowPS.h"
 #include "ShadowVS.h"
 #include "HudVS.h"
 #include "HudPS.h"
 #include "VoxelVS.h"
+#include "BrickClearCS.h"
+#include "BrickVisibilityCS.h"
+#include "BrickResolvePS.h"
+#include "BrickResolveVS.h"
 #include "VoxelPS.h"
 #include "VoxelShadowPS.h"
 #include "SkyVS.h"
@@ -152,6 +160,8 @@ struct VoxelFrameConstants
     UINT probePadding[2];
     DiffuseProbeGrid probes;
     XMFLOAT4 boughWind;
+    XMFLOAT4 treePlacement, screenRayX, screenRayY, screenRayForward;
+    XMFLOAT2 rasterSize, rasterPadding;
 };
 
 struct VoxelDrawConstants
@@ -261,7 +271,8 @@ constexpr std::uint8_t cascadeCasterOverride = 2;
 
 enum FrameTimestamp : UINT
 {
-    FrameStart, ProbeEnd, ShadowStart, ShadowEnd, TreeDepthStart, TreeDepthEnd, CameraEnd, FrameEnd, TimestampCount
+    FrameStart, ProbeEnd, ShadowStart, ShadowEnd, AssetStart, LiveCutEnd, AssetEnd, BoughBrickStart, BoughBrickEnd,
+    TreeDepthStart, TreeDepthEnd, CameraEnd, FrameEnd, TimestampCount
 };
 static_assert(offsetof(FrameConstants, probes) == 480);
 static_assert(offsetof(FrameConstants, normalBiasWorld) == 160);
@@ -583,7 +594,8 @@ void D3D12Renderer::setScene(const ViewerScene& scene)
     // Each frame and texture upload has completed before the viewer can switch scenes.
     if (asset_ != scene.asset || fixedLodAsset_ != scene.fixedLod || sprayLodAssets_ != scene.sprayLods ||
         sprayBoughAsset_ != scene.sprayBough || treeHierarchyAsset_ != scene.treeHierarchy || boughVoxelPath_ != scene.boughVoxelBake ||
-        livePath_ != scene.liveCut || (!scene.liveCut.empty() && liveCut_.packAssembly != scene.liveCutPackAssembly))
+        (!scene.boughVoxelBake.empty() && (scene.objects.size() > boughTreeCapacity_ || (scene.softwareBoughRaster && !brickClear_))) ||
+        livePath_ != scene.liveCut || (!scene.liveCut.empty() && (liveCut_.packAssembly != scene.liveCutPackAssembly || bool(liveGpu_.views) != scene.liveCutGpu || liveCut_.treeCount != scene.objects.size())))
     {
         std::vector<GpuMesh> meshes;
         meshes.reserve(scene.asset->meshes.size());
@@ -1392,6 +1404,63 @@ void D3D12Renderer::createDepthBuffer(RenderMode& mode, D3D12_RESOURCE_DESC desc
     device_->CreateDepthStencilView(mode.depthBuffer.Get(), &view, mode.depthTarget);
 }
 
+void D3D12Renderer::setOakRasterReplay(OakRaster mode, bool validate)
+{
+    if (mode != OakRaster::Live && (!oakPlacementKeys_ || !liveGpu_.readable || liveGpu_.packStride || liveCut_.replace != 7 ||
+                                    msaaEnabled_ || encodedCamera_ || swapChain_))
+        throw std::runtime_error("Prime a complete GPU-instanced oak cut in a shaded, single-sample capture before replay.");
+    oakRaster_ = mode;
+    validateOakRaster_ = validate;
+    if (mode < OakRaster::Depth || oakRasterPipelines_[0][0]) return;
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap{};
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heap.NumDescriptors = 1;
+    check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&oakIdHeap_)), "Create oak visibility descriptor");
+    auto texture = sceneColor_->GetDesc();
+    texture.Format = DXGI_FORMAT_R32G32_UINT;
+    D3D12_CLEAR_VALUE empty{};
+    empty.Format = texture.Format;
+    oakIds_ = createRenderTexture(texture, D3D12_RESOURCE_STATE_RENDER_TARGET, empty);
+    device_->CreateRenderTargetView(oakIds_.Get(), nullptr, oakIdHeap_->GetCPUDescriptorHandleForHeapStart());
+
+    const auto& layout = meshPipelineDescription_.InputLayout;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> keyed(layout.pInputElementDescs, layout.pInputElementDescs + layout.NumElements);
+    keyed.push_back({"CUTKEY", 0, DXGI_FORMAT_R32_UINT, 3, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1});
+    for (auto arm : {OakRaster::Depth, OakRaster::Visibility, OakRaster::Flat, OakRaster::EarlyDepthFull})
+    {
+        auto desc = meshPipelineDescription_;
+        desc.VS = {meshVS, sizeof(meshVS)};
+        if (arm == OakRaster::Depth)
+        {
+            desc.NumRenderTargets = 0;
+            desc.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+        }
+        else if (arm == OakRaster::Visibility)
+        {
+            desc.InputLayout = {keyed.data(), static_cast<UINT>(keyed.size())};
+            desc.VS = {oakVisibilityVS, sizeof(oakVisibilityVS)};
+            desc.PS = {oakVisibilityPS, sizeof(oakVisibilityPS)};
+            desc.RTVFormats[0] = texture.Format;
+        }
+        else if (arm == OakRaster::Flat) desc.PS = {oakFlatPS, sizeof(oakFlatPS)};
+        else desc.PS = {oakEarlyPS, sizeof(oakEarlyPS)};
+        for (unsigned cull = 0; cull < 2; ++cull)
+        {
+            desc.RasterizerState.CullMode = cull ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
+            oakRasterPipelines_[int(arm) - int(OakRaster::Depth)][cull] =
+                createPipeline(device_.Get(), desc, "Create fixed-cut oak raster pipeline");
+        }
+    }
+}
+
+void D3D12Renderer::readOakRasterValidation(std::vector<uint32_t>& depth, std::vector<uint64_t>& ids)
+{
+    readFrameColor(oakDepthReadback_, depth);
+    ids.clear();
+    if (oakRaster_ == OakRaster::Visibility) readFrameColor(oakIdReadback_, ids);
+}
+
 void D3D12Renderer::updateSun(const ViewerScene& scene)
 {
     toSun_ = scene.sunDirection();
@@ -1792,15 +1861,15 @@ void D3D12Renderer::createVoxelPipeline(bool enableMultisampling)
     shadow.BaseShaderRegister = 2;
     auto probeView = shadow;
     probeView.BaseShaderRegister = 6;
-    D3D12_ROOT_PARAMETER parameters[8]{};
+    D3D12_ROOT_PARAMETER parameters[11]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[1].Constants = {1, 0, sizeof(VoxelDrawConstants) / sizeof(UINT)};
     parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     parameters[3].Descriptor.ShaderRegister = 1;
-    parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameters[4].DescriptorTable = {1, &shadow};
     parameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
@@ -1813,6 +1882,12 @@ void D3D12Renderer::createVoxelPipeline(bool enableMultisampling)
     parameters[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameters[7].DescriptorTable = {1, &probeView};
     parameters[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[9].Descriptor.ShaderRegister = 4;
+    parameters[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[10].Descriptor.ShaderRegister = 5;
     D3D12_STATIC_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
@@ -1907,8 +1982,30 @@ void D3D12Renderer::uploadBoughVoxels(const ViewerScene& scene)
 {
     boughVoxelLevels_ = {};
     boughReplace_ = 0;
+    mixedBoughVoxels_ = false;
     boughVoxelPath_ = scene.boughVoxelBake;
     if (boughVoxelPath_.empty()) return;
+    constexpr size_t stride = (sizeof(VoxelFrameConstants) + 255) & ~size_t(255);
+    voxelConstants_ = createUploadBuffer(stride * (voxelBranchRegionCount + 2 + 2 * scene.objects.size()));
+    boughTreeCapacity_ = scene.objects.size();
+    if (scene.softwareBoughRaster && !brickClear_)
+    {
+        auto create = [&](D3D12_SHADER_BYTECODE shader, ComPtr<ID3D12PipelineState>& pipeline) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+            desc.pRootSignature = voxelRoot_.Get();
+            desc.CS = shader;
+            check(device_->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline)), "Create SM 6.6 bough brick raster pipeline");
+        };
+        create({BrickClearCS,sizeof(BrickClearCS)},brickClear_);
+        create({BrickVisibilityCS,sizeof(BrickVisibilityCS)},brickVisibility_);
+        auto desc = meshPipelineDescription_;
+        desc.pRootSignature = voxelRoot_.Get();
+        desc.InputLayout = {};
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.VS = {BrickResolveVS,sizeof(BrickResolveVS)};
+        desc.PS = {BrickResolvePS,sizeof(BrickResolvePS)};
+        brickResolve_ = createCameraPipeline(desc,"Create bough brick material resolve");
+    }
     std::ifstream input(boughVoxelPath_, std::ios::binary);
     input.exceptions(std::ios::failbit | std::ios::badbit);
     auto read = [&](auto* ptr, size_t count) {
@@ -1917,7 +2014,9 @@ void D3D12Renderer::uploadBoughVoxels(const ViewerScene& scene)
     char magic[8];
     read(magic, 8);
     read(&boughFirst_, 1); read(&boughCount_, 1); read(&boughReplace_, 1);
-    if (std::memcmp(magic, "OAKVX001", 8) || boughReplace_ > 3 || !boughCount_ ||
+    mixedBoughVoxels_ = std::memcmp(magic, "OAKMX001", 8) == 0;
+    if ((!mixedBoughVoxels_ && std::memcmp(magic, "OAKVX001", 8)) || boughReplace_ > 3 ||
+        (mixedBoughVoxels_ && !boughReplace_) || !boughCount_ ||
         !scene.treeHierarchy || !scene.sprayLods[0] || !scene.sprayLods[1])
         throw std::runtime_error("Invalid bough voxel fixture.");
     for (UINT slot = 0; slot < 2; ++slot)
@@ -1932,6 +2031,21 @@ void D3D12Renderer::uploadBoughVoxels(const ViewerScene& scene)
         std::vector<XMFLOAT4> axes(4ull * level.brickCount);
         std::vector<UINT> normals(level.brickCount + 4ull * cells);
         read(bricks.data(), bricks.size()); read(axes.data(), axes.size()); read(normals.data(), normals.size());
+        auto lower = XMVectorReplicate(std::numeric_limits<float>::max()), upper = -lower;
+        for (UINT i = 0; i < level.brickCount; ++i)
+        {
+            auto low = XMLoadFloat4(&axes[4*i]), high = low;
+            for (UINT axis = 1; axis <= 3; ++axis)
+            {
+                const auto delta = 4 * XMLoadFloat4(&axes[4*i + axis]);
+                low += XMVectorMin(delta, XMVectorZero());
+                high += XMVectorMax(delta, XMVectorZero());
+            }
+            lower = XMVectorMin(lower,low);
+            upper = XMVectorMax(upper,high);
+        }
+        XMStoreFloat3(&boughBrickBounds_[slot].center, (lower + upper) * .5f);
+        XMStoreFloat3(&boughBrickBounds_[slot].halfExtent, (upper - lower) * .5f);
         UINT offset = 0;
         for (UINT i = 0; i < level.brickCount; ++i)
         {
@@ -1945,6 +2059,8 @@ void D3D12Renderer::uploadBoughVoxels(const ViewerScene& scene)
         level.cellSize = 1;
         level.meshIndex = scene.sprayLods[slot]->meshIndex;
     }
+    if (mixedBoughVoxels_ && !boughVoxelLevels_[0].brickCount && !boughVoxelLevels_[1].brickCount)
+        throw std::runtime_error("Mixed cut contains no bricks.");
     if (input.rdbuf()->sgetc() != std::char_traits<char>::eof()) throw std::runtime_error("Trailing bough voxel data.");
 }
 
@@ -2006,7 +2122,7 @@ void D3D12Renderer::uploadBranchVoxels(const ViewerScene& scene)
 }
 
 void D3D12Renderer::drawBranchVoxels(const ViewerScene& scene, const GpuVoxelLevel& level, FXMMATRIX view,
-                                   const PassVisibility& visibility, PassStats& stats, bool packPlacements, bool shadowPass)
+                                   const PassVisibility& visibility, PassStats& stats, bool packPlacements, bool shadowPass, const SceneObject* tree)
 {
     if (visibility.ranges.empty()) return;
     packPlacements = packPlacements && visibility.ranges.size() > 1;
@@ -2054,6 +2170,63 @@ void D3D12Renderer::drawBranchVoxels(const ViewerScene& scene, const GpuVoxelLev
         frame.boughWind = {frameWind_.x,frameWind_.y,windStart_,inverseWindHeight_};
         if (captureGeometryMask_) frame.viewMode = boughDepth_ ? 10 : boughMaterials_ ?
             (level.meshIndex == scene.sprayLods[0]->meshIndex ? 8 : 9) : 1;
+    }
+    frame.treePlacement = tree ? tree->placement : XMFLOAT4{0,0,0,1};
+    const bool software = level.axes && scene.softwareBoughRaster && !msaaEnabled_ && !shadowPass;
+    size_t slot = 0;
+    UINT maxWidth = 0, maxHeight = 0;
+    if (software)
+    {
+        slot = static_cast<size_t>(&level - boughVoxelLevels_.data());
+        brickWorkItems_.clear();
+        UINT64 pixels = 0;
+        for (const auto range : visibility.ranges)
+            for (UINT i = range.first; i < range.first + range.count; ++i)
+            {
+                const auto& object = scene.objects[i];
+                auto bounds = worldWindBounds(boughBrickBounds_[slot],object,frameWind_);
+                XMFLOAT3 corners[8];
+                bounds.GetCorners(corners);
+                float left = viewport_.Width, top = viewport_.Height, right = 0, bottom = 0;
+                for (const auto& corner : corners)
+                {
+                    XMFLOAT4 p;
+                    XMStoreFloat4(&p,XMVector4Transform(XMVectorSetW(XMLoadFloat3(&corner),1),viewProjection));
+                    if (p.w <= cameraNearPlane_) { left = top = 0; right = viewport_.Width; bottom = viewport_.Height; break; }
+                    const float x = (.5f + .5f*p.x/p.w)*viewport_.Width, y = (.5f - .5f*p.y/p.w)*viewport_.Height;
+                    left = std::min(left,x); right = std::max(right,x); top = std::min(top,y); bottom = std::max(bottom,y);
+                }
+                D3D12_RECT rect = {std::clamp<LONG>(LONG(floor(left))-1,0,scissor_.right), std::clamp<LONG>(LONG(floor(top))-1,0,scissor_.bottom),
+                        std::clamp<LONG>(LONG(ceil(right))+1,0,scissor_.right), std::clamp<LONG>(LONG(ceil(bottom))+1,0,scissor_.bottom)};
+                if (rect.right <= rect.left || rect.bottom <= rect.top) continue;
+                UINT width = UINT(rect.right-rect.left), height = UINT(rect.bottom-rect.top);
+                brickWorkItems_.push_back({object.placement,UINT(rect.left),UINT(rect.top),width,height,UINT(pixels)});
+                maxWidth = std::max(maxWidth,width);
+                maxHeight = std::max(maxHeight,height);
+                pixels += UINT64(width)*height;
+            }
+        if (brickWorkItems_.empty()) return;
+        if (pixels > UINT_MAX/8 || brickWorkItems_.size() > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION)
+            throw std::runtime_error("Bough brick batch exceeds dispatch or byte address limits.");
+        frame.rasterSize = {viewport_.Width,viewport_.Height};
+        const auto camera = XMMatrixInverse(nullptr,view);
+        XMStoreFloat4(&frame.screenRayX,camera.r[0]/projection_._11);
+        XMStoreFloat4(&frame.screenRayY,camera.r[1]/projection_._22);
+        XMStoreFloat4(&frame.screenRayForward,-camera.r[2]);
+        // Each tree owns a compact rectangle in scratch. Hardware depth resolves overlaps between trees.
+        const auto bytes = std::bit_ceil(std::max<UINT64>(65536,pixels*8));
+        if (!brickHits_[slot] || brickHits_[slot]->GetDesc().Width < bytes)
+            brickHits_[slot] = createProbeBuffer(bytes,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const size_t workBytes = brickWorkItems_.size()*sizeof(BrickWork);
+        static_assert(sizeof(BrickWork) == 48);
+        if (!brickWork_[slot] || brickWork_[slot]->GetDesc().Width < workBytes)
+            brickWork_[slot] = createUploadBuffer(workBytes);
+        void* items;
+        const D3D12_RANGE noReads{};
+        check(brickWork_[slot]->Map(0,&noReads,&items),"Map bough brick rectangles");
+        std::memcpy(items,brickWorkItems_.data(),workBytes);
+        const D3D12_RANGE written{0,workBytes};
+        brickWork_[slot]->Unmap(0,&written);
     }
     frame.encodedCamera = encodedCamera_;
     frame.directionalSkylight = skyPanorama_ && !encodedCamera_ && !scene.legacyAmbientForDiagnostics;
@@ -2108,6 +2281,43 @@ void D3D12Renderer::drawBranchVoxels(const ViewerScene& scene, const GpuVoxelLev
         commands_->SetGraphicsRootShaderResourceView(5, (level.normals ? level.normals : level.bricks)->GetGPUVirtualAddress());
         commands_->SetGraphicsRootConstantBufferView(6, skyIrradiance_->GetGPUVirtualAddress());
         commands_->SetGraphicsRootDescriptorTable(7, probeGpuView_);
+    }
+    if (software)
+    {
+        const UINT count = static_cast<UINT>(brickWorkItems_.size());
+        const auto hits = brickHits_[slot]->GetGPUVirtualAddress();
+        const auto workAddress = brickWork_[slot]->GetGPUVirtualAddress();
+        commands_->SetGraphicsRootShaderResourceView(10,workAddress);
+        const VoxelDrawConstants args{level.origin,level.cellSize,level.brickCount,0};
+        commands_->SetComputeRootSignature(voxelRoot_.Get());
+        commands_->SetComputeRootConstantBufferView(0,voxelConstants_->GetGPUVirtualAddress()+constantOffset);
+        commands_->SetComputeRoot32BitConstants(1,sizeof(args)/4,&args,0);
+        commands_->SetComputeRootShaderResourceView(2,level.bricks->GetGPUVirtualAddress());
+        commands_->SetComputeRootShaderResourceView(3,level.axes->GetGPUVirtualAddress());
+        commands_->SetComputeRootUnorderedAccessView(8,hits);
+        commands_->SetComputeRootShaderResourceView(10,workAddress);
+        commands_->SetPipelineState(brickClear_.Get());
+        commands_->Dispatch((maxWidth+7)/8,(maxHeight+7)/8,count);
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource = brickHits_[slot].Get();
+        commands_->ResourceBarrier(1,&barrier);
+        commands_->SetPipelineState(brickVisibility_.Get());
+        commands_->Dispatch((level.brickCount+63)/64,count,1);
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition = {brickHits_[slot].Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+        commands_->ResourceBarrier(1,&barrier);
+        commands_->SetPipelineState(brickResolve_.get(encodedCamera_));
+        commands_->SetGraphicsRoot32BitConstants(1,sizeof(args)/4,&args,0);
+        commands_->SetGraphicsRootShaderResourceView(9,hits);
+        commands_->DrawInstanced(6,count,0,0);
+        std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);
+        commands_->ResourceBarrier(1,&barrier);
+        ++stats.draws; ++stats.foliageDraws; ++stats.foliageCalls;
+        stats.voxelBricks += uint64_t(count)*level.brickCount;
+        stats.triangles += 2ull * count;
+        return;
     }
     const D3D12_INDEX_BUFFER_VIEW box{voxelBoxIndices_->GetGPUVirtualAddress(), sizeof(voxelBoxIndices), DXGI_FORMAT_R16_UINT};
     commands_->IASetIndexBuffer(&box);
@@ -3127,7 +3337,7 @@ D3D12Renderer::FrameTiming D3D12Renderer::drawFrame(
     commands_->RSSetViewports(1, &viewport_);
     commands_->RSSetScissorRects(1, &scissor_);
     commands_->OMSetRenderTargets(1, &colorTarget, FALSE, &mode.depthTarget);
-    boughCameraSelected_ = {};
+    for (auto& selected : selectedBoughTrees_) selected.clear();
     if (scene.cameraPipelineStats)
     {
         if (!timestampReadback_) throw std::runtime_error("Camera pipeline statistics require a query readback.");
@@ -3138,16 +3348,42 @@ D3D12Renderer::FrameTiming D3D12Renderer::drawFrame(
         }
         commands_->BeginQuery(cameraPipelineQuery_.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
     }
+    if (oakRaster_ == OakRaster::Visibility)
+    {
+        const auto target = oakIdHeap_->GetCPUDescriptorHandleForHeapStart();
+        constexpr float empty[4]{};
+        commands_->ClearRenderTargetView(target, empty, 0, nullptr);
+        commands_->OMSetRenderTargets(1, &target, FALSE, &mode.depthTarget);
+    }
+    else if (oakRaster_ == OakRaster::Depth)
+        commands_->OMSetRenderTargets(0, nullptr, FALSE, &mode.depthTarget);
     auto camera = drawMeshes(scene, false);
     if (scene.cameraPipelineStats)
     {
-        commands_->EndQuery(cameraPipelineQuery_.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
+        if (oakRaster_ == OakRaster::Live)
+            commands_->EndQuery(cameraPipelineQuery_.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
         commands_->ResolveQueryData(cameraPipelineQuery_.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0,1,
                                     timestampReadback_.Get(),TimestampCount*sizeof(UINT64));
     }
+    timestamp(BoughBrickStart);
     for (UINT slot = 0; slot < boughVoxelLevels_.size(); ++slot)
-        if (boughVoxelLevels_[slot].brickCount && (!boughReplace_ || boughCameraSelected_[slot]))
-            drawBranchVoxels(scene, boughVoxelLevels_[slot], XMLoadFloat4x4(&view), cameraVisibility_, camera, false);
+        if (boughVoxelLevels_[slot].brickCount)
+        {
+            const auto& visible = boughReplace_ ? selectedBoughTrees_[slot] : cameraVisibility_;
+            if (scene.softwareBoughRaster && !msaaEnabled_)
+            {
+                drawBranchVoxels(scene,boughVoxelLevels_[slot],XMLoadFloat4x4(&view),visible,camera,false);
+                continue;
+            }
+            for (const auto range : visible.ranges)
+                for (UINT i = range.first; i < range.first + range.count; ++i)
+                {
+                    PassVisibility one;
+                    one.add(i);
+                    drawBranchVoxels(scene,boughVoxelLevels_[slot],XMLoadFloat4x4(&view),one,camera,false,false,&scene.objects[i]);
+                }
+        }
+    timestamp(BoughBrickEnd);
     if (const auto voxelIndex = branchVoxelIndex(scene.branchVoxelView))
         drawBranchVoxels(scene, voxelLevels_[*voxelIndex], XMLoadFloat4x4(&view), cameraVisibility_, camera, false);
     else if (automaticVoxels)
@@ -3216,6 +3452,7 @@ D3D12Renderer::FrameTiming D3D12Renderer::drawFrame(
     waitForGpu();
     check(presentResult, "Present frame");
     readTreeGpuStats(scene, camera, shadow, shadowCascades);
+    readLiveGpuStats(camera);
     readTreeBatchStats(scene, camera, shadow, shadowCascades);
     if (scene.cameraPipelineStats)
     {
@@ -3228,6 +3465,7 @@ D3D12Renderer::FrameTiming D3D12Renderer::drawFrame(
         const D3D12_RANGE noWrites{0,0};
         timestampReadback_->Unmap(0,&noWrites);
         camera.vertexInvocations=counters.VSInvocations;
+        camera.inputPrimitives=counters.IAPrimitives;
         camera.pixelInvocations=counters.PSInvocations;
     }
     if (capture) readFrameColor(displayReadback_, *capture);
@@ -3417,9 +3655,23 @@ void D3D12Renderer::uploadTreeHierarchy(const ViewerScene& scene, const std::vec
     };
     if (!liveCut_.nodes.empty())
     {
+        if (scene.profileOakRaster)
+        {
+            // Bins have disjoint instance slots. ID zero represents an uncovered pixel.
+            if (uint64_t(liveGpu_.capacity) * 3 * liveCut_.treeCount > UINT_MAX)
+                throw std::runtime_error("Oak visibility IDs exceed the capture format.");
+            std::vector<UINT> keys(liveGpu_.capacity);
+            std::iota(keys.begin(), keys.end(), 1u);
+            oakPlacementKeys_ = resident(uploadBuffer(keys.data(), keys.size() * sizeof(UINT)),
+                                         D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+        }
+        for (auto& input : liveGpu_.inputs)
+            if (input) input = resident(std::move(input),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         auto& mesh = liveCut_.mesh;
         mesh.vertexBuffer = resident(mesh.vertexBuffer,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-        mesh.indexBuffer = resident(mesh.indexBuffer,D3D12_RESOURCE_STATE_INDEX_BUFFER);
+        const auto indexState=D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_INDEX_BUFFER |
+            (scene.liveCutGpu ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON));
+        mesh.indexBuffer = resident(mesh.indexBuffer,indexState);
         mesh.vertices.BufferLocation = mesh.vertexBuffer->GetGPUVirtualAddress();
         mesh.indices.BufferLocation = mesh.indexBuffer->GetGPUVirtualAddress();
     }
@@ -3464,11 +3716,13 @@ void D3D12Renderer::uploadTreeHierarchy(const ViewerScene& scene, const std::vec
 void D3D12Renderer::loadLiveCut(const ViewerScene& scene)
 {
     liveCut_ = {};
+    liveGpu_ = {};
     livePath_ = scene.liveCut;
     if (livePath_.empty()) return;
     if (!scene.treeHierarchy) throw std::runtime_error("A live oak cut needs the matching tree asset.");
     auto& cut = liveCut_;
     cut.packAssembly = scene.liveCutPackAssembly;
+    cut.treeCount = static_cast<UINT>(scene.objects.size());
     std::ifstream file(livePath_,std::ios::binary);
     file.exceptions(std::ios::badbit | std::ios::failbit);
     const auto size = std::filesystem::file_size(livePath_);
@@ -3520,34 +3774,35 @@ void D3D12Renderer::loadLiveCut(const ViewerScene& scene)
     }
     cut.mesh=uploadMesh(data);
     cut.mesh.meshInstanceCount=1;
+    if (scene.liveCutGpu) { prepareLiveGpu(); return; }
     cut.instances=uploadBuffer(cut.placements.data(),cut.placements.size()*sizeof(MeshInstance));
-    cut.packed=createUploadBuffer(std::max<size_t>(1,drawNodes)*3*sizeof(MeshInstance));
+    cut.packed=createUploadBuffer(std::max<size_t>(1,drawNodes)*cut.treeCount*3*sizeof(MeshInstance));
     const D3D12_RANGE noReads{0,0};
     void* mapped=nullptr;
     if (assemblyCapacity)
     {
         cut.sourceIndices=std::move(data.indices);
-        cut.assemblyIndices=createUploadBuffer(assemblyCapacity*sizeof(UINT));
+        cut.assemblyIndices=createUploadBuffer(assemblyCapacity*cut.treeCount*sizeof(UINT));
         check(cut.assemblyIndices->Map(0,&noReads,&mapped),"Map live assembly index stream");
         cut.mappedIndices=static_cast<UINT*>(mapped);
     }
     check(cut.packed->Map(0,&noReads,&mapped),"Map live spray instances");
     cut.mapped=static_cast<MeshInstance*>(mapped);
-    cut.bins.resize(cut.geometry.size());
+    cut.batches.resize(cut.treeCount);
+    for (auto& tree : cut.batches) tree.bins.resize(cut.geometry.size());
 }
 
-void D3D12Renderer::selectLiveCut(const ViewerScene& scene, PassStats& stats)
+void D3D12Renderer::selectLiveCut(const ViewerScene& scene, UINT objectIndex, PassStats& stats)
 {
     using Clock=std::chrono::steady_clock;
     const auto start=Clock::now();
     auto& cut=liveCut_;
-    for (auto g:cut.used) cut.bins[g].clear();
-    cut.used.clear();
-    cut.offset=0;
-    cut.indexOffset=0;
+    auto& tree=cut.batches[objectIndex];
+    for (auto g:tree.used) tree.bins[g].clear();
+    tree.used.clear();
     const auto view=XMLoadFloat4x4(&frameView_);
     const auto planes=frustumPlanes(view*XMLoadFloat4x4(&projection_));
-    const auto& object=scene.objects.front();
+    const auto& object=scene.objects[objectIndex];
     const auto objectView=object.placementMatrix()*view;
     const auto ax=XMVectorAbs(objectView.r[0]),ay=XMVectorAbs(objectView.r[1]),az=XMVectorAbs(objectView.r[2]);
     const auto wind=XMVector3TransformNormal(XMVectorSet(frameWind_.x,0,frameWind_.y,0),view)*(.5f*object.placement.w);
@@ -3605,28 +3860,29 @@ void D3D12Renderer::selectLiveCut(const ViewerScene& scene, PassStats& stats)
             }
             if (lo<=n.minimum*focal && n.minimum>0) {++i;continue;}
         }
-        auto& batch=cut.bins[bin];
-        if (batch.empty()) cut.used.push_back(bin);
+        auto& batch=tree.bins[bin];
+        if (batch.empty()) tree.used.push_back(bin);
         batch.push_back(n.instance);
         ++i;
     }
     stats.treeSelectionMilliseconds+=std::chrono::duration<double,std::milli>(Clock::now()-start).count();
 }
 
-void D3D12Renderer::drawLiveCut(const ViewerScene& scene, size_t meshIndex, UINT slot, PassStats& stats)
+void D3D12Renderer::drawLiveCut(const ViewerScene& scene, size_t meshIndex, UINT slot, UINT objectIndex, PassStats& stats)
 {
     auto& cut=liveCut_;
     auto& proxy=cut.mesh;
     proxy.material=meshes_[meshIndex].material;
-    const D3D12_VERTEX_BUFFER_VIEW tree{instanceView_.BufferLocation+sizeof(XMFLOAT4),sizeof(XMFLOAT4),0};
+    const D3D12_VERTEX_BUFFER_VIEW tree{instanceView_.BufferLocation+(objectIndex+1)*sizeof(XMFLOAT4),sizeof(XMFLOAT4),0};
     commands_->IASetVertexBuffers(1,1,&tree);
     const size_t firstIndex=cut.indexOffset;
     const UINT identity=static_cast<UINT>(cut.placements.size()-1);
-    for (const auto g:cut.used)
+    const auto& batches=cut.batches[objectIndex];
+    for (const auto g:batches.used)
     {
         const auto geometry=cut.geometry[g][slot];
         if (!geometry.indexCount) continue;
-        const auto& ids=cut.bins[g];
+        const auto& ids=batches.bins[g];
         const auto emit=[&](D3D12_GPU_VIRTUAL_ADDRESS address, UINT count) {
             const D3D12_VERTEX_BUFFER_VIEW stream{address,count*UINT(sizeof(MeshInstance)),sizeof(MeshInstance)};
             treeInstancedProxyDraws_.push_back(treeDraw(proxy,nullptr,geometry,count,0,stream));
@@ -3699,11 +3955,26 @@ void D3D12Renderer::selectTreeCut(const GpuTreePart& part, const ViewerScene& sc
                 if (node.firstPlacement>=region[0] && end<=regionEnd) return;
                 overlapsReplacement |= node.firstPlacement<regionEnd && region[0]<end;
             }
-        if (kind && !shadowPass && node.firstPlacement == boughFirst_ && node.placementCount == boughCount_)
+        const bool boughGroup = node.firstPlacement == boughFirst_ && node.placementCount == boughCount_;
+        if (kind == 3)
+        {
+            bool mixed = false;
+            if (mixedBoughVoxels_ && boughGroup && !shadowPass &&
+                projectLodError(node.error,node.bounds,matrix,frameView_,wind) <= scene.sprayTemplatePixelLimit * 0.9999f)
+                for (UINT slot = 0; slot < boughVoxelLevels_.size(); ++slot)
+                    if ((boughReplace_ & (1u << slot)) && part.bake->meshIndex == scene.sprayLods[slot]->meshIndex)
+                    {
+                        mixed = true;
+                        selectedBoughTrees_[slot].add(static_cast<UINT>(&object-scene.objects.data()));
+                    }
+            self(self, node.firstChild + (mixed ? 0 : 1), inside);
+            return;
+        }
+        if (kind && !mixedBoughVoxels_ && !shadowPass && boughGroup)
             for (UINT slot = 0; slot < 2; ++slot)
                 if ((boughReplace_ & (1u << slot)) && part.bake->meshIndex == boughVoxelLevels_[slot].meshIndex)
                 {
-                    boughCameraSelected_[slot] = true;
+                    selectedBoughTrees_[slot].add(static_cast<UINT>(&object-scene.objects.data()));
                     return;
                 }
         if (kind == 2)
@@ -4228,7 +4499,20 @@ D3D12Renderer::PassStats D3D12Renderer::drawMeshes(const ViewerScene& scene, boo
     const bool treeLod = scene.sprayTraversal == SprayTraversal::Hierarchy && scene.branchLod == automaticBranchLod;
     const bool materialCull = !shadowPass && scene.cullSprayWoodBackfaces && scene.sprayLods[1];
     const bool live = !shadowPass && visibility.count && treeLod && !liveCut_.nodes.empty();
-    if (live) selectLiveCut(scene,stats);
+    if (!shadowPass && timestampQueries_)
+        commands_->EndQuery(timestampQueries_.Get(),D3D12_QUERY_TYPE_TIMESTAMP,AssetStart);
+    if (live)
+    {
+        if (oakRaster_ != OakRaster::Live) liveGpu_.used = true;
+        else if (scene.liveCutGpu) dispatchLiveGpu(scene,stats);
+        else {
+            liveCut_.offset=liveCut_.indexOffset=0;
+            for (const auto range : visibility.ranges)
+                for (UINT id=range.first; id<range.first+range.count; ++id) selectLiveCut(scene,id,stats);
+        }
+    }
+    if (!shadowPass && timestampQueries_)
+        commands_->EndQuery(timestampQueries_.Get(),D3D12_QUERY_TYPE_TIMESTAMP,LiveCutEnd);
     auto& cameraMode = msaaEnabled_ ? multisample_ : singleSample_;
     if (materialCull && !cameraMode.oneSidedMesh.linear)
     {
@@ -4255,17 +4539,32 @@ D3D12Renderer::PassStats D3D12Renderer::drawMeshes(const ViewerScene& scene, boo
             if (i == woodIndex) buildTreeDepth();
         }
         const auto& flags = scene.meshShadows[i];
-        if (materialCull)
-            commands_->SetPipelineState((i == scene.sprayLods[1]->meshIndex ? cameraMode.oneSidedMesh : cameraMode.mesh).get(encodedCamera_));
+        if (materialCull || (live && scene.liveCutGpu))
+            commands_->SetPipelineState((materialCull && i == scene.sprayLods[1]->meshIndex ? cameraMode.oneSidedMesh : cameraMode.mesh).get(encodedCamera_));
         if (shadowPass && !flags.cast) continue;
         if (batchedTrees && treeParts_[i].bake) continue;
 
         const auto& mesh = meshes_[i];
         const auto& material = scene.asset->materials[mesh.material];
+        if (!shadowPass && oakRaster_ != OakRaster::Live)
+        {
+            if (material.alphaCutoff >= 0 || !live || !treeParts_[i].bake)
+                throw std::runtime_error("Oak raster replay requires a fully replaced, opaque oak.");
+            if (oakRaster_ >= OakRaster::Depth)
+            {
+                const bool cull = cullMeshBackfaces_ || (materialCull && i == scene.sprayLods[1]->meshIndex);
+                commands_->SetPipelineState(oakRasterPipelines_[int(oakRaster_) - int(OakRaster::Depth)][cull].Get());
+            }
+        }
         if (live && treeParts_[i].bake)
         {
             const UINT part = i == scene.sprayLods[0]->meshIndex ? 0 : i == scene.sprayLods[1]->meshIndex ? 1 : 2;
-            drawLiveCut(scene,i,part,stats);
+            for (const auto range : visibility.ranges)
+                for (UINT id=range.first; id<range.first+range.count; ++id)
+                {
+                    if (scene.liveCutGpu) drawLiveGpu(scene,i,part,id,stats);
+                    else drawLiveCut(scene,i,part,id,stats);
+                }
             commands_->IASetVertexBuffers(1,1,&instanceView_);
             if (liveCut_.replace & (1u<<part)) continue;
         }
@@ -4414,6 +4713,23 @@ D3D12Renderer::PassStats D3D12Renderer::drawMeshes(const ViewerScene& scene, boo
         treeDepthReady_ = false;
     }
     if (materialCull) commands_->SetPipelineState(cameraMode.mesh.get(encodedCamera_));
+    if (!shadowPass && timestampQueries_)
+        commands_->EndQuery(timestampQueries_.Get(),D3D12_QUERY_TYPE_TIMESTAMP,AssetEnd);
+    if (!shadowPass && oakRaster_ != OakRaster::Live)
+    {
+        if (scene.cameraPipelineStats)
+            commands_->EndQuery(cameraPipelineQuery_.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
+        if (validateOakRaster_)
+        {
+            copyFrameColor(cameraMode.depthBuffer.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                           D3D12_RESOURCE_STATE_DEPTH_WRITE, oakDepthReadback_);
+            if (oakRaster_ == OakRaster::Visibility)
+                copyFrameColor(oakIds_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET, oakIdReadback_);
+        }
+        commands_->OMSetRenderTargets(1, &sceneTarget_, FALSE, &cameraMode.depthTarget);
+        commands_->SetPipelineState(cameraMode.mesh.linear.Get());
+    }
     if (shadowPass ? scene.groundShadows.cast : !captureGeometryMask_)
     {
         stats.triangles += drawMesh(ground_, scene.groundMaterial, false, scene.groundShadows.receive, 1, 0);
@@ -4512,6 +4828,7 @@ void D3D12Renderer::waitForGpu()
     {
         check(HRESULT_FROM_WIN32(GetLastError()), "Wait for frame completion");
     }
+
 }
 
 void D3D12Renderer::createFrameTimer()
@@ -4559,6 +4876,10 @@ void D3D12Renderer::readGpuTimes(FrameTiming& timing) const
     timing.gpuProbeMilliseconds = elapsed(FrameStart, ProbeEnd);
     timing.gpuShadowMilliseconds = elapsed(ShadowStart, ShadowEnd);
     timing.gpuCameraMilliseconds = elapsed(ShadowEnd, CameraEnd);
+    timing.gpuAssetMilliseconds = elapsed(AssetStart, AssetEnd);
+    if (timing.camera.voxelBricks && !boughVoxelPath_.empty())
+        timing.gpuBoughBrickMilliseconds = elapsed(BoughBrickStart, BoughBrickEnd);
+    timing.gpuLiveCutMilliseconds = elapsed(AssetStart, LiveCutEnd);
     if (timing.camera.treeOcclusionActive)
         timing.camera.treePyramidGpuMilliseconds += elapsed(TreeDepthStart, TreeDepthEnd);
     const D3D12_RANGE noWrites{0, 0};

@@ -1,0 +1,473 @@
+--- a/shaders/Mesh.hlsl
++++ b/shaders/Mesh.hlsl
+@@ -5,7 +5,7 @@
+ cbuffer DrawConstants : register(b0)
+ {
+     row_major float4x4 model;
+-    row_major float4x4 normalToWorld;
++    row_major float3x4 normalToWorld;
+     float4 surfaceColor;
+     uint textureCoordinateSet;
+     uint hasColorTexture;
+@@ -22,6 +22,8 @@
+     uint usesMeshInstances;
+     float3 transmissionColor;
+     uint transmissionFlags;
++    float bladeNormalScale;
++    float bladeRoughness;
+ };
+ 
+ cbuffer FrameConstants : register(b1)
+@@ -51,6 +53,7 @@
+     float4 probeOriginSpacing;
+     uint4 probeSize;
+     float4 studyEye;
++    float4 meadowCascadeTexels;
+ };
+ 
+ Texture2D<float4> colorTexture : register(t0);
+@@ -61,6 +64,7 @@
+ Texture2DArray<float> cascadeShadowMaps : register(t3);
+ Texture2D<float4> transmissionColorTexture : register(t4);
+ Texture2D<float4> transmissionStrengthTexture : register(t5);
++Texture2D<float4> detailTexture : register(t7);
+ 
+ struct VertexInput
+ {
+@@ -148,7 +152,7 @@
+     {
+         normal = rotateMeshInstance(normal / input.meshScale, input.meshRotation);
+     }
+-    output.worldNormal = mul(float4(normal, 0.0), normalToWorld).xyz;
++    output.worldNormal = mul(normal, normalToWorld).xyz;
+     output.worldNormal.xz = rotateXZ(output.worldNormal.xz, input.instance.z);
+     // The normal's Y component changes under the horizontal shear.
+     output.worldNormal.y -= dot(bendSlope, output.worldNormal.xz);
+@@ -200,6 +204,35 @@
+     }
+ }
+ 
++float3 bladeShadingNormal(float3 position, float3 n, float2 uv)
++{
++    float3 dx = ddx(position), dy = ddy(position);
++    float2 du = ddx(uv), dv = ddy(uv);
++    float det = du.x * dv.y - du.y * dv.x;
++    float3 t = (dx * dv.y - dy * du.y) * sign(det);
++    t -= n * dot(n, t);
++    if (dot(t,t) < 1e-26 || abs(det) < 1e-18) return n;
++    t = normalize(t);
++    float3 b = cross(n,t);
++    b *= sign(dot(b, (dy * du.x - dx * dv.x) * sign(det)));
++    float3 map = 2.0 * detailTexture.SampleGrad(colorSampler, uv, du, dv).xyz - 1.0;
++    return normalize(t * map.x * bladeNormalScale + b * map.y * bladeNormalScale + n * map.z);
++}
++
++float bladeSunReflection(float3 n, float3 v, float roughness)
++{
++    float nl = saturate(dot(n,toSun)), nv = saturate(dot(n,v));
++    if (min(nl,nv) <= 0.0) return 0.0;
++    float3 h = normalize(toSun + v);
++    float nh = saturate(dot(n,h)), vh = saturate(dot(v,h));
++    float a2 = max(pow(roughness, 4.0), 1e-4);
++    float d = 1.0 + nh*nh*(a2-1.0);
++    float smith = 0.5 / max(nl*sqrt(a2+(1-a2)*nv*nv) + nv*sqrt(a2+(1-a2)*nl*nl), 1e-5);
++    // Dielectric cuticle with the Blender material's IOR of 1.42.
++    float fresnel = 0.0301 + 0.9699*pow(1.0-vh,5.0);
++    return 0.65 * nl * (a2/(d*d)) * smith * fresnel;
++}
++
+ float sunVisibility(float4 lightPosition, float3 worldNormal, float normalToSun)
+ {
+     if (normalBiasWorld > 0.0)
+@@ -234,6 +267,53 @@
+     if (any(uv < 0.0) || any(uv > 1.0) || projected.z < 0.0 || projected.z > 1.0) return 1.0;
+     float3 location = float3(uv, cascade);
+     float reference = projected.z - cascadeShadowBias[cascade];
++    if (meadowCascadeTexels.w && cascade < 2)
++    {
++        uint width,height,layers;
++        cascadeShadowMaps.GetDimensions(width,height,layers);
++        float texel = meadowCascadeTexels[cascade];
++        float depthPerMetre = cascadeDepthPerTexel[cascade] / texel;
++        float separation = 0.0, blockers = 0.0;
++        // Search for blockers in world space. A high canopy casts a wider penumbra
++        // than a blade touching the receiver, for the same angular sun radius.
++        [unroll] for (uint i=0; i<12; ++i)
++        {
++            float angle = 2.39996323*i;
++            float2 delta = float2(cos(angle),sin(angle))*sqrt(i/11.0)*(0.055/texel);
++            int2 px = clamp(int2((uv*width)+delta),0,int(width)-1);
++            float z = cascadeShadowMaps.Load(int4(px,cascade,0));
++            float gap = (reference + dot(receiverSlope,delta)*cascadeDepthPerTexel[cascade] - z)/depthPerMetre;
++            if (gap>0.002) { separation += gap; blockers += 1.0; }
++        }
++        float radius = min(0.075,0.00465*separation/max(blockers,1.0))/texel;
++        if (radius > 1.5)
++        {
++            // A distant canopy blocker can set the disk size even when a blade
++            // touches the receiver. Retain the coverage of nearby blockers.
++            float2 p = uv*width - 0.5;
++            int2 origin = int2(floor(p));
++            float2 fracPart = frac(p);
++            float contact = 1.0;
++            [unroll] for (uint k=0; k<4; ++k)
++            {
++                int2 offset = int2(k&1,k>>1);
++                float2 delta = float2(offset)-fracPart;
++                float z = cascadeShadowMaps.Load(int4(clamp(origin+offset,0,int(width)-1),cascade,0));
++                float gap = (reference+dot(receiverSlope,delta)*cascadeDepthPerTexel[cascade]-z)/depthPerMetre;
++                float2 weight = lerp(1.0-fracPart,fracPart,float2(offset));
++                if (gap > 0.0) contact -= weight.x*weight.y*(1.0-smoothstep(0.12,0.48,gap));
++            }
++            float sum = 0;
++            [loop] for (uint j=0; j<80; ++j)
++            {
++                float angle = 2.39996323*j;
++                float2 delta = float2(cos(angle),sin(angle))*sqrt((j+0.5)/80.0)*radius;
++                sum += cascadeShadowMaps.SampleCmpLevelZero(shadowSampler,float3(uv+delta/width,cascade),
++                           reference+dot(receiverSlope,delta)*cascadeDepthPerTexel[cascade]);
++            }
++            return saturate(contact)*sum/80.0;
++        }
++    }
+     [branch] if (filterCascades)
+     {
+         // Compare each bilinear tap at the depth of the receiver plane at that tap.
+@@ -394,6 +474,18 @@
+             tint *= transmissionColorTexture.Sample(colorSampler, colorUv == 1 ? input.texcoords.xy : input.texcoords.zw).rgb;
+         if (strengthUv)
+             fraction *= transmissionStrengthTexture.Sample(colorSampler, strengthUv == 1 ? input.texcoords.xy : input.texcoords.zw).a;
++        const uint normalUv = (transmissionFlags >> 7) & 3u;
++        float sunGlint = 0.0;
++        if (normalUv)
++        {
++            const float side = twoSidedNormalSign ? (isFrontFace ? 1.0 : -1.0) * twoSidedNormalSign : 1.0;
++            worldNormal = side * bladeShadingNormal(input.worldPositionAndViewDepth.xyz, side * worldNormal,
++                                normalUv == 1 ? input.texcoords.xy : input.texcoords.zw);
++            normalToSun = dot(worldNormal,toSun);
++            if (lightingMode != skyOnly && lightingMode != transmissionOnly)
++                sunGlint = visibility * bladeSunReflection(worldNormal,
++                    normalize(studyEye.xyz - input.worldPositionAndViewDepth.xyz), bladeRoughness);
++        }
+         LeafIncidentLight light = leafIncidentLight(worldNormal, normalToSun, directionalSkylight);
+         const LeafIncidentLight openLight = light;
+         localDiffuse(input.worldPositionAndViewDepth.xyz, worldNormal, probeOriginSpacing,
+@@ -404,7 +496,7 @@
+             return float4(studyLeaf(light, openLight, visibility, baseColor.rgb, tint, fraction,
+                                     worldNormal, v, toSun, lightingMode), 1.0);
+         }
+-        return float4(shadeLeaf(light, visibility, lightingMode, baseColor.rgb, tint, fraction), 1.0);
++        return float4(shadeLeaf(light, visibility, lightingMode, baseColor.rgb, tint, fraction) + sunGlint, 1.0);
+     }
+     if (lightingMode == transmissionOnly) return float4(0, 0, 0, 1);
+     float3 ambient = lightingMode == sunOnly ? 0.0 : directionalSkylight ? evaluateSkylight(worldNormal) : 0.35;
+@@ -412,6 +504,13 @@
+     localDiffuse(input.worldPositionAndViewDepth.xyz, worldNormal, probeOriginSpacing, probeSize.xyz,
+                  false, ambient, unusedBack);
+     const float direct = lightingMode == skyOnly ? 0.0 : 0.65 * diffuse * visibility;
++    if (transmissionFlags & 512u)
++    {
++        // Registered, linear sky visibility from the actual stationary grass.
++        float2 soilUv = (input.worldPositionAndViewDepth.xz + float2(11,2)) / float2(18,9);
++        if (all(soilUv>=0) && all(soilUv<=1))
++            ambient *= detailTexture.Sample(colorSampler,soilUv).r;
++    }
+     float3 lit = baseColor.rgb * (ambient + direct);
+     if (transmissionFlags & 64u)
+         lit = studyTwig(baseColor.rgb, ambient, direct, normalToSun, visibility);
+--- a/src/MeshData.h
++++ b/src/MeshData.h
+@@ -70,6 +70,10 @@
+     bool hasBacklighting = false;
+     bool twoSidedTransmission = false;
+     std::optional<DiffuseTransmission> diffuseTransmission;
++    std::optional<TransmissionTexture> bladeNormal;
++    std::optional<std::size_t> soilSkyVisibility;
++    float normalScale = 1.0f;
++    float roughness = 1.0f;
+ };
+ 
+ struct TextureMip
+@@ -85,6 +89,7 @@
+ {
+     std::string name;
+     TextureData mips;
++    bool linearData = false;
+ };
+ 
+ struct AssetData
+--- a/src/TextureLoader.h
++++ b/src/TextureLoader.h
+@@ -5,5 +5,5 @@
+ #include <filesystem>
+ #include <span>
+ 
+-TextureData loadColorTexture(std::span<const std::uint8_t> encoded, float coverageCutoff);
+-TextureData loadColorTexture(const std::filesystem::path& path);
++TextureData loadColorTexture(std::span<const std::uint8_t> encoded, float coverageCutoff, bool linearData = false);
++TextureData loadColorTexture(const std::filesystem::path& path, bool linearData = false);
+--- a/src/TextureLoader.cpp
++++ b/src/TextureLoader.cpp
+@@ -90,7 +90,7 @@
+     return toByte(encoded * 255.0f);
+ }
+ 
+-TextureMip downsample(const TextureMip& source, bool masked)
++TextureMip downsample(const TextureMip& source, bool masked, bool linearData)
+ {
+     static const auto linearRgb = [] {
+         std::array<float, 256> table{};
+@@ -126,7 +126,7 @@
+                     alpha += weight;
+                     for (int channel = 0; channel < 3; ++channel)
+                     {
+-                        const float linear = linearRgb[pixel[channel]];
++                        const float linear = linearData ? pixel[channel] / 255.0f : linearRgb[pixel[channel]];
+                         weightedRgb[channel] += linear * weight;
+                         rgb[channel] += linear;
+                     }
+@@ -137,7 +137,7 @@
+             {
+                 const float linear = masked && alpha > 0.0f ? weightedRgb[channel] / alpha
+                                                              : rgb[channel] / count;
+-                pixel[channel] = encodeSrgb(linear);
++                pixel[channel] = linearData ? toByte(255.0f * linear) : encodeSrgb(linear);
+             }
+             pixel[3] = toByte(alpha / count);
+         }
+@@ -212,14 +212,14 @@
+ }
+ }
+ 
+-TextureData loadColorTexture(std::span<const std::uint8_t> encoded, float coverageCutoff)
++TextureData loadColorTexture(std::span<const std::uint8_t> encoded, float coverageCutoff, bool linearData)
+ {
+     TextureData mips;
+     mips.push_back(decodeImage(encoded));
+     const bool masked = coverageCutoff > 0.0f && coverageCutoff <= 1.0f;
+     while (mips.back().width > 1 || mips.back().height > 1)
+     {
+-        mips.push_back(downsample(mips.back(), masked));
++        mips.push_back(downsample(mips.back(), masked, linearData));
+     }
+     if (masked)
+     {
+@@ -228,7 +228,7 @@
+     return mips;
+ }
+ 
+-TextureData loadColorTexture(const std::filesystem::path& path)
++TextureData loadColorTexture(const std::filesystem::path& path, bool linearData)
+ {
+     std::ifstream file(path, std::ios::binary | std::ios::ate);
+     if (!file) throw std::runtime_error("Could not open texture: " + path.filename().string());
+@@ -239,5 +239,5 @@
+     file.seekg(0);
+     if (!file.read(reinterpret_cast<char*>(encoded.data()), size))
+         throw std::runtime_error("Could not read texture: " + path.filename().string());
+-    return loadColorTexture(encoded, -1.0f);
+-}
++    return loadColorTexture(encoded, -1.0f, linearData);
++}
+--- a/src/GltfLoader.cpp
++++ b/src/GltfLoader.cpp
+@@ -169,7 +169,7 @@
+ }
+ 
+ TransmissionTexture readMaterialTexture(const cgltf_texture_view& view, AssetData& asset,
+-                                        std::string_view label, float coverageCutoff = -1.0f)
++                                        std::string_view label, float coverageCutoff = -1.0f, bool linearData = false)
+ {
+     if (view.has_transform || view.texcoord < 0 || view.texcoord > 1)
+         throw std::runtime_error(std::string(label) + " needs untransformed TEXCOORD_0 or TEXCOORD_1.");
+@@ -181,7 +181,7 @@
+     if (!encoded) throw std::runtime_error("Could not read the embedded material texture.");
+     const auto index = asset.textures.size();
+     asset.textures.push_back({image->name ? std::string(image->name) : std::string(label),
+-                              loadColorTexture({encoded, image->buffer_view->size}, coverageCutoff)});
++                              loadColorTexture({encoded, image->buffer_view->size}, coverageCutoff, linearData), linearData});
+     return {index, static_cast<std::uint32_t>(view.texcoord)};
+ }
+ 
+@@ -216,6 +216,12 @@
+         return material;
+     }
+     const auto& pbr = source.pbr_metallic_roughness;
++    if (material.name.starts_with("Lamina |") && source.normal_texture.texture)
++    {
++        material.bladeNormal = readMaterialTexture(source.normal_texture, asset, "Blade normal", -1.0f, true);
++        material.normalScale = source.normal_texture.scale;
++        material.roughness = pbr.roughness_factor;
++    }
+     material.color = DirectX::XMFLOAT4(pbr.base_color_factor);
+     const auto& view = pbr.base_color_texture;
+     if (!view.texture)
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -83,7 +83,7 @@
+ struct DrawConstants
+ {
+     XMFLOAT4X4 model;
+-    XMFLOAT4X4 normalToWorld;
++    XMFLOAT3X4 normalToWorld;
+     XMFLOAT4 surfaceColor;
+     UINT textureCoordinateSet;
+     UINT hasColorTexture;
+@@ -100,6 +100,8 @@
+     UINT usesMeshInstances;
+     XMFLOAT3 transmissionColor;
+     UINT transmissionFlags;
++    float bladeNormalScale;
++    float bladeRoughness;
+ };
+ 
+ struct FrameConstants
+@@ -128,6 +130,7 @@
+     UINT probePadding;
+     DiffuseProbeGrid probes;
+     XMFLOAT4 studyEye;
++    XMFLOAT4 meadowCascadeTexels;
+ };
+ 
+ struct VoxelFrameConstants
+@@ -188,7 +191,7 @@
+     2, 6, 7, 2, 7, 3, 0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6};
+ 
+ constexpr UINT drawConstantCount = sizeof(DrawConstants) / sizeof(float);
+-static_assert(drawConstantCount == 53);
++static_assert(drawConstantCount == 51);
+ 
+ std::array<XMVECTOR, 6> frustumPlanes(FXMMATRIX viewProjection)
+ {
+@@ -1540,13 +1543,13 @@
+     const float tanDiagonalSquared = tanHalfX * tanHalfX + tanHalfY * tanHalfY;
+     const bool stabilized = scene.stabilizeSunCascades;
+     const float normalBiasTexels = scene.shadowBias.normalTexels;
+-    float splitStart = std::min(cameraNearPlane_, sunCascadeSplits.front());
++    float splitStart = std::min(cameraNearPlane_, scene.shadowSplits.front());
+     for (std::size_t cascade = 0; cascade < sunCascadeSplits.size(); ++cascade)
+     {
+-        const float splitEnd = sunCascadeSplits[cascade];
++        const float splitEnd = scene.shadowSplits[cascade];
+         // Include the previous split's transition strip in the incoming map.
+         const float fitStart = scene.blendSunCascades && cascade != 0 ?
+-            std::max(std::min(cameraNearPlane_, splitStart), splitStart - sunCascadeBlendWidths[cascade - 1]) : splitStart;
++            std::max(std::min(cameraNearPlane_, splitStart), splitStart - scene.shadowBlendWidths[cascade - 1]) : splitStart;
+         auto lower = XMVectorReplicate(std::numeric_limits<float>::max());
+         auto upper = -lower;
+         float width;
+@@ -1678,7 +1681,12 @@
+     transmissionStrength.BaseShaderRegister = 5;
+     D3D12_DESCRIPTOR_RANGE probeView = colorTexture;
+     probeView.BaseShaderRegister = 6;
+-    D3D12_ROOT_PARAMETER parameters[9]{};
++    D3D12_DESCRIPTOR_RANGE bladeNormal = colorTexture;
++    bladeNormal.BaseShaderRegister = 7;
++    D3D12_ROOT_PARAMETER parameters[10]{};
++    parameters[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[9].DescriptorTable = {1, &bladeNormal};
++    parameters[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     parameters[0].Constants.Num32BitValues = drawConstantCount;
+     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+@@ -2449,6 +2457,7 @@
+     {
+         const auto& mips = texture.mips;
+         textures_.push_back(uploadTexture(mips, staging));
++        view.Format = texture.linearData ? DXGI_FORMAT_R8G8B8A8_UNORM : colorTextureFormat;
+         handle.ptr += textureDescriptorSize_;
+         view.Texture2D.MipLevels = static_cast<UINT>(mips.size());
+         device_->CreateShaderResourceView(textures_.back().Get(), &view, handle);
+@@ -2889,11 +2898,14 @@
+     if (probesActive_) constants.probes = probeGrid_;
+     if (constants.useCascades)
+     {
+-        constants.cascadeSplits = {sunCascadeSplits[0], sunCascadeSplits[1], sunCascadeSplits[2], 0};
++        constants.cascadeSplits = {scene.shadowSplits[0], scene.shadowSplits[1], scene.shadowSplits[2], 0};
+         constants.filterCascades = scene.filterSunCascades;
+         if (scene.blendSunCascades)
+-            constants.cascadeBlendWidths = {sunCascadeBlendWidths[0], sunCascadeBlendWidths[1], sunCascadeBlendWidths[2], 0};
++            constants.cascadeBlendWidths = {scene.shadowBlendWidths[0], scene.shadowBlendWidths[1], scene.shadowBlendWidths[2], 0};
+         constants.cascadeViewProjections = cascadeViewProjections_;
++        if (scene.groundMaterial.soilSkyVisibility)
++            constants.meadowCascadeTexels = {cascadeWorldUnitsPerTexel_[0],cascadeWorldUnitsPerTexel_[1],
++                                             cascadeWorldUnitsPerTexel_[2],1.0f};
+         constants.cascadeDepthPerTexel = {cascadeDepthPerTexel_[0], cascadeDepthPerTexel_[1], cascadeDepthPerTexel_[2], 0};
+         constants.lightRight = {sunRotation_._11, sunRotation_._21, sunRotation_._31, 0};
+         constants.cascadeShadowBias = {scene.shadowBias.samplingTexels * cascadeDepthPerTexel_[0],
+@@ -4764,7 +4776,8 @@
+ {
+     DrawConstants constants{};
+     constants.model = mesh.localToWorld;
+-    constants.normalToWorld = mesh.normalToWorld;
++    // Only the three direction rows are needed for normals.
++    std::memcpy(&constants.normalToWorld, &mesh.normalToWorld, sizeof(constants.normalToWorld));
+     constants.surfaceColor = material.color;
+     constants.textureCoordinateSet = material.textureCoordinateSet;
+     constants.hasColorTexture = material.colorTexture.has_value();
+@@ -4814,6 +4827,18 @@
+     static const bool study = GetEnvironmentVariableW(L"OAK_LIGHTING_STUDY_BASELINE", nullptr, 0) == 0;
+     if (study && material.name == "White Oak Leaves") constants.transmissionFlags |= 32u;
+     if (study && material.name == "M_Oak_Twig") constants.transmissionFlags |= 64u;
++    static const bool bladeSurface = !GetEnvironmentVariableW(L"MEADOW_MATERIAL_CONTROL", nullptr, 0);
++    std::optional<std::size_t> bladeNormal;
++    if (bladeSurface && material.bladeNormal)
++    {
++        bladeNormal = material.bladeNormal->index;
++        constants.transmissionFlags |= (material.bladeNormal->texcoord + 1u) << 7;
++        constants.bladeNormalScale = material.normalScale;
++        constants.bladeRoughness = material.roughness;
++    }
++    // A receiving ground draw and a blade draw use mutually exclusive surface maps.
++    if (material.soilSkyVisibility) constants.transmissionFlags |= 512u;
++    commands_->SetGraphicsRootDescriptorTable(9, textureHandle(material.soilSkyVisibility ? material.soilSkyVisibility : bladeNormal));
+     commands_->SetGraphicsRoot32BitConstants(0, drawConstantCount, &constants, 0);
+     commands_->SetGraphicsRootDescriptorTable(1, textureHandle(material.colorTexture));
+     commands_->SetGraphicsRootDescriptorTable(6, textureHandle(transmissionColor));
+--- a/src/ViewerScene.h
++++ b/src/ViewerScene.h
+@@ -255,6 +255,8 @@
+     bool legacyAmbientForDiagnostics = false;
+     bool captureForceBough = false;
+     bool useSunCascades = false;
++    std::array<float,3> shadowSplits = sunCascadeSplits;
++    std::array<float,3> shadowBlendWidths = sunCascadeBlendWidths;
+     bool stabilizeSunCascades = true;
+     bool blendSunCascades = true;
+     bool filterSunCascades = true;
+--- a/src/ViewerScene.cpp
++++ b/src/ViewerScene.cpp
+@@ -1,11 +1,13 @@
+ #include "ViewerScene.h"
+ 
+ #include "GltfLoader.h"
++#include "TextureLoader.h"
+ #include "SourceFingerprint.h"
+ 
+ #include <algorithm>
+ #include <bit>
+ #include <cmath>
++#include <Windows.h>
+ #include <limits>
+ #include <fstream>
+ #include <sstream>
+@@ -626,6 +628,19 @@
+         }
+     }
+     scene.groundMaterial.name = "Ground";
++    if (std::ranges::any_of(scene.asset->materials, [](const auto& m) { return m.name.starts_with("Lamina |"); })
++        && !GetEnvironmentVariableW(L"MEADOW_SHADOW_CONTROL", nullptr, 0))
++    {
++        scene.useSunCascades = true;
++        scene.shadowSplits = {3.0f, 12.0f, 120.0f};
++        scene.shadowBlendWidths = {0.5f, 2.0f, 8.0f};
++        const auto map = scene.source.parent_path() / "MeadowGroundVisibility.png";
++        if (std::filesystem::is_regular_file(map))
++        {
++            scene.groundMaterial.soilSkyVisibility = scene.asset->textures.size();
++            scene.asset->textures.push_back({"Grass sky visibility",loadColorTexture(map,true),true});
++        }
++    }
+     scene.groundMaterial.color = {0.30f, 0.36f, 0.30f, 1.0f};
+     return entry.emplace(std::move(scene));
+ }

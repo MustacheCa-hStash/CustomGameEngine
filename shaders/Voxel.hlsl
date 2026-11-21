@@ -33,6 +33,10 @@ cbuffer Frame : register(b0)
     float4 probeOriginSpacing;
     uint4 probeSize;
     float4 boughWind;
+    float4 treePlacement;
+    float4 screenRayX, screenRayY, screenRayForward;
+    float2 rasterSize;
+    float2 rasterPadding;
 };
 
 cbuffer Draw : register(b1)
@@ -77,11 +81,27 @@ float2 rotateXZ(float2 xz, float angle)
     return float2(c * xz.x + s * xz.y, -s * xz.x + c * xz.y);
 }
 
+void brickBasis(uint axes, float4 placement, out float3 base, out float3 a, out float3 b, out float3 c)
+{
+    base = placements[axes].xyz; a = placements[axes+1].xyz;
+    b = placements[axes+2].xyz; c = placements[axes+3].xyz;
+    float height = (base.y - boughWind.z) * boughWind.w;
+    float weight = saturate(height);
+    float2 wind = rotateXZ(boughWind.xy, -placement.z);
+    float2 slope = height > 0 && height < 1 ? 2 * weight * boughWind.w * wind : 0;
+    base.xz += weight * weight * wind;
+    a.xz += a.y * slope; b.xz += b.y * slope; c.xz += c.y * slope;
+    base.xz = rotateXZ(base.xz,placement.z); base *= placement.w; base.xz += placement.xy;
+    a.xz = rotateXZ(a.xz,placement.z); a *= placement.w;
+    b.xz = rotateXZ(b.xz,placement.z); b *= placement.w;
+    c.xz = rotateXZ(c.xz,placement.z); c *= placement.w;
+}
+
 Pixel VSMain(uint vertex : SV_VertexID, uint instance : SV_InstanceID)
 {
     const Brick brick = bricks[instance % brickCount];
     const uint axes = 4 * (instance % brickCount);
-    const float4 placement = orientedBricks ? float4(0,0,0,1) : placements[firstPlacement + instance / brickCount];
+    const float4 placement = orientedBricks ? treePlacement : placements[firstPlacement + instance / brickCount];
     const float3 lower = origin + float3(brick.coordinate) * (4.0 * cellSize);
     // Reverse the winding if the mesh transform mirrors the local grid.
     const uint corner = vertex ^ (orientedBricks ? uint(placements[axes].w) : mirrored);
@@ -104,13 +124,8 @@ Pixel VSMain(uint vertex : SV_VertexID, uint instance : SV_InstanceID)
     float3 orientedEye = 0;
     if (orientedBricks)
     {
-        float3 base = placements[axes].xyz, a = placements[axes+1].xyz;
-        float3 b = placements[axes+2].xyz, c = placements[axes+3].xyz;
-        float height = (base.y - boughWind.z) * boughWind.w;
-        float weight = saturate(height);
-        float2 slope = height > 0 && height < 1 ? 2 * weight * boughWind.w * boughWind.xy : 0;
-        base.xz += weight * weight * boughWind.xy;
-        a.xz += a.y * slope; b.xz += b.y * slope; c.xz += c.y * slope;
+        float3 base,a,b,c;
+        brickBasis(axes,placement,base,a,b,c);
         world = base + output.backInCells.x * a + output.backInCells.y * b + output.backInCells.z * c;
         float3 delta = eye - base;
         orientedEye = float3(dot(delta,cross(b,c)),dot(delta,cross(c,a)),dot(delta,cross(a,b))) / dot(a,cross(b,c));
@@ -271,17 +286,8 @@ struct Output
     float depth : SV_Depth;
 };
 
-Output PSMain(Pixel input)
+Output shadeCell(Pixel input, float3 path, float lengthToBack, float backViewDepth, float hit, float hitExit, uint hitBit)
 {
-    const float3 path = input.backInCells - input.eyeInCells;
-    const float lengthToBack = length(path);
-    const float backViewDepth = input.worldAndViewDepth.w;
-    if (lengthToBack <= 0 || backViewDepth <= 0) discard;
-    float hit, hitExit;
-    uint hitBit;
-    if (!firstOccupied(input.backInCells, path / lengthToBack,
-                       (nearPlane / backViewDepth - 1) * lengthToBack,
-                       min(0, (farPlane / backViewDepth - 1) * lengthToBack), input.mask, hit, hitExit, hitBit)) discard;
     const float offset = (orientedBricks ? 0.5 * (hit + hitExit) : hit) / lengthToBack;
     const float viewDepth = clamp(backViewDepth * (1 + offset), nearPlane, farPlane);
     Output output;
@@ -402,4 +408,18 @@ Output PSMain(Pixel input)
     float3 lit = baseColor * (ambient + direct);
     output.color = float4(encodedCamera ? displayColor(saturate(lit)) : lit, 1);
     return output;
+}
+
+Output PSMain(Pixel input)
+{
+    const float3 path = input.backInCells - input.eyeInCells;
+    const float lengthToBack = length(path);
+    const float backViewDepth = input.worldAndViewDepth.w;
+    if (lengthToBack <= 0 || backViewDepth <= 0) discard;
+    float hit, hitExit;
+    uint hitBit;
+    if (!firstOccupied(input.backInCells, path / lengthToBack,
+                       (nearPlane / backViewDepth - 1) * lengthToBack,
+                       min(0, (farPlane / backViewDepth - 1) * lengthToBack), input.mask, hit, hitExit, hitBit)) discard;
+    return shadeCell(input,path,lengthToBack,backViewDepth,hit,hitExit,hitBit);
 }

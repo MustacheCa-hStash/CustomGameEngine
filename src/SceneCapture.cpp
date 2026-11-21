@@ -5,6 +5,8 @@
 
 #include <wincodec.h>
 
+#include <algorithm>
+#include <bit>
 #include <cmath>
 #include <chrono>
 #include <cstring>
@@ -53,6 +55,7 @@ struct CaptureOptions
     std::optional<float> sprayTemplatePixelLimit;
     fs::path boughBake;
     UINT timingSamples = 0;
+    bool sequenceTimingsOnly = false;
     std::optional<float> sunAzimuth;
     std::optional<float> sunElevation;
     std::optional<float> backlighting;
@@ -63,14 +66,18 @@ struct CaptureOptions
     bool cullSprayWoodBackfaces = false;
     fs::path boughVoxelBake;
     fs::path liveCut;
+    bool liveCutGpu = false;
+    bool profileOakRaster = false;
     bool liveCutUnbatched = false;
     bool liveCutPackAssembly = false;
     bool cameraPipelineStats = false;
     float liveCutPixelError = 1.0f;
+    std::optional<float> liveCutErrorDistanceProduct;
+    bool softwareBoughRaster = false;
     bool boughDepth = false;
     bool boughMaterials = false;
     CaptureLighting lighting = CaptureLighting::Combined;
-    ProbeLightingMode probeLighting = ProbeLightingMode::Off;
+    std::optional<ProbeLightingMode> probeLighting;
     std::optional<float> probeWindRefreshVoxels;
     bool forceBough = false;
 };
@@ -94,6 +101,11 @@ CaptureOptions parseOptions(std::span<wchar_t* const> args)
     for (std::size_t i = 0; i < args.size(); ++i)
     {
         const std::wstring_view flag = args[i];
+        if (flag == L"--sequence-timings-only")
+        {
+            options.sequenceTimingsOnly = true;
+            continue;
+        }
         if (flag == L"--animate-wind")
         {
             options.animateWind = true;
@@ -119,12 +131,15 @@ CaptureOptions parseOptions(std::span<wchar_t* const> args)
             options.cullSprayWoodBackfaces = true;
             continue;
         }
+        if (flag == L"--brick-raster") { options.softwareBoughRaster = true; continue; }
         if (flag == L"--bough-depth")
         {
             options.boughDepth = true;
             continue;
         }
         if (flag == L"--bough-materials") { options.boughMaterials = true; continue; }
+        if (flag == L"--live-cut-gpu") { options.liveCutGpu = true; continue; }
+        if (flag == L"--profile-oak-raster") { options.profileOakRaster = true; continue; }
         if (flag == L"--live-cut-unbatched") { options.liveCutUnbatched = true; continue; }
         if (flag == L"--live-cut-pack-assembly") { options.liveCutPackAssembly = true; continue; }
         if (flag == L"--camera-pipeline-stats") { options.cameraPipelineStats = true; continue; }
@@ -152,6 +167,8 @@ CaptureOptions parseOptions(std::span<wchar_t* const> args)
         else if (flag == L"--bough-voxel-bake") options.boughVoxelBake = value;
         else if (flag == L"--live-cut") options.liveCut = value;
         else if (flag == L"--live-cut-pixel-error") options.liveCutPixelError = static_cast<float>(number(value,.001,16,"--live-cut-pixel-error"));
+        else if (flag == L"--live-cut-error-distance-product")
+            options.liveCutErrorDistanceProduct = static_cast<float>(number(value,.001,1e6,"--live-cut-error-distance-product"));
         else if (flag == L"--camera")
         {
             if (choice == L"overview") options.camera = CameraPreset::Overview;
@@ -287,6 +304,10 @@ CaptureOptions parseOptions(std::span<wchar_t* const> args)
         }
         else throw std::runtime_error("Unknown capture option. See Windowless scene capture in README.md.");
     }
+    if (options.liveCutErrorDistanceProduct && (options.frames < 2 || options.liveCut.empty()))
+        throw std::runtime_error("--live-cut-error-distance-product requires a live-cut sequence.");
+    if (options.sequenceTimingsOnly && options.frames < 2)
+        throw std::runtime_error("--sequence-timings-only requires a camera sequence.");
     if (options.frames == 1 && (options.orbitDegrees != 0 || options.endDistance || options.endPitch || options.animateWind))
         throw std::runtime_error("Motion options require --frames greater than 1. Use --wind-time for a fixed pose.");
     if (options.frames > 1 && options.timingSamples) throw std::runtime_error("--timing-samples requires a still capture.");
@@ -367,25 +388,30 @@ void applyOverrides(ViewerScene& scene, const CaptureOptions& options)
     scene.sprayTemplatePixelLimit = options.sprayTemplatePixelLimit.value_or(scene.sprayTemplatePixelLimit);
     scene.cullSprayWoodBackfaces = options.cullSprayWoodBackfaces;
     scene.boughVoxelBake = options.boughVoxelBake;
+    scene.softwareBoughRaster = options.softwareBoughRaster;
     scene.liveCut = options.liveCut;
+    scene.liveCutGpu = options.liveCutGpu;
+    if (options.liveCutGpu && (options.liveCut.empty() || options.liveCutUnbatched))
+        throw std::runtime_error("--live-cut-gpu requires a live cut and generates its own draw batches.");
     scene.liveCutUnbatched = options.liveCutUnbatched;
     scene.liveCutPackAssembly = options.liveCutPackAssembly;
     scene.cameraPipelineStats = options.cameraPipelineStats;
+    scene.profileOakRaster = options.profileOakRaster;
     scene.liveCutPixelError = options.liveCutPixelError;
     if (!scene.liveCut.empty() && (scene.kind != SceneKind::ForkedOak || scene.treeSubmission != TreeSubmission::Direct ||
-        scene.sprayTraversal != SprayTraversal::Hierarchy || scene.objects.size() != 1 || !scene.boughVoxelBake.empty() ||
+        scene.sprayTraversal != SprayTraversal::Hierarchy || !scene.boughVoxelBake.empty() ||
         scene.branchLod != automaticBranchLod))
-        throw std::runtime_error("Live oak cuts require the single-tree direct automatic hierarchy fixture.");
+        throw std::runtime_error("Live oak cuts require the direct automatic forked-oak hierarchy.");
     if (!scene.boughVoxelBake.empty() && (scene.treeSubmission != TreeSubmission::Direct ||
-        scene.sprayTraversal != SprayTraversal::Hierarchy || scene.objects.size() != 1))
-        throw std::runtime_error("Bough voxel captures require one tree and direct hierarchy submission.");
+        scene.sprayTraversal != SprayTraversal::Hierarchy))
+        throw std::runtime_error("Bough voxel captures require direct hierarchy submission.");
     scene.captureBoughMaterials = options.boughMaterials;
     scene.captureBoughDepth = options.boughDepth;
     if ((options.boughDepth || options.boughMaterials) && !options.geometryMask)
         throw std::runtime_error("Bough depth and material captures require --geometry-mask.");
     scene.captureGeometryMask = options.geometryMask;
     scene.captureLighting = options.lighting;
-    scene.probeLighting = options.probeLighting;
+    scene.probeLighting = options.probeLighting.value_or(scene.probeLighting);
     scene.probeWindRefreshVoxels = options.probeWindRefreshVoxels.value_or(scene.probeWindRefreshVoxels);
     if (options.geometryMask) scene.branchAppearance = BranchAppearance::Representation;
     scene.sunAzimuth = options.sunAzimuth.value_or(scene.sunAzimuth);
@@ -603,6 +629,87 @@ CameraView captureCamera(const ViewerScene& scene, const CaptureOptions& options
     view.distance = options.distance.value_or(view.distance);
     return view;
 }
+
+void profileOakRaster(D3D12Renderer& renderer, ViewerScene& scene, const DirectX::XMFLOAT4X4& matrix,
+                      float wind, const fs::path& output)
+{
+    using Arm = D3D12Renderer::OakRaster;
+    constexpr std::array arms{Arm::Full, Arm::Depth, Arm::Visibility, Arm::Flat, Arm::EarlyDepthFull};
+    constexpr std::array names{"full", "depth", "visibility", "flat", "early-full"};
+    auto path = output;
+    path.replace_extension(L".raster.csv");
+    if (fs::exists(path)) throw std::runtime_error("The oak raster CSV already exists.");
+    auto maskPath = output;
+    maskPath.replace_extension(L".mask");
+    if (fs::exists(maskPath)) throw std::runtime_error("The oak raster coverage file already exists.");
+    const auto draw = [&] { return renderer.drawFrame(scene, matrix, wind, {}); };
+    const auto prime = draw().camera;
+    if (!prime.gpuTreeDispatches || !prime.treeDraws)
+        throw std::runtime_error("Oak raster capture did not generate a live cut.");
+    const auto triangles = prime.treeCanopyTriangles[0] + prime.treeCanopyTriangles[1] + prime.treeTrunkTriangles;
+    std::vector<uint32_t> reference, depth;
+    std::vector<uint64_t> ids;
+    std::array<D3D12Renderer::PassStats, arms.size()> counters;
+    std::vector<uint64_t> referenceColor, earlyColor;
+    std::size_t colorChanges = 0;
+    std::size_t occupied = 0;
+    scene.cameraPipelineStats = true;
+    for (unsigned i = 0; i < arms.size(); ++i)
+    {
+        renderer.setOakRasterReplay(arms[i], true);
+        auto* color = arms[i] == Arm::Full ? &referenceColor : arms[i] == Arm::EarlyDepthFull ? &earlyColor : nullptr;
+        counters[i] = renderer.drawFrame(scene, matrix, wind, {}, {}, nullptr, nullptr, color).camera;
+        const auto& c = counters[i];
+        if (c.inputPrimitives != triangles || c.treeCanopyTriangles != prime.treeCanopyTriangles ||
+            c.treeTrunkTriangles != prime.treeTrunkTriangles || c.treeDraws != prime.treeDraws ||
+            c.treeSubmissionCalls != prime.treeSubmissionCalls || c.gpuTreeDispatches)
+            throw std::runtime_error("Frozen oak draw counts differ from the primed cut.");
+        renderer.readOakRasterValidation(depth, ids);
+        if (i == 0)
+        {
+            reference = depth;
+            occupied = depth.size() - std::count(depth.begin(), depth.end(), std::bit_cast<uint32_t>(1.0f));
+            if (!occupied) throw std::runtime_error("Empty oak depth buffer.");
+        }
+        else if (depth != reference) throw std::runtime_error("Frozen oak depth differs between shader modes.");
+        if (arms[i] == Arm::Visibility)
+            for (std::size_t p = 0; p < depth.size(); ++p)
+                if ((uint32_t(ids.at(p)) != 0) != (depth[p] != std::bit_cast<uint32_t>(1.0f)))
+                    throw std::runtime_error("Oak visibility ID and depth coverage differ.");
+    }
+    for (size_t p = 0; p < referenceColor.size(); ++p)
+        colorChanges += referenceColor[p] != earlyColor.at(p);
+    std::vector<uint8_t> mask((reference.size() + 7) / 8);
+    for (size_t p = 0; p < reference.size(); ++p)
+        if (reference[p] != std::bit_cast<uint32_t>(1.0f)) mask[p / 8] |= uint8_t(1u << (p % 8));
+    writeNewFile(maskPath, std::as_bytes(std::span(mask)));
+    scene.cameraPipelineStats = false;
+    std::string csv = "block,arm,sample,triangles,draws,submissions,vs_invocations,ps_invocations,covered_pixels,early_full_hdr_changed_pixels,tree_gpu_ms,frame_gpu_ms,fenced_ms\n";
+    // An odd-sized Williams design needs both the forward and reversed orders.
+    constexpr std::array offsets{0u, 1u, 4u, 2u, 3u};
+    for (unsigned block = 0; block < 2 * arms.size(); ++block)
+        for (unsigned position = 0; position < arms.size(); ++position)
+        {
+            const auto offset = offsets[block < arms.size() ? position : arms.size() - 1 - position];
+            const auto i = (block + offset) % arms.size();
+            renderer.setOakRasterReplay(arms[i]);
+            for (unsigned warm = 0; warm < 8; ++warm) draw();
+            for (unsigned sample = 0; sample < 24; ++sample)
+            {
+                const auto start = std::chrono::steady_clock::now();
+                const auto frame = draw();
+                const auto wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                if (!frame.gpuAssetMilliseconds || !frame.gpuMilliseconds)
+                    throw std::runtime_error("Oak raster capture needs GPU timestamps.");
+                const auto& c = counters[i];
+                csv += std::format("{},{},{},{},{},{},{},{},{},{},{:.6f},{:.6f},{:.6f}\n",
+                    block, names[i], sample, triangles, c.treeDraws, c.treeSubmissionCalls, c.vertexInvocations,
+                    c.pixelInvocations, occupied, colorChanges, *frame.gpuAssetMilliseconds, *frame.gpuMilliseconds, wall);
+            }
+        }
+    writeNewFile(path, std::as_bytes(std::span(csv)));
+    renderer.setOakRasterReplay(Arm::Full); // Save the shaded result using the same frozen buffers.
+}
 }
 
 SceneCaptureReview prepareSceneCaptureReview(std::span<wchar_t* const> arguments, ViewerScenes& scenes)
@@ -626,6 +733,9 @@ void captureScene(std::span<wchar_t* const> arguments, const fs::path& assetDire
     while (output.has_relative_path() && !output.has_filename())
         output = output.parent_path();
     const auto options = parseOptions(arguments.subspan(1));
+    if (options.profileOakRaster && (options.frames != 1 || options.msaa != 1 || !options.liveCutGpu ||
+        options.liveCutPackAssembly || options.geometryMask || options.timingSamples || options.cameraPipelineStats))
+        throw std::runtime_error("Fixed-cut oak profiling requires a single shaded 1x GPU-instanced capture.");
     const bool png = _wcsicmp(output.extension().c_str(), L".png") == 0;
     if (options.frames == 1 && !png) throw std::runtime_error("A still capture requires a .png output path.");
     if (options.frames > 1 && png) throw std::runtime_error("A frame sequence requires a new output directory.");
@@ -663,7 +773,7 @@ void captureScene(std::span<wchar_t* const> arguments, const fs::path& assetDire
     const auto lodColumns = sprayLodColumns();
     std::string manifest = "frame,fps,seconds,wind_seconds,yaw_degrees,pitch_degrees,distance,msaa,"
         "camera_spray_wood_triangles,shadow_spray_wood_triangles,camera_coarse_wood_sprays,shadow_coarse_wood_sprays,"
-        "camera_triangles,shadow_triangles" +
+        "camera_triangles,shadow_triangles,camera_leaf_triangles,camera_voxel_bricks,gpu_asset_ms,gpu_bough_brick_ms,gpu_camera_ms,gpu_frame_ms" +
         lodColumns;
     for (UINT index = 0; index < options.frames; ++index)
     {
@@ -674,9 +784,14 @@ void captureScene(std::span<wchar_t* const> arguments, const fs::path& assetDire
         view.yaw += orbitRadians * fraction;
         view.pitch = std::lerp(start.pitch, endPitch, fraction);
         view.distance = std::lerp(start.distance, endDistance, fraction);
+        if (options.liveCutErrorDistanceProduct)
+            scene.liveCutPixelError = std::clamp(std::round(10000.0f * *options.liveCutErrorDistanceProduct / view.distance)
+                                                 / 10000.0f, .001f, options.liveCutPixelError);
         renderer.updateOrbitCameraProjection(scene, view.distance);
         const auto matrix = view.matrix();
         renderer.updateBranchLod(scene, matrix);
+        if (options.profileOakRaster)
+            profileOakRaster(renderer, scene, matrix, windPhaseAt(windTime), output);
         if (options.timingSamples)
         {
             for (int warmup = 0; warmup < 2; ++warmup)
@@ -687,7 +802,7 @@ void captureScene(std::span<wchar_t* const> arguments, const fs::path& assetDire
                 "camera_sprays,shadow_sprays,camera_sprays_considered,shadow_sprays_considered,camera_draws,shadow_draws,"
                 "camera_spray_group_tests,shadow_spray_group_tests,camera_spray_tests,shadow_spray_tests,"
                 "camera_bough_triangles,shadow_bough_triangles,camera_bough_sprays,shadow_bough_sprays,"
-                "camera_coarse_wood_sprays,shadow_coarse_wood_sprays,camera_voxel_bricks,shadow_voxel_bricks,scene_far_m,camera_selection_cpu_ms,camera_mesh_vs_invocations,camera_mesh_ps_invocations,fenced_frame_ms" + lodColumns;
+                "camera_coarse_wood_sprays,shadow_coarse_wood_sprays,camera_voxel_bricks,shadow_voxel_bricks,scene_far_m,camera_selection_cpu_ms,camera_mesh_vs_invocations,camera_mesh_ps_invocations,fenced_frame_ms,gpu_asset_ms,gpu_live_cut_ms" + lodColumns;
             for (UINT sample = 0; sample < options.timingSamples; ++sample)
             {
                 const auto frameStart = std::chrono::steady_clock::now();
@@ -711,18 +826,21 @@ void captureScene(std::span<wchar_t* const> arguments, const fs::path& assetDire
                     t.camera.sprayWoodByLod[fixedLodSharedCoarseLevel], t.shadow.sprayWoodByLod[fixedLodSharedCoarseLevel]);
                 csv += std::format(",{},{},{},{:.6f},{},{}", t.camera.voxelBricks,t.shadow.voxelBricks,scene.farPlane(),t.camera.treeSelectionMilliseconds,
                                    t.camera.vertexInvocations,t.camera.pixelInvocations);
-                csv += std::format(",{:.6f}", fencedMs);
+                csv += std::format(",{:.6f},{:.6f},{:.6f}", fencedMs, *t.gpuAssetMilliseconds, *t.gpuLiveCutMilliseconds);
                 appendSprayLodCounts(csv, t);
             }
             writeNewFile(timingPath, std::as_bytes(std::span(csv)));
         }
         if (!sequence && scene.treeBatchOcclusion && !options.timingSamples)
             renderer.drawFrame(scene, matrix, windPhaseAt(windTime), {});
-        const auto timing = renderer.drawFrame(scene, matrix, windPhaseAt(windTime), {}, {}, &pixels, nullptr,
+        if (options.sequenceTimingsOnly && index == 0)
+            for (unsigned warm = 0; warm < 32; ++warm)
+                renderer.drawFrame(scene, matrix, windPhaseAt(windTime), {});
+        const auto timing = renderer.drawFrame(scene, matrix, windPhaseAt(windTime), {}, {}, options.sequenceTimingsOnly ? nullptr : &pixels, nullptr,
                                                options.linearHdr.empty() ? nullptr : &linearPixels);
 
         const auto path = sequence ? output / std::format(L"frame-{:06}.png", index) : output;
-        encoder.write(path, options.width, options.height, pixels);
+        if (!options.sequenceTimingsOnly) encoder.write(path, options.width, options.height, pixels);
         if (!options.linearHdr.empty()) writeLinearDds(options.linearHdr, options.width, options.height, linearPixels);
         if (sequence)
         {
@@ -732,6 +850,9 @@ void captureScene(std::span<wchar_t* const> arguments, const fs::path& assetDire
                                     timing.shadow.sprayWoodTriangles, timing.camera.sprayWoodByLod[fixedLodSharedCoarseLevel],
                                     timing.shadow.sprayWoodByLod[fixedLodSharedCoarseLevel], timing.camera.triangles,
                                     timing.shadow.triangles);
+            manifest += std::format(",{},{},{:.6f},{:.6f},{:.6f},{:.6f}", timing.camera.foliageTriangles,
+                timing.camera.voxelBricks, timing.gpuAssetMilliseconds.value_or(0),
+                timing.gpuBoughBrickMilliseconds, timing.gpuCameraMilliseconds.value_or(0), timing.gpuMilliseconds.value_or(0));
             appendSprayLodCounts(manifest, timing);
         }
     }

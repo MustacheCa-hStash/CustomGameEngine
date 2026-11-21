@@ -54,7 +54,7 @@ public:
         unsigned treeSubmissionCalls = 0;
         double treeSubmissionMilliseconds = 0;
         double treeSelectionMilliseconds = 0;
-        std::uint64_t vertexInvocations = 0, pixelInvocations = 0;
+        std::uint64_t vertexInvocations = 0, pixelInvocations = 0, inputPrimitives = 0;
         std::uint64_t treeCutHash = 0;
         unsigned gpuTreeDispatches = 0;
         unsigned treeDepthRejects = 0;
@@ -82,7 +82,8 @@ public:
         double cpuMilliseconds;
         std::optional<double> gpuMilliseconds;
         unsigned drawCalls = 0;
-        std::optional<double> gpuCameraMilliseconds;
+        std::optional<double> gpuCameraMilliseconds, gpuAssetMilliseconds, gpuLiveCutMilliseconds;
+        double gpuBoughBrickMilliseconds = 0;
         std::optional<double> gpuShadowMilliseconds;
         PassStats camera;
         PassStats shadow;
@@ -133,6 +134,9 @@ public:
                           const DirectX::XMFLOAT4X4* cascadeFitView = nullptr,
                           std::vector<std::uint64_t>* linearCapture = nullptr);
 
+    enum class OakRaster { Live, Full, Depth, Visibility, Flat, EarlyDepthFull };
+    void setOakRasterReplay(OakRaster mode, bool validate = false);
+    void readOakRasterValidation(std::vector<uint32_t>& depth, std::vector<uint64_t>& ids);
     ID3D12Device* device() const { return device_.Get(); }
     ID3D12CommandQueue* queue() const { return queue_.Get(); }
     DXGI_FORMAT backBufferFormat() const;
@@ -242,8 +246,12 @@ private:
         std::vector<Tier> tiers;
         std::vector<MeshInstance> placements;
         std::vector<std::array<UINT,2>> regions;
-        std::vector<std::vector<UINT>> bins;
-        std::vector<UINT> used;
+        struct Batches {
+            std::vector<std::vector<UINT>> bins;
+            std::vector<UINT> used;
+        };
+        std::vector<Batches> batches;
+        UINT treeCount = 0;
         std::vector<UINT> sourceIndices;
         UINT replace = 0;
         bool packAssembly = false;
@@ -257,8 +265,30 @@ private:
     LiveCut liveCut_;
     std::filesystem::path livePath_;
     void loadLiveCut(const ViewerScene& scene);
-    void selectLiveCut(const ViewerScene& scene, PassStats& stats);
-    void drawLiveCut(const ViewerScene& scene, size_t meshIndex, UINT slot, PassStats& stats);
+    struct LiveGpu
+    {
+        struct View {
+            DirectX::XMFLOAT4X4 world, view;
+            DirectX::XMFLOAT4 planes[6], windFocal, viewWindNear;
+            float scale; UINT visible, frustum, pad;
+        };
+        std::array<ComPtr<ID3D12Resource>,4> inputs;
+        ComPtr<ID3D12Resource> views, active, bins, instances, arguments, counts, readback;
+        std::vector<std::array<UINT,2>> levels;
+        UINT capacity = 0, packStride = 0;
+        std::array<UINT,3> packSizes{};
+        ComPtr<ID3D12Resource> packedIndices, packedDraws;
+        bool used = false, readable = false;
+    } liveGpu_;
+    ComPtr<ID3D12RootSignature> liveGpuRoot_;
+    std::array<ComPtr<ID3D12PipelineState>,4> liveGpuPipelines_;
+    ComPtr<ID3D12CommandSignature> liveGpuSignature_;
+    void prepareLiveGpu();
+    void dispatchLiveGpu(const ViewerScene& scene, PassStats& stats);
+    void drawLiveGpu(const ViewerScene& scene, size_t meshIndex, UINT slot, UINT object, PassStats& stats);
+    void readLiveGpuStats(PassStats& stats);
+    void selectLiveCut(const ViewerScene& scene, UINT objectIndex, PassStats& stats);
+    void drawLiveCut(const ViewerScene& scene, size_t meshIndex, UINT slot, UINT objectIndex, PassStats& stats);
 
     struct TreeGpuReadback
     {
@@ -513,7 +543,8 @@ private:
     void uploadBranchVoxels(const ViewerScene& scene);
     void uploadBoughVoxels(const ViewerScene& scene);
     void drawBranchVoxels(const ViewerScene& scene, const GpuVoxelLevel& level, DirectX::FXMMATRIX view,
-                          const PassVisibility& visibility, PassStats& stats, bool packPlacements, bool shadowPass = false);
+                          const PassVisibility& visibility, PassStats& stats, bool packPlacements, bool shadowPass = false,
+                          const SceneObject* tree = nullptr);
     static BranchLodProjection branchGroupProjection(const FixedLodGroup& group, bool fullCrown = false);
     static BranchLodProjection branchInstanceProjection(std::span<const BranchLodProjection> groups);
     BranchLodErrors projectBranchLodErrors(const BranchLodProjection& projection,
@@ -704,9 +735,22 @@ private:
     ComPtr<ID3D12Resource> branchArgumentBuffer_;
     std::array<GpuVoxelLevel, branchVoxelBakeCount> voxelLevels_;
     std::array<GpuVoxelLevel, 2> boughVoxelLevels_;
-    std::array<bool, 2> boughCameraSelected_{};
+    std::array<PassVisibility, 2> selectedBoughTrees_;
+    std::array<Bounds, 2> boughBrickBounds_{};
+    CameraPipeline brickResolve_;
+    ComPtr<ID3D12PipelineState> brickClear_, brickVisibility_;
+    std::array<ComPtr<ID3D12Resource>,2> brickHits_, brickWork_;
+    struct BrickWork
+    {
+        DirectX::XMFLOAT4 placement;
+        UINT left, top, width, height, firstPixel;
+        UINT padding[3]{};
+    };
+    std::vector<BrickWork> brickWorkItems_;
+    size_t boughTreeCapacity_ = 0;
     std::filesystem::path boughVoxelPath_;
     UINT boughFirst_ = 0, boughCount_ = 0, boughReplace_ = 0;
+    bool mixedBoughVoxels_ = false;
     std::array<GpuVoxelLevel, voxelBranchRegionCount> voxelRegionLevels_;
     std::array<BranchLodProjection, voxelBranchRegionCount> voxelRegionProjections_;
     std::vector<std::uint8_t> voxelGroupRegionBits_;
@@ -768,6 +812,12 @@ private:
     ComPtr<ID3D12QueryHeap> cameraPipelineQuery_;
     ComPtr<ID3D12Resource> timestampReadback_;
     FrameReadback displayReadback_;
+    OakRaster oakRaster_ = OakRaster::Live;
+    bool validateOakRaster_ = false;
+    std::array<std::array<ComPtr<ID3D12PipelineState>, 2>, 4> oakRasterPipelines_;
+    ComPtr<ID3D12DescriptorHeap> oakIdHeap_;
+    ComPtr<ID3D12Resource> oakIds_, oakPlacementKeys_;
+    FrameReadback oakDepthReadback_, oakIdReadback_;
     FrameReadback linearReadback_;
     UINT64 timestampFrequency_ = 0;
     ComPtr<ID3D12RootSignature> hudRoot_;

@@ -25,10 +25,10 @@ def pack_normals(axis):
     x,y=np.rint((xy+1)*2047.5).clip(0,4095).astype("<u4").T
     return x | y<<12 | 255<<24
 
-def write_bake(path, slots, replacement, group=None):
+def write_bake(path, slots, replacement, group=None, mixed=False):
     group=layout()[7] if group is None else group
     with path.open("wb") as f:
-        f.write(struct.pack("<8sIII",b"OAKVX001",group[0][0],sum(len(g[1]) for g in group),replacement))
+        f.write(struct.pack("<8sIII",b"OAKMX001" if mixed else b"OAKVX001",group[0][0],sum(len(g[1]) for g in group),replacement))
         for bricks in slots:
             f.write(struct.pack("<II",len(bricks),sum(b[1].bit_count() for b in bricks)))
             if not bricks:continue

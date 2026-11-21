@@ -21,6 +21,10 @@ set(tree_depth_cs "${CMAKE_CURRENT_BINARY_DIR}/TreeDepthCS.h")
 set(tree_batch_depth_cs "${CMAKE_CURRENT_BINARY_DIR}/TreeBatchDepthCS.h")
 set(mesh_vs "${CMAKE_CURRENT_BINARY_DIR}/MeshVS.h")
 set(mesh_ps "${CMAKE_CURRENT_BINARY_DIR}/MeshPS.h")
+set(oak_flat_ps "${CMAKE_CURRENT_BINARY_DIR}/OakFlatPS.h")
+set(oak_early_ps "${CMAKE_CURRENT_BINARY_DIR}/OakEarlyPS.h")
+set(oak_visibility_ps "${CMAKE_CURRENT_BINARY_DIR}/OakVisibilityPS.h")
+set(oak_visibility_vs "${CMAKE_CURRENT_BINARY_DIR}/OakVisibilityVS.h")
 set(shadow_vs "${CMAKE_CURRENT_BINARY_DIR}/ShadowVS.h")
 set(shadow_ps "${CMAKE_CURRENT_BINARY_DIR}/ShadowPS.h")
 set(hud_shader "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Hud.hlsl")
@@ -29,6 +33,17 @@ set(hud_ps "${CMAKE_CURRENT_BINARY_DIR}/HudPS.h")
 set(voxel_shader "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Voxel.hlsl")
 set(voxel_vs "${CMAKE_CURRENT_BINARY_DIR}/VoxelVS.h")
 set(voxel_ps "${CMAKE_CURRENT_BINARY_DIR}/VoxelPS.h")
+set(brick_raster_headers)
+foreach(entry IN ITEMS BrickClearCS BrickVisibilityCS BrickResolveVS BrickResolvePS)
+    string(REGEX REPLACE ".*(CS|VS|PS)$" "\\1" stage "${entry}")
+    string(TOLOWER "${stage}" stage)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/${entry}.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T "${stage}_6_6" -E "${entry}" -Fh "${header}" -Vn "${entry}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/BrickRaster.hlsl"
+        DEPENDS shaders/BrickRaster.hlsl "${voxel_shader}" shaders/LeafLighting.hlsli shaders/ProbeLighting.hlsli shaders/Skylight.hlsli
+        VERBATIM)
+    list(APPEND brick_raster_headers "${header}")
+endforeach()
 set(voxel_shadow_ps "${CMAKE_CURRENT_BINARY_DIR}/VoxelShadowPS.h")
 set(sky_shader "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Sky.hlsl")
 set(sky_vs "${CMAKE_CURRENT_BINARY_DIR}/SkyVS.h")
@@ -38,8 +53,13 @@ set(display_vs "${CMAKE_CURRENT_BINARY_DIR}/DisplayVS.h")
 set(display_ps "${CMAKE_CURRENT_BINARY_DIR}/DisplayPS.h")
 add_custom_command(
     OUTPUT "${mesh_vs}" "${mesh_ps}" "${shadow_vs}" "${shadow_ps}"
+           "${oak_flat_ps}" "${oak_early_ps}" "${oak_visibility_ps}" "${oak_visibility_vs}"
     COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E VSMain -Fh "${mesh_vs}" -Vn meshVS "${mesh_shader}"
     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -Fh "${mesh_ps}" -Vn meshPS "${mesh_shader}"
+    COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSOakFlat -Fh "${oak_flat_ps}" -Vn oakFlatPS "${mesh_shader}"
+    COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -D OAK_PROFILE_EARLY_DEPTH=1 -Fh "${oak_early_ps}" -Vn oakEarlyPS "${mesh_shader}"
+    COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSOakVisibility -Fh "${oak_visibility_ps}" -Vn oakVisibilityPS "${mesh_shader}"
+    COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E VSOakVisibility -Fh "${oak_visibility_vs}" -Vn oakVisibilityVS "${mesh_shader}"
     COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E ShadowVS -Fh "${shadow_vs}" -Vn shadowVS "${mesh_shader}"
     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E ShadowPS -Fh "${shadow_ps}" -Vn shadowPS "${mesh_shader}"
     DEPENDS "${mesh_shader}" "${leaf_lighting_shader}" "${skylight_shader}" "${probe_lighting_shader}" "${DXC_EXECUTABLE}"
@@ -115,6 +135,15 @@ foreach(stage IN ITEMS Traverse Select Clip Encode Scatter PrepareOcclusion Cull
     list(APPEND tree_batch_headers "${header}")
 endforeach()
 
+foreach(stage IN ITEMS Clear Traverse Encode Pack)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/LiveCut${stage}CS.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -Gis -E "${stage}" -Fh "${header}" -Vn "liveCut${stage}CS"
+                "${CMAKE_CURRENT_SOURCE_DIR}/shaders/LiveCut.hlsl"
+        DEPENDS shaders/LiveCut.hlsl "${DXC_EXECUTABLE}" VERBATIM)
+    list(APPEND tree_batch_headers "${header}")
+endforeach()
+
 add_executable(CustomGameEngine WIN32
     src/main.cpp
     src/SceneCapture.cpp
@@ -151,10 +180,15 @@ add_executable(CustomGameEngine WIN32
     src/VoxelFoliage.cpp
     "${mesh_vs}"
     "${mesh_ps}"
+    "${oak_flat_ps}"
+    "${oak_early_ps}"
+    "${oak_visibility_ps}"
+    "${oak_visibility_vs}"
     "${shadow_vs}"
     "${shadow_ps}"
     "${hud_vs}"
     "${hud_ps}"
+    ${brick_raster_headers}
     "${voxel_vs}"
     "${voxel_ps}"
     "${voxel_shadow_ps}"

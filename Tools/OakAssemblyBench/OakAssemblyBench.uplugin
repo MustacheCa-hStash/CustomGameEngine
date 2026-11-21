@@ -4,5 +4,6 @@
   "VersionName": "1",
   "FriendlyName": "Oak assembly reduction benchmark",
   "EnabledByDefault": true,
-  "Modules": [{"Name":"OakAssemblyBench","Type":"Editor","LoadingPhase":"PostEngineInit"}]
+  "Modules": [{"Name":"OakAssemblyBench","Type":"Editor","LoadingPhase":"PostEngineInit"},
+              {"Name":"OakGameTiming","Type":"Runtime","LoadingPhase":"PostEngineInit"}]
 }

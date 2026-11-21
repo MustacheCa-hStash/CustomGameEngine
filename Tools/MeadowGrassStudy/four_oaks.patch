@@ -1,0 +1,84 @@
+--- a/src/ViewerScene.cpp
++++ b/src/ViewerScene.cpp
+@@ -47,6 +47,12 @@
+ 
+ MeshData makeGround(const ViewerScene& scene)
+ {
++    const auto terrain = scene.source.parent_path() / "MeadowTerrain.glb";
++    if (std::filesystem::is_regular_file(terrain))
++    {
++        auto asset = loadGlb(terrain);
++        return std::move(asset.meshes.at(0));
++    }
+     const auto& [center, halfExtent] = scene.assetBounds;
+     const float height = std::max(0.0f, center.y + halfExtent.y);
+     const float x = std::abs(center.x) + halfExtent.x;
+--- a/shaders/Mesh.hlsl
++++ b/shaders/Mesh.hlsl
+@@ -507,7 +507,7 @@
+     if (transmissionFlags & 512u)
+     {
+         // Registered, linear sky visibility from the actual stationary grass.
+-        float2 soilUv = (input.worldPositionAndViewDepth.xz + float2(11,2)) / float2(18,9);
++        float2 soilUv = (input.worldPositionAndViewDepth.xz + 48) / 80;
+         if (all(soilUv>=0) && all(soilUv<=1))
+             ambient *= detailTexture.Sample(colorSampler,soilUv).r;
+     }
+--- a/src/ProbeLighting.cpp
++++ b/src/ProbeLighting.cpp
+@@ -110,7 +110,20 @@
+         lower = XMVectorMin(lower, center - extent);
+         upper = XMVectorMax(upper, center + extent);
+     }
+-    const float ground = scene.ground.localBounds.center.y;
++    const auto& terrain = scene.ground;
++    const float ground = terrain.localBounds.center.y - terrain.localBounds.halfExtent.y;
++    const unsigned side = static_cast<unsigned>(std::sqrt(terrain.vertices.size()));
++    // The study terrain is an evenly spaced square grid, row-major in world X/Z.
++    const auto terrainOffset = [&](float x, float z) {
++        if (side < 3 || side * side != terrain.vertices.size()) return 0.0f;
++        const auto& first = terrain.vertices.front().position;
++        const float step = terrain.vertices[1].position.x - first.x;
++        const float gx = std::clamp((x-first.x)/step, 0.0f, float(side-1));
++        const float gz = std::clamp((z-first.z)/step, 0.0f, float(side-1));
++        const unsigned ix = std::min(unsigned(gx),side-2), iz = std::min(unsigned(gz),side-2);
++        const auto y = [&](unsigned dx,unsigned dz) { return terrain.vertices[(iz+dz)*side+ix+dx].position.y; };
++        return std::lerp(std::lerp(y(0,0),y(1,0),gx-ix),std::lerp(y(0,1),y(1,1),gx-ix),gz-iz)-ground;
++    };
+     lower = XMVectorSetY(lower, std::min(XMVectorGetY(lower), ground));
+     XMFLOAT3 extent;
+     XMStoreFloat3(&extent, upper - lower);
+@@ -187,7 +200,8 @@
+         }
+         const float cover = 1.0f-std::exp(-s.w);
+         const float f = cover/std::max(s.w,1e-8f);
+-        s = {s.x*f+earth.x*(1-cover),s.y*f+earth.y*(1-cover),s.z*f+earth.z*(1-cover),heights[i]*f};
++        s = {s.x*f+earth.x*(1-cover),s.y*f+earth.y*(1-cover),s.z*f+earth.z*(1-cover),heights[i]*f+(1-cover)*terrainOffset(volume.originCellSize.x+(x+0.5f)*2*cell,
++                                                             volume.originCellSize.z+(z+0.5f)*2*cell)};
+     }
+     // Sparse wood covers only part of a cell face. Retain strong extinction once
+     // enough wood surface spans a cell, as on the trunk and larger boughs.
+--- a/shaders/ProbeTrace.hlsl
++++ b/shaders/ProbeTrace.hlsl
+@@ -198,7 +198,20 @@
+         float sinPhi, cosPhi;
+         sincos(i * 2.39996323 + 0.5, sinPhi, cosPhi);
+         const float3 direction = float3(radius * cosPhi, y, radius * sinPhi);
+-        const float groundDistance = y < 0 ? (proxyOriginCellSize.y - origin.y) / y : traceRange;
++        float groundDistance = traceRange;
++        if (y < 0)
++        {
++            groundDistance = clamp((proxyOriginCellSize.y - origin.y) / y, 0, traceRange);
++            // Refine the plane hit against the local soil/grass reflecting height.
++            [unroll] for (uint tap = 0; tap < 2; ++tap)
++            {
++                float2 hit = origin.xz + direction.xz * groundDistance;
++                int2 cell = clamp(int2(floor((hit-proxyOriginCellSize.xz)/(2*proxyOriginCellSize.w))),
++                                  int2(0,0),int2(groundSize())-1);
++                float height = groundSurface[cell.y*groundSize().x+cell.x].w;
++                groundDistance = clamp((proxyOriginCellSize.y + height - origin.y) / y, 0, traceRange);
++            }
++        }
+         float blocker;
+         const float visibility = traceProxy(origin, direction, min(groundDistance, traceRange), blocker);
+         float3 correction = skyRadiance(direction) * (visibility - 1);

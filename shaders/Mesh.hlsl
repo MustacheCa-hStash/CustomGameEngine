@@ -157,6 +157,22 @@ PixelInput VSMain(VertexInput input, uint instanceId : SV_InstanceID)
     return output;
 }
 
+// The fixed-cut capture validates that every profiled material is opaque.
+PixelInput VSOakVisibility(VertexInput input, uint placementSlot : CUTKEY)
+{
+    return VSMain(input, placementSlot);
+}
+
+uint2 PSOakVisibility(PixelInput input, uint primitive : SV_PrimitiveID) : SV_Target
+{
+    return uint2(firstLodTag + input.meshInstanceId, primitive);
+}
+
+float4 PSOakFlat() : SV_Target
+{
+    return float4(0.15, 0.55, 0.32, 1);
+}
+
 float3 encodeSrgb(float3 linearColor)
 {
     linearColor = saturate(linearColor);
@@ -268,6 +284,9 @@ float3 tintColor(uint id)
     return 0.22 + (0.73 / 255.0) * float3(id & 255, (id >> 8) & 255, (id >> 16) & 255);
 }
 
+#ifdef OAK_PROFILE_EARLY_DEPTH
+[earlydepthstencil]
+#endif
 float4 PSMain(PixelInput input, bool isFrontFace : SV_IsFrontFace, uint primitive : SV_PrimitiveID) : SV_Target
 {
     const float2 uv = textureCoordinateSet == 0 ? input.texcoords.xy : input.texcoords.zw;

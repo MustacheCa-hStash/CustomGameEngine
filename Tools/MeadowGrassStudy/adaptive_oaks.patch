@@ -1,0 +1,456 @@
+--- a/shaders/Mesh.hlsl
++++ b/shaders/Mesh.hlsl
+@@ -60,7 +60,13 @@
+ SamplerState colorSampler : register(s0);
+ Texture2D<float> shadowMap : register(t1);
+ SamplerComparisonState shadowSampler : register(s1);
+-StructuredBuffer<uint3> lodTags : register(t2);
++ByteAddressBuffer lodTags : register(t2);
++static const uint elevatedTreeBatch = 1u << 20;
++
++uint3 readLodTag(uint index)
++{
++    return lodTags.Load3(index * ((transmissionFlags & elevatedTreeBatch) ? 16 : 12));
++}
+ Texture2DArray<float> cascadeShadowMaps : register(t3);
+ Texture2D<float4> transmissionColorTexture : register(t4);
+ Texture2D<float4> transmissionStrengthTexture : register(t5);
+@@ -116,7 +122,7 @@
+     return value + rotation.w * twiceCross + cross(rotation.xyz, twiceCross);
+ }
+ 
+-float4 bendPosition(VertexInput input, out float2 bendSlope)
++float4 bendPosition(VertexInput input, uint instanceId, out float2 bendSlope)
+ {
+     float3 position = input.position;
+     if (usesMeshInstances)
+@@ -128,6 +134,8 @@
+     world.xz = rotateXZ(asset.xz, input.instance.z);
+     world.xyz *= input.instance.w;
+     world.xz += input.instance.xy;
++    if (transmissionFlags & elevatedTreeBatch)
++        world.y += asfloat(lodTags.Load((firstLodTag + instanceId) * 16 + 12));
+     bendSlope = 0.0;
+     if (movesWithWind)
+     {
+@@ -224,7 +232,7 @@
+         input.position*=scale;
+     }
+     float2 bendSlope;
+-    float4 world = bendPosition(input, bendSlope);
++    float4 world = bendPosition(input, instanceId, bendSlope);
+     output.position = mul(world, viewProjection);
+     float3 normal = input.normal;
+     if (usesMeshInstances)
+@@ -573,12 +581,12 @@
+     if (shadowView == 0 && (lodTint != 0 || highlightedLodGroup != 0))
+     {
+         if (lodTint == 5)
+-            return float4(tintColor(lodTags[firstLodTag + input.meshInstanceId].y), 1.0);
++            return float4(tintColor(readLodTag(firstLodTag + input.meshInstanceId).y), 1.0);
+         if (lodTint == 6)
+             return float4(1.0, 0.66, 0.13, 1.0);
+         uint3 tag = 0;
+         if (lodTint != 4 || highlightedLodGroup != 0)
+-            tag = lodTags[firstLodTag + primitive];
++            tag = readLodTag(firstLodTag + primitive);
+         if (highlightedLodGroup == tag.y + 1)
+         {
+             return float4(1.0, 0.58, 0.12, 1.0);
+@@ -739,11 +747,11 @@
+     return PSMain(input,front,primitive);
+ }
+ 
+-ShadowInput ShadowVS(VertexInput input)
++ShadowInput ShadowVS(VertexInput input, uint instanceId : SV_InstanceID)
+ {
+     ShadowInput output;
+     float2 bendSlope;
+-    output.position = mul(bendPosition(input, bendSlope), lightViewProjection);
++    output.position = mul(bendPosition(input, instanceId, bendSlope), lightViewProjection);
+     output.uv = materialUv(input);
+     return output;
+ }
+--- a/shaders/TreeBatch.hlsl
++++ b/shaders/TreeBatch.hlsl
+@@ -600,13 +600,16 @@
+     uint target = state.Load(binOffset(record.bin)) + record.rank;
+     instances.Store4(target * 16, asuint(poses[record.pose].placement));
+     uint offset = sizes.w * 16 + target * 40;
++    const bool elevated = (options.x & 128) != 0;
++    const uint tagAddress = sizes.w * 56 + target * (elevated ? 16 : 12);
++    if (elevated) instances.Store(tagAddress + 12, asuint(poses[record.pose].toWorld[3].y));
+     if (record.placement != invalid)
+     {
+         Placement spray = placements[record.placement];
+         instances.Store3(offset, asuint(spray.translation));
+         instances.Store4(offset + 12, asuint(spray.rotation));
+         instances.Store3(offset + 28, asuint(spray.scale));
+-        if (options.x & 8) instances.Store3(sizes.w * 56 + target * 12, spray.tag);
++        if (options.x & 8) instances.Store3(tagAddress, spray.tag);
+     }
+     else
+     {
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -1711,7 +1711,7 @@
+     parameters[3].Descriptor.ShaderRegister = 1;
+     parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+     parameters[4].Descriptor.ShaderRegister = 2;
+-    parameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    parameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+     parameters[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+     parameters[5].Descriptor.ShaderRegister = 2;
+     parameters[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+@@ -4176,6 +4176,7 @@
+         if (!part.geometry.indices.empty())
+         {
+             gpu.geometry = uploadMesh(part.geometry);
++            gpu.geometry.material = meshes[part.meshIndex].material;
+             auto& geometry = gpu.geometry;
+             geometry.vertexBuffer = resident(std::move(geometry.vertexBuffer), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+             geometry.indexBuffer = resident(std::move(geometry.indexBuffer), D3D12_RESOURCE_STATE_INDEX_BUFFER);
+@@ -5196,8 +5197,13 @@
+         if (msaaEnabled_) { description.SampleDesc = msaaSamples; description.RasterizerState.MultisampleEnable = TRUE; }
+         cameraMode.oneSidedMesh = createCameraPipeline(description,"Create one-sided spray camera pipelines");
+     }
++    PassVisibility grove;
++    const bool separateOaks = !scene.oakPlacements.empty();
++    const bool hideOaks = separateOaks && GetEnvironmentVariableW(shadowPass ? L"MEADOW_TEST_NO_OAK_SHADOW" : L"MEADOW_TEST_NO_OAK_CAMERA", nullptr, 0);
++    if (separateOaks && !hideOaks) grove.add(0, static_cast<UINT>(scene.oakPlacements.size()));
+     const bool batchedTrees = !materialCull && treeLod && scene.treeSubmission == TreeSubmission::GpuBatched &&
+-                              drawBatchedTrees(scene, visibility, shadowPass, shadowSlice, stats);
++                              drawBatchedTrees(scene, separateOaks ? grove : visibility, shadowPass, shadowSlice, stats);
++    if (separateOaks && !batchedTrees) throw std::runtime_error("Meadow oak batch unavailable.");
+     const auto woodIndex = !shadowPass && !materialCull && treeLod && scene.treeSubmission == TreeSubmission::GpuPerPart &&
+                           scene.treeOcclusion && scene.sprayLods[1] &&
+                           treeParts_[scene.sprayLods[1]->meshIndex].gpuNodes
+@@ -5531,7 +5537,7 @@
+ 
+ void D3D12Renderer::bindMesh(const GpuMesh& mesh, const MaterialData& material, bool wind, bool receiveShadows,
+                             const GpuFixedLodLevel* lod, FixedLodTint tint, UINT highlightedGroup,
+-                            UINT lodLevel, UINT firstTag, D3D12_GPU_VIRTUAL_ADDRESS tags)
++                            UINT lodLevel, UINT firstTag, D3D12_GPU_VIRTUAL_ADDRESS tags, bool elevatedBatch)
+ {
+     DrawConstants constants{};
+     constants.model = mesh.localToWorld;
+@@ -5623,6 +5629,7 @@
+         transmissionColor = material.meadowSward;
+         transmissionStrength = material.meadowCover;
+     }
++    if (elevatedBatch) constants.transmissionFlags |= 1u << 20;
+     commands_->SetGraphicsRootDescriptorTable(9, textureHandle(material.soilSkyVisibility ? material.soilSkyVisibility : bladeNormal));
+     commands_->SetGraphicsRoot32BitConstants(0, drawConstantCount, &constants, 0);
+     commands_->SetGraphicsRootDescriptorTable(1, textureHandle(material.colorTexture));
+--- a/src/D3D12Renderer.h
++++ b/src/D3D12Renderer.h
+@@ -636,7 +636,7 @@
+                       UINT level = 0, UINT firstTag = 0, D3D12_GPU_VIRTUAL_ADDRESS tags = 0) const;
+     void bindMesh(const GpuMesh& mesh, const MaterialData& material, bool wind, bool receiveShadows,
+                   const GpuFixedLodLevel* lod, FixedLodTint tint, UINT highlightedGroup, UINT lodLevel,
+-                  UINT firstTag, D3D12_GPU_VIRTUAL_ADDRESS tags = 0);
++                  UINT firstTag, D3D12_GPU_VIRTUAL_ADDRESS tags = 0, bool elevatedBatch = false);
+     std::uint64_t drawMesh(const GpuMesh& mesh, const MaterialData& material, bool wind,
+                   bool receiveShadows, UINT instanceCount, UINT firstInstance,
+                   const GpuFixedLodLevel* lod = nullptr, FixedLodTint tint = FixedLodTint::Shaded,
+--- a/src/ProbeLighting.cpp
++++ b/src/ProbeLighting.cpp
+@@ -150,9 +150,8 @@
+         return s <= 0.04045f ? s/12.92f : std::pow((s+0.055f)/1.055f,2.4f);
+     };
+ 
+-    for (const auto& mesh : scene.asset->meshes)
+-    {
+-        if (mesh.name.starts_with("Meadow tuft card") || mesh.name.starts_with("Near tuft |")) continue; // source tufts already feed the probes
++    const auto depositMesh = [&](const MeshData& mesh) {
++        if (mesh.name.starts_with("Meadow tuft card") || mesh.name.starts_with("Near tuft |")) return; // source tufts already feed the probes
+         const auto& material = scene.asset->materials[mesh.material];
+         const bool foliage = material.hasBacklighting;
+         XMFLOAT3 color{material.color.x,material.color.y,material.color.z};
+@@ -193,7 +192,9 @@
+             else
+                 deposit(volume, samples, world, foliage, coverage, grass ? &color : nullptr, heights);
+         }
+-    }
++    };
++    for (const auto& mesh : scene.oakProbeMeshes) depositMesh(mesh);
++    for (const auto& mesh : std::span(scene.asset->meshes).subspan(scene.oakPartCount)) depositMesh(mesh);
+     const TextureMip* soil = nullptr;
+     if (const auto texture = scene.groundMaterial.colorTexture)
+     {
+--- a/src/TreeGpu.cpp
++++ b/src/TreeGpu.cpp
+@@ -718,7 +718,7 @@
+ constexpr UINT batchStateHeader = 16;
+ constexpr UINT pyramidLevels = 4;
+ constexpr UINT noCluster = std::numeric_limits<UINT>::max();
+-constexpr UINT batchArenaStride = 68; // Scene placement, spray placement, and optional group tag.
++constexpr UINT batchArenaStride = 72; // Scene placement, spray placement, group tag and terrain elevation.
+ 
+ struct BatchPart
+ {
+@@ -816,7 +816,7 @@
+ void D3D12Renderer::prepareTreeBatch(const ViewerScene& scene, std::span<const TreeGpuTable> tables)
+ {
+     if (tables.empty() || tables.size() != scene.treeHierarchy->parts.size() || tables.size() > 32 ||
+-        scene.objects.empty() || scene.objects.size() > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION)
++        scene.treePlacements().empty() || scene.treePlacements().size() > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION)
+         return;
+ 
+     // A parent replaces one or more terminal ranges. The all-terminal cut bounds both queues.
+@@ -828,8 +828,8 @@
+         const auto slots = table.plans.empty() ? 1u : std::ranges::max(table.plans, {}, &TreeGpuPlan::count).count;
+         recordsPerTree += std::max<std::size_t>(1, table.placements.size() * slots);
+     }
+-    const auto maxJobs = jobsPerTree * scene.objects.size();
+-    const auto maxRecords = recordsPerTree * scene.objects.size();
++    const auto maxJobs = jobsPerTree * scene.treePlacements().size();
++    const auto maxRecords = recordsPerTree * scene.treePlacements().size();
+     const auto recordLimit = std::min<std::size_t>(UINT_MAX / batchArenaStride,
+         D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION * batchScatterThreads);
+     if (maxJobs > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION ||
+@@ -1026,7 +1026,7 @@
+     queue_->ExecuteCommandLists(1, lists);
+     waitForGpu();
+     gpu.partCount = static_cast<UINT>(parts.size());
+-    gpu.rootCapacity = static_cast<UINT>(scene.objects.size());
++    gpu.rootCapacity = static_cast<UINT>(scene.treePlacements().size());
+     gpu.recordCapacity = static_cast<UINT>(recordCapacity);
+     gpu.stateBytes = static_cast<UINT>((batchStateHeader + 4 * gpu.bins.size() + 4 * parts.size()) * sizeof(UINT));
+     gpu.poseStride = gpu.rootCapacity * sizeof(BatchPose);
+@@ -1140,7 +1140,7 @@
+     {
+         for (UINT index = range.first; index < range.first + range.count; ++index)
+         {
+-            const auto& object = scene.objects[index];
++            const auto& object = scene.treePlacements()[index];
+             BatchPose pose{};
+             pose.placement = object.placement;
+             const auto toWorld = object.placementMatrix();
+@@ -1176,7 +1176,7 @@
+     view.options = {(scene.sprayFrustumCulling ? 1u : 0u) | (shadowPass ? 2u : 0u) |
+                     (scene.sprayLocalLod ? 4u : 0u) | (tint == FixedLodTint::SprayGroup ? 8u : 0u) |
+                     (sparse ? 16u : 0u) | (history ? 32u : 0u) |
+-                    (!shadowPass && scene.guardSprayReference ? 64u : 0u), enabledParts, 0, 0};
++                    (!shadowPass && scene.guardSprayReference ? 64u : 0u) | (!scene.oakPlacements.empty() ? 128u : 0u), enabledParts, 0, 0};
+     const auto address = gpu.instances->GetGPUVirtualAddress();
+     view.instanceAddress = {static_cast<UINT>(address), static_cast<UINT>(address >> 32), 0, 0};
+     view.previousClip = gpu.previousClip;
+@@ -1247,7 +1247,7 @@
+             auto drawTint = tint;
+             if (batch.proxy && tint != FixedLodTint::Shaded) drawTint = FixedLodTint::BoughProxy;
+             if (!batch.proxy && !mesh.meshInstanceCount) drawTint = FixedLodTint::Shaded;
+-            bindMesh(mesh, scene.asset->materials[mesh.material], scene.foliage, flags.receive, nullptr, drawTint, 0, 0, 0);
++            bindMesh(mesh, scene.asset->materials[mesh.material], scene.foliage, flags.receive, nullptr, drawTint, 0, 0, 0, 0, !scene.oakPlacements.empty());
+             const auto countOffset = (batchStateHeader + 2 * view.sizes.x + batch.firstBin) * sizeof(UINT);
+             commands_->ExecuteIndirect(treeBatchDrawSignature_.Get(), sparse ? batch.commandCapacity : batch.binCount,
+                                        gpu.arguments.Get(), batch.firstCommand * sizeof(TreeBatchDraw), gpu.state.Get(), countOffset);
+--- a/src/ViewerScene.cpp
++++ b/src/ViewerScene.cpp
+@@ -127,6 +127,118 @@
+     return bounds;
+ }
+ 
++void loadSprayFamilies(ViewerScene& scene, const std::filesystem::path& manifest)
++{
++    auto hierarchy = std::make_shared<TreeHierarchy>();
++    std::vector<bool> registered(scene.asset->meshes.size());
++    std::ifstream input(manifest);
++    for (std::string line; std::getline(input, line);)
++    {
++        std::istringstream fields(line);
++        std::string leaf, wood, tree, extra;
++        if (!(fields >> leaf >> wood >> tree) || fields >> extra)
++            throw std::runtime_error("Invalid spray family manifest.");
++        const auto local = [&](const std::filesystem::path& name) {
++            if (name != name.filename()) throw std::runtime_error("Expected a local bake filename.");
++            return manifest.parent_path() / name;
++        };
++        const SprayBoughSources sources{scene.source, local(leaf), local(wood)};
++        auto& pair = scene.sprayFamilies.emplace_back();
++        for (std::size_t i = 0; i < pair.size(); ++i)
++            pair[i] = std::make_shared<FixedLod>(readFixedLod(scene.source, sources[i + 1], *scene.asset));
++        const auto a = pair[0]->meshIndex, b = pair[1]->meshIndex;
++        if (!scene.isLeafSpray(a) || scene.isLeafSpray(b) || registered[a] || registered[b] ||
++            scene.asset->meshes[a].instances != scene.asset->meshes[b].instances)
++            throw std::runtime_error("Incompatible shoot material roles or placement streams.");
++        auto group = readTreeHierarchy(sources, *scene.asset, local(tree));
++        for (auto& part : group.parts)
++        {
++            const auto id = part.meshIndex;
++            if (scene.asset->meshes[id].instances)
++            {
++                if (id != a && id != b) throw std::runtime_error("Unexpected shoot hierarchy part.");
++                if (part.placementOrder.empty()) part.placementOrder = group.placementOrder;
++            }
++            else if (registered[id]) continue; // Legacy per-pair bakes include the same scaffold.
++            registered[id] = true;
++            hierarchy->parts.push_back(std::move(part));
++        }
++    }
++    if (scene.sprayFamilies.empty() || std::ranges::find(registered, false) != registered.end())
++        throw std::runtime_error("Incomplete spray family manifest.");
++    scene.sprayLods = scene.sprayFamilies.front();
++    scene.treeHierarchy = hierarchy;
++    scene.branchLod = automaticBranchLod;
++    scene.sprayTraversal = SprayTraversal::Hierarchy;
++}
++
++// Validate against the original tree before combining its draw parts with the meadow.
++void attachMeadowOak(ViewerScene& scene)
++{
++    ViewerScene oak{};
++    oak.source = scene.source.parent_path() / "oak" / scene.source.filename();
++    oak.asset = std::make_shared<AssetData>(loadGlb(oak.source));
++    auto manifest = oak.source;
++    loadSprayFamilies(oak, manifest.replace_extension(".spraylods"));
++    auto meadow = std::move(scene.asset->meshes);
++    auto& parts = scene.asset->meshes;
++    parts = std::move(oak.asset->meshes);
++    scene.oakPartCount = parts.size();
++    // Keep the old geometry only for lighting probes. Discover roots from one
++    // part and match all other parts by transform, independent of GLB node order.
++    const auto& anchor = parts.at(0);
++    const auto inverseAnchor = XMMatrixInverse(nullptr, XMLoadFloat4x4(&anchor.localToWorld));
++    for (const auto& mesh : meadow)
++    {
++        if (mesh.name != anchor.name) continue;
++        XMFLOAT4X4 root;
++        XMStoreFloat4x4(&root, inverseAnchor * XMLoadFloat4x4(&mesh.localToWorld));
++        scene.oakPlacements.push_back({static_cast<unsigned>(scene.oakPlacements.size() + 1),
++            {root._41, root._43, std::atan2(root._31, root._11), root._22}, root._42});
++    }
++    if (scene.oakPlacements.empty()) throw std::runtime_error("Meadow contains no placements of the baked oak.");
++    std::vector<bool> registered(scene.oakPartCount * scene.oakPlacements.size());
++    std::vector<std::optional<std::size_t>> materials(scene.oakPartCount);
++    for (auto& mesh : meadow)
++    {
++        const auto oakEnd = parts.begin() + scene.oakPartCount;
++        const auto source = std::ranges::find(parts.begin(), oakEnd, mesh.name, &MeshData::name);
++        if (source == oakEnd)
++        {
++            parts.push_back(std::move(mesh));
++            continue;
++        }
++        const auto partIndex = static_cast<std::size_t>(source - parts.begin());
++        auto& material = materials[partIndex];
++        if (oak.asset->materials.at(source->material).name != scene.asset->materials.at(mesh.material).name ||
++            (material && *material != mesh.material))
++            throw std::runtime_error("Meadow oak material differs from the baked asset.");
++        material = mesh.material;
++        const auto actual = XMLoadFloat4x4(&mesh.localToWorld);
++        const auto placed = std::ranges::find_if(scene.oakPlacements, [&](const SceneObject& object) {
++            if (registered[(object.id - 1) * scene.oakPartCount + partIndex]) return false;
++            const auto expected = XMLoadFloat4x4(&source->localToWorld) * object.placementMatrix();
++            for (unsigned row = 0; row < 4; ++row)
++                if (!XMVector4NearEqual(expected.r[row], actual.r[row], XMVectorReplicate(0.0001f))) return false;
++            return true;
++        });
++        if (placed == scene.oakPlacements.end())
++            throw std::runtime_error("Meadow oak part has no matching upright tree placement.");
++        registered[(placed->id - 1) * scene.oakPartCount + partIndex] = true;
++        scene.oakProbeMeshes.push_back(std::move(mesh));
++    }
++    if (std::ranges::find(registered, false) != registered.end())
++        throw std::runtime_error("Incomplete meadow oak placement.");
++    for (std::size_t i = 0; i < scene.oakPartCount; ++i) parts[i].material = materials[i].value();
++    scene.meshShadows.assign(parts.size(), {});
++    scene.sprayFamilies = std::move(oak.sprayFamilies);
++    scene.sprayLods = oak.sprayLods;
++    scene.treeHierarchy = std::move(oak.treeHierarchy);
++    scene.branchLod = automaticBranchLod;
++    scene.sprayTraversal = SprayTraversal::Hierarchy;
++    scene.treeSubmission = TreeSubmission::GpuBatched;
++}
++
+ auto loadBranchVoxelRegions(const ViewerScene& scene, const std::filesystem::path& file, const std::filesystem::path& mask)
+ {
+     const auto& voxels = *scene.branchVoxels[automaticBranchVoxelIndex];
+@@ -239,7 +351,7 @@
+ XMMATRIX SceneObject::placementMatrix() const
+ {
+     const auto& p = placement;
+-    return XMMatrixScaling(p.w, p.w, p.w) * XMMatrixRotationY(p.z) * XMMatrixTranslation(p.x, 0.0f, p.y);
++    return XMMatrixScaling(p.w, p.w, p.w) * XMMatrixRotationY(p.z) * XMMatrixTranslation(p.x, elevation, p.y);
+ }
+ 
+ XMFLOAT3 CameraView::eye() const
+@@ -506,47 +618,7 @@
+         manifest.replace_extension(".spraylods");
+         if (std::filesystem::is_regular_file(manifest))
+         {
+-            auto hierarchy = std::make_shared<TreeHierarchy>();
+-            std::vector<bool> registered(scene.asset->meshes.size());
+-            std::ifstream input(manifest);
+-            for (std::string line; std::getline(input, line);)
+-            {
+-                std::istringstream fields(line);
+-                std::string leaf, wood, tree, extra;
+-                if (!(fields >> leaf >> wood >> tree) || fields >> extra)
+-                    throw std::runtime_error("Invalid spray family manifest.");
+-                const auto local = [&](const std::filesystem::path& name) {
+-                    if (name != name.filename()) throw std::runtime_error("Expected a local bake filename.");
+-                    return manifest.parent_path() / name;
+-                };
+-                const SprayBoughSources sources{scene.source, local(leaf), local(wood)};
+-                auto& pair = scene.sprayFamilies.emplace_back();
+-                for (std::size_t i = 0; i < pair.size(); ++i)
+-                    pair[i] = std::make_shared<FixedLod>(readFixedLod(scene.source, sources[i + 1], *scene.asset));
+-                const auto a = pair[0]->meshIndex, b = pair[1]->meshIndex;
+-                if (!scene.isLeafSpray(a) || scene.isLeafSpray(b) || registered[a] || registered[b] ||
+-                    scene.asset->meshes[a].instances != scene.asset->meshes[b].instances)
+-                    throw std::runtime_error("Incompatible shoot material roles or placement streams.");
+-                auto group = readTreeHierarchy(sources, *scene.asset, local(tree));
+-                for (auto& part : group.parts)
+-                {
+-                    const auto id = part.meshIndex;
+-                    if (scene.asset->meshes[id].instances)
+-                    {
+-                        if (id != a && id != b) throw std::runtime_error("Unexpected shoot hierarchy part.");
+-                        if (part.placementOrder.empty()) part.placementOrder = group.placementOrder;
+-                    }
+-                    else if (registered[id]) continue; // Legacy per-pair bakes include the same scaffold.
+-                    registered[id] = true;
+-                    hierarchy->parts.push_back(std::move(part));
+-                }
+-            }
+-            if (scene.sprayFamilies.empty() || std::ranges::find(registered, false) != registered.end())
+-                throw std::runtime_error("Incomplete spray family manifest.");
+-            scene.sprayLods = scene.sprayFamilies.front();
+-            scene.treeHierarchy = hierarchy;
+-            scene.branchLod = automaticBranchLod;
+-            scene.sprayTraversal = SprayTraversal::Hierarchy;
++            loadSprayFamilies(scene, manifest);
+         }
+         else try
+         {
+@@ -675,5 +747,7 @@
+                         mat.meadowGrowth = scene.groundMaterial.meadowCover;
+         }
+     }
++    if (kind == SceneKind::ForkedOak && GetEnvironmentVariableW(L"MEADOW_ADAPTIVE_OAK", nullptr, 0))
++        attachMeadowOak(scene);
+     return entry.emplace(std::move(scene));
+ }
+--- a/src/ViewerScene.h
++++ b/src/ViewerScene.h
+@@ -69,6 +69,7 @@
+     // X/Z translation, yaw in radians, and uniform scale.
+     DirectX::XMFLOAT4 placement;
+ 
++    float elevation = 0;
+     DirectX::XMMATRIX placementMatrix() const;
+ };
+ 
+@@ -160,6 +161,11 @@
+     std::filesystem::path source;
+     std::shared_ptr<AssetData> asset;
+     std::vector<SceneObject> objects;
++    // The meadow is one static scene. Baked oak geometry has its own instance domain.
++    std::vector<SceneObject> oakPlacements;
++    std::vector<MeshData> oakProbeMeshes;
++    std::size_t oakPartCount = 0;
++    const std::vector<SceneObject>& treePlacements() const { return oakPlacements.empty() ? objects : oakPlacements; }
+     Bounds assetBounds;
+     std::optional<Bounds> cameraBounds;
+     float nearPlane = 0.05f;

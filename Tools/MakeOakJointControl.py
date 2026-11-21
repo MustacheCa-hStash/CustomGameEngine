@@ -9,13 +9,16 @@ out=stage.parent/"oak-assembly-step"
 bough=int(os.environ.get("OAK_REUSABLE_BOUGH","7"))
 asset_path=f"/Game/NaniteOakBench/AssemblyStep{bough:02d}Joint"
 voxelize=os.environ.get("OAK_VOXEL_CONTROL")=="1"
-if voxelize:
-    asset_path+="Voxels"
-if "OAK_REUSABLE_BOUGH" in os.environ:
+if "OAK_SPRAY_GROUP_INPUT" in os.environ:
+    data=json.loads(Path(os.environ["OAK_SPRAY_GROUP_INPUT"]).read_text())
+    asset_path="/Game/NaniteOakBench/"+data["asset"]
+elif "OAK_REUSABLE_BOUGH" in os.environ:
     data=json.loads((out/f"reusable/bough{bough}-ue.json").read_text())
 else:
     data=dict(root=json.loads((out/"joint-root.json").read_text()),
               others=json.loads((stage/"branchstep-bough-input.json").read_text())["others"])
+if voxelize:
+    asset_path+="Voxels"
 assets=u.get_editor_subsystem(u.EditorAssetSubsystem)
 actors=u.get_editor_subsystem(u.EditorActorSubsystem)
 static=u.get_editor_subsystem(u.StaticMeshEditorSubsystem)

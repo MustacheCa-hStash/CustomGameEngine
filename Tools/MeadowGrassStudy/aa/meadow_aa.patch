@@ -1,0 +1,539 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -151,6 +151,21 @@
+         COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -Gis -E "${stage}" -Fh "${header}" -Vn "liveCut${stage}CS"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/shaders/LiveCut.hlsl"
+         DEPENDS shaders/LiveCut.hlsl "${DXC_EXECUTABLE}" VERBATIM)
++    list(APPEND tree_batch_headers "${header}")
++endforeach()
++
++set(far_temporal_ps "${CMAKE_CURRENT_BINARY_DIR}/FarTemporalPS.h")
++add_custom_command(OUTPUT "${far_temporal_ps}"
++    COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -D DISTANT_GRASS_LIGHT=1
++        -Fh "${far_temporal_ps}" -Vn farTemporalPS "${mesh_shader}"
++    DEPENDS "${mesh_shader}" shaders/ProbeLighting.hlsli shaders/LeafLighting.hlsli shaders/OakStudy.hlsli "${DXC_EXECUTABLE}" VERBATIM)
++list(APPEND tree_batch_headers "${far_temporal_ps}")
++foreach(stage IN ITEMS Weighted Seed Temporal)
++    set(header "${CMAKE_CURRENT_BINARY_DIR}/Meadow${stage}PS.h")
++    add_custom_command(OUTPUT "${header}"
++        COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E "${stage}" -Fh "${header}" -Vn "meadow${stage}PS"
++                "${CMAKE_CURRENT_SOURCE_DIR}/shaders/MeadowAA.hlsl"
++        DEPENDS shaders/MeadowAA.hlsl "${DXC_EXECUTABLE}" VERBATIM)
+     list(APPEND tree_batch_headers "${header}")
+ endforeach()
+ 
+--- a/shaders/Mesh.hlsl
++++ b/shaders/Mesh.hlsl
+@@ -93,6 +93,7 @@
+     float4 worldPositionAndViewDepth : TEXCOORD2;
+     nointerpolation uint meshInstanceId : TEXCOORD3;
+     nointerpolation float cardBlend : TEXCOORD4;
++    float windWeight : TEXCOORD11;
+ #ifdef DISTANT_GRASS_LIGHT
+     float3 probeCube[6] : TEXCOORD5;
+ #endif
+@@ -122,7 +123,7 @@
+     return value + rotation.w * twiceCross + cross(rotation.xyz, twiceCross);
+ }
+ 
+-float4 bendPosition(VertexInput input, uint instanceId, out float2 bendSlope)
++float4 bendPosition(VertexInput input, uint instanceId, out float2 bendSlope, out float windWeight)
+ {
+     float3 position = input.position;
+     if (usesMeshInstances)
+@@ -137,13 +138,15 @@
+     if (transmissionFlags & elevatedTreeBatch)
+         world.y += asfloat(lodTags.Load((firstLodTag + instanceId) * 16 + 12));
+     bendSlope = 0.0;
++    windWeight = 0;
+     if (movesWithWind)
+     {
+         // Use asset height to keep the lower trunk fixed at any instance scale.
+         // Apply the shared wind direction after yaw, with amplitude scaled per tree.
+         float height = (asset.y - windStart) * inverseWindHeight;
+         float weight = saturate(height);
+-        world.xz += windOffset * (weight * weight * input.instance.w);
++        windWeight = weight * weight * input.instance.w;
++        world.xz += windOffset * windWeight;
+         if (height > 0.0 && height < 1.0)
+         {
+             // Uniform instance scale cancels out of displacement per unit of world height.
+@@ -232,7 +235,7 @@
+         input.position*=scale;
+     }
+     float2 bendSlope;
+-    float4 world = bendPosition(input, instanceId, bendSlope);
++    float4 world = bendPosition(input, instanceId, bendSlope, output.windWeight);
+     output.position = mul(world, viewProjection);
+     float3 normal = input.normal;
+     if (usesMeshInstances)
+@@ -509,10 +512,7 @@
+     return 0.22 + (0.73 / 255.0) * float3(id & 255, (id >> 8) & 255, (id >> 16) & 255);
+ }
+ 
+-#ifdef OAK_PROFILE_EARLY_DEPTH
+-[earlydepthstencil]
+-#endif
+-float4 PSMain(PixelInput input, bool isFrontFace : SV_IsFrontFace, uint primitive : SV_PrimitiveID) : SV_Target
++float4 shadeSurface(PixelInput input, bool isFrontFace, uint primitive)
+ {
+     const float2 uv = textureCoordinateSet == 0 ? input.texcoords.xy : input.texcoords.zw;
+     if (shadowView >= 9)
+@@ -536,7 +536,16 @@
+         return float4(0.15, 0.55, 0.32, 1);
+     }
+     float4 baseColor = sampleTuftColor(input,uv);
+-    if (transmissionFlags & 65536u) clip(baseColor.a-.002);
++    if (probePadding && alphaCutoff >= 0 && (transmissionFlags & (32768u | 262144u)))
++    {
++        // Decorrelate overlapping tufts and cycle the threshold across jittered frames.
++        uint2 px = uint2(input.position.xy);
++        uint h = input.meshInstanceId ^ (px.x*0x9e3779b9u) ^ (px.y*0x85ebca6bu);
++        h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
++        float t = frac(float(h >> 8) / 16777216.0 + (probePadding-1)*.375);
++        clip(baseColor.a - max(t,.0001));
++    }
++    else if (transmissionFlags & 65536u) clip(baseColor.a-.002);
+     else applyCutout(baseColor.a);
+     float4 cardSurface=0;
+     float bladeCoverage=0;
+@@ -722,6 +731,18 @@
+     return float4(encodedCamera && hasColorTexture ? encodeSrgb(lit) : lit, 1.0);
+ }
+ 
++#ifdef OAK_PROFILE_EARLY_DEPTH
++[earlydepthstencil]
++#endif
++float4 PSMain(PixelInput input, bool front : SV_IsFrontFace, uint primitive : SV_PrimitiveID) : SV_Target
++{
++    float4 shaded = shadeSurface(input,front,primitive);
++    if (probePadding)
++        shaded.a = (alphaCutoff >= 0 && (transmissionFlags & (32768u | 262144u)))
++            ? -1.0-input.windWeight : input.windWeight;
++    return shaded;
++}
++
+ uint grassCoverage(PixelInput input, uint raster)
+ {
+     // Sample priority must vary between plants. Otherwise overlapping fine stems
+@@ -751,7 +772,8 @@
+ {
+     ShadowInput output;
+     float2 bendSlope;
+-    output.position = mul(bendPosition(input, instanceId, bendSlope), lightViewProjection);
++    float unusedWeight;
++    output.position = mul(bendPosition(input, instanceId, bendSlope, unusedWeight), lightViewProjection);
+     output.uv = materialUv(input);
+     return output;
+ }
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -5,6 +5,7 @@
+ #include "FarGrassPS.h"
+ #include "FarGrassVS.h"
+ #include "FarEqualPS.h"
++#include "FarTemporalPS.h"
+ #include "OakFlatPS.h"
+ #include "OakEarlyPS.h"
+ #include "OakVisibilityPS.h"
+@@ -484,7 +485,7 @@
+ 
+     D3D12_DESCRIPTOR_HEAP_DESC heapDescription{};
+     heapDescription.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+-    heapDescription.NumDescriptors = colorTargetCount + 1 + (canUseMsaa ? 2 : 0);
++    heapDescription.NumDescriptors = colorTargetCount + 3 + (canUseMsaa ? 2 : 0);
+     check(device_->CreateDescriptorHeap(&heapDescription, IID_PPV_ARGS(&renderTargetHeap_)),
+           "Create render target descriptor heap");
+ 
+@@ -503,6 +504,8 @@
+     viewport_.MaxDepth = 1.0f;
+     scissor_.right = static_cast<LONG>(backBuffer.Width);
+     scissor_.bottom = static_cast<LONG>(backBuffer.Height);
++    for (UINT i=0;i<2;++i)
++        aaTargets_[i].ptr = target.ptr + (1 + (canUseMsaa ? 2 : 0) + i)*descriptorSize;
+     sceneTarget_ = target;
+     sceneColor_ = createCameraColor(sceneColorFormat, {1, 0}, sceneTarget_,
+                                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+@@ -538,6 +541,7 @@
+                          {shadowVS, sizeof(shadowVS)}, {shadowPS, sizeof(shadowPS)}, {}, canUseMsaa);
+     createVoxelPipeline(canUseMsaa);
+     createDisplayPipeline();
++    createMeadowAaPipelines();
+     if (window) createHud();
+     frameConstants_ = createUploadBuffer((1 + sunCascadeSplits.size()) * frameConstantStride);
+     msaaEnabled_ = canUseMsaa;
+@@ -577,8 +581,7 @@
+ {
+     if (supportsMsaa())
+     {
+-        msaaEnabled_ = !msaaEnabled_;
+-        treeBatch_.historyValid = false;
++        setMeadowAa(msaaEnabled_ ? MeadowAa::Off : MeadowAa::Msaa);
+     }
+ }
+ 
+@@ -589,6 +592,8 @@
+ 
+ void D3D12Renderer::setScene(const ViewerScene& scene)
+ {
++    aaHistoryValid_ = false;
++    aaFrame_ = 0;
+     probeGrid_ = {};
+     diffuseProbes_.Reset();
+     probeDensity_.Reset();
+@@ -1864,8 +1869,9 @@
+ void D3D12Renderer::drawSky(ID3D12PipelineState* pipeline, const XMFLOAT4X4& view, bool skyOnly)
+ {
+     // Undo perspective scaling and rotate a camera-space direction into world space.
+-    const auto transform = XMMatrixScaling(1.0f / projection_._11, 1.0f / projection_._22, 1.0f) *
+-                           XMMatrixTranspose(XMLoadFloat4x4(&view));
++    auto rays = XMMatrixScaling(1.0f / projection_._11, 1.0f / projection_._22, 1.0f);
++    rays.r[2] = XMVectorSet(-projection_._31/projection_._11, -projection_._32/projection_._22, 1, 0);
++    const auto transform = rays * XMMatrixTranspose(XMLoadFloat4x4(&view));
+     SkyConstants constants{};
+     XMStoreFloat4x4(&constants.viewRayTransform, transform);
+     constants.toSun = toSun_;
+@@ -2387,6 +2393,11 @@
+     if (cullMeshBackfaces_) description.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+     auto singleSample = createCameraPipeline(description, "Create single-sample mesh pipelines");
+     CameraPipeline multisample;
++    auto temporalGrass = description;
++    temporalGrass.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
++    temporalGrass.VS = {farGrassVS,sizeof(farGrassVS)};
++    temporalGrass.PS = {farTemporalPS,sizeof(farTemporalPS)};
++    singleSample_.farGrass = createCameraPipeline(temporalGrass,"Create temporal distant grass lighting pipeline");
+     auto shadow = createShadowPipeline(shadowVertex, shadowPixel, bias);
+     if (enableMultisampling)
+     {
+@@ -2466,7 +2477,7 @@
+     check(commands_->Reset(allocator_.Get(), nullptr), "Reset texture upload list");
+     D3D12_DESCRIPTOR_HEAP_DESC heap{};
+     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+-    heap.NumDescriptors = static_cast<UINT>(textures.size() + 9 + (skyPanorama_ ? 1u : 0u));
++    heap.NumDescriptors = static_cast<UINT>(textures.size() + 13 + (skyPanorama_ ? 1u : 0u));
+     heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+     check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&textureHeap_)), "Create texture descriptor heap");
+     textureDescriptorSize_ = device_->GetDescriptorHandleIncrementSize(heap.Type);
+@@ -2516,6 +2527,15 @@
+     probeGpuView_.ptr = sceneColorView_.ptr + (skyPanorama_ ? 2ull : 1ull) * textureDescriptorSize_;
+     writeProbeView();
+     writeTreeDepthViews({probeCpuView_.ptr + textureDescriptorSize_});
++    aaCpu_ = textureHeap_->GetCPUDescriptorHandleForHeapStart();
++    aaGpu_ = textureHeap_->GetGPUDescriptorHandleForHeapStart();
++    const auto tail = UINT64(heap.NumDescriptors-4) * textureDescriptorSize_;
++    aaCpu_.ptr += tail;
++    aaGpu_.ptr += tail;
++    writeAaView(1,singleSample_.depthBuffer.Get(),DXGI_FORMAT_R32_FLOAT,false);
++    if (multisampleColor_) writeAaView(0,multisampleColor_.Get(),sceneColorFormat,true);
++    for (UINT i=0;i<2;++i)
++        if (aaHistory_[i]) writeAaView(2+i,aaHistory_[i].Get(),sceneColorFormat,false);
+     check(commands_->Close(), "Close texture upload command list");
+     if (!staging.empty())
+     {
+@@ -3347,6 +3367,7 @@
+                             amplitude * (0.34f * gust + 0.94f * crosswind)};
+     constants.windStart = windStart_;
+     constants.inverseWindHeight = inverseWindHeight_;
++    constants.probePadding = temporalCamera_ ? 1 + aaFrame_%8 : 0;
+     constants.useCascades = scene.usesSunCascades();
+     constants.showCascadeColors = scene.showCascadeColors;
+     constants.encodedCamera = encodedCamera_;
+@@ -3698,6 +3719,20 @@
+         if (!cascadeShadowMap_) createCascadeShadowMaps();
+         updateShadowCascades(cascadeFitView ? *cascadeFitView : view, scene);
+     }
++    splitCamera_ = !encodedCamera_ && !scene.oakPlacements.empty() && meadowAa_ == MeadowAa::Split;
++    temporalCamera_ = !encodedCamera_ && !scene.oakPlacements.empty() && meadowAa_ == MeadowAa::Temporal;
++    if (!temporalCamera_) aaHistoryValid_ = false;
++    const auto unjittered = projection_;
++    if (temporalCamera_)
++    {
++        // Centered eight-frame Halton sequence in pixel units.
++        constexpr XMFLOAT2 offsets[]{{0,-.166667f},{-.25f,.166667f},{.25f,-.388889f},{-.375f,-.055556f},
++                                     {.125f,.277778f},{-.125f,-.277778f},{.375f,.055556f},{-.4375f,.388889f}};
++        const auto offset = offsets[aaFrame_ % 8];
++        aaJitter_ = {offset.x + .0546875f,offset.y};
++        projection_._31 -= 2 * aaJitter_.x / viewport_.Width;
++        projection_._32 += 2 * offset.y / viewport_.Height;
++    }
+     const auto viewProjection = XMLoadFloat4x4(&view) * XMLoadFloat4x4(&projection_);
+     frameView_ = view;
+     const auto windOffset = updateFrameConstants(scene, viewProjection, windPhase);
+@@ -3784,7 +3819,11 @@
+     {
+         auto& color = encodedCamera_ ? encodedMultisampleColor_ : multisampleColor_;
+         colorTarget = encodedCamera_ ? encodedMultisampleTarget_ : multisampleTarget_;
+-        if (!color) color = createCameraColor(format, msaaSamples, colorTarget, D3D12_RESOURCE_STATE_RENDER_TARGET);
++        if (!color)
++        {
++            color = createCameraColor(format, msaaSamples, colorTarget, D3D12_RESOURCE_STATE_RENDER_TARGET);
++            if (!encodedCamera_) writeAaView(0,color.Get(),sceneColorFormat,true);
++        }
+         cameraColor = color.Get();
+     }
+     check(allocator_->Reset(), "Reset command allocator");
+@@ -3812,9 +3851,11 @@
+     commands_->SetGraphicsRootConstantBufferView(5, skyIrradiance_->GetGPUVirtualAddress());
+     commands_->SetGraphicsRootDescriptorTable(8, probeGpuView_);
+ 
+-    if (!msaaEnabled_)
+-    {
+-        transitionResource(commands_.Get(), cameraColor, resolvedIdle, D3D12_RESOURCE_STATE_RENDER_TARGET);
++    auto firstTarget = splitCamera_ ? sceneTarget_ : colorTarget;
++    const auto& firstMode = splitCamera_ ? singleSample_ : mode;
++    if (splitCamera_ || !msaaEnabled_)
++    {
++        transitionResource(commands_.Get(), resolvedColor, resolvedIdle, D3D12_RESOURCE_STATE_RENDER_TARGET);
+     }
+ 
+     constexpr float geometryMaskBackground[] = {0, 0, 0, 1};
+@@ -3822,12 +3863,12 @@
+     const bool showBackdrop = !captureGeometryMask_ && scene.captureLighting != CaptureLighting::Transmission &&
+                               scene.captureLighting != CaptureLighting::ShadowVisibility;
+     if (!showBackdrop) background = geometryMaskBackground;
+-    commands_->ClearRenderTargetView(colorTarget, background, 0, nullptr);
+-    commands_->ClearDepthStencilView(mode.depthTarget, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
++    commands_->ClearRenderTargetView(firstTarget, background, 0, nullptr);
++    commands_->ClearDepthStencilView(firstMode.depthTarget, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+ 
+     commands_->RSSetViewports(1, &viewport_);
+     commands_->RSSetScissorRects(1, &scissor_);
+-    commands_->OMSetRenderTargets(1, &colorTarget, FALSE, &mode.depthTarget);
++    commands_->OMSetRenderTargets(1, &firstTarget, FALSE, &firstMode.depthTarget);
+     for (auto& selected : selectedBoughTrees_) selected.clear();
+     if (scene.cameraPipelineStats)
+     {
+@@ -3888,14 +3929,15 @@
+     timestamp(TreeDepthStart);
+     finishTreeBatchDepth(viewProjection);
+     timestamp(TreeDepthEnd);
+-    if (auto* skyPipeline = mode.sky.get(encodedCamera_); skyPipeline && showBackdrop)
++    if (auto* skyPipeline = mode.sky.get(encodedCamera_); skyPipeline && showBackdrop && !splitCamera_)
+     {
+         drawSky(skyPipeline, view, scene.captureLighting == CaptureLighting::SkyOnly);
+         ++camera.draws;
+         ++camera.triangles;
+     }
+ 
+-    if (msaaEnabled_)
++    if (!encodedCamera_ && meadowAa_ == MeadowAa::Weighted) resolveWeighted(scene.exposureEv);
++    else if (msaaEnabled_)
+     {
+         transitionResource(commands_.Get(), cameraColor, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                            D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+@@ -3909,6 +3951,8 @@
+     {
+         transitionResource(commands_.Get(), resolvedColor, D3D12_RESOURCE_STATE_RENDER_TARGET, resolvedReady);
+     }
++    if (temporalCamera_) resolveTemporal(viewProjection);
++    projection_ = unjittered;
+     if (!encodedCamera_)
+     {
+         transitionResource(commands_.Get(), backBuffer, idleState, D3D12_RESOURCE_STATE_RENDER_TARGET);
+@@ -3916,7 +3960,7 @@
+         drawDisplay(scene.exposureEv);
+     }
+     timestamp(CameraEnd);
+-    if (linearCapture) copyFrameColor(sceneColor_.Get(), linearIdle, linearIdle, linearReadback_);
++    if (linearCapture) copyFrameColor(temporalCamera_ ? aaHistory_[(aaFrame_-1)%2].Get() : sceneColor_.Get(), linearIdle, linearIdle, linearReadback_);
+     if (drawOverlay) commands_->OMSetRenderTargets(1, &renderTargets_[bufferIndex], FALSE, nullptr);
+     if (swapChain_ && !hud.empty()) drawHud(renderTargets_[bufferIndex], hud);
+     if (drawOverlay)
+@@ -5204,6 +5248,7 @@
+     const bool batchedTrees = !materialCull && treeLod && scene.treeSubmission == TreeSubmission::GpuBatched &&
+                               drawBatchedTrees(scene, separateOaks ? grove : visibility, shadowPass, shadowSlice, stats);
+     if (separateOaks && !batchedTrees) throw std::runtime_error("Meadow oak batch unavailable.");
++    if (!shadowPass && splitCamera_) seedGrassSamples(scene,stats);
+     const auto woodIndex = !shadowPass && !materialCull && treeLod && scene.treeSubmission == TreeSubmission::GpuPerPart &&
+                           scene.treeOcclusion && scene.sprayLods[1] &&
+                           treeParts_[scene.sprayLods[1]->meshIndex].gpuNodes
+@@ -5303,7 +5348,8 @@
+                 commands_->SetPipelineState(cameraMode.coverageMesh.get(encodedCamera_));
+             const bool farPass = mesh.tuftCard && !shadowPass && msaaEnabled_ && !captureGeometryMask_ &&
+                                  !boughDepth_ && !boughMaterials_ && oakRaster_==OakRaster::Live;
+-            if (vertexProbes && farPass)
++            const bool temporalFar = temporalCamera_ && !shadowPass && mesh.tuftCard && vertexProbes;
++            if (temporalFar || (vertexProbes && farPass))
+                 commands_->SetPipelineState(cameraMode.farGrass.get(encodedCamera_));
+             static const bool depthFirst=GetEnvironmentVariableW(L"MEADOW_FAR_DEPTH",nullptr,0)!=0;
+             if (depthFirst && farPass)
+@@ -5320,7 +5366,7 @@
+                 commands_->SetPipelineState((vertexProbes ? cameraMode.farEqual : cameraMode.grassEqual).get(encodedCamera_));
+             }
+             drawInstancedMesh(scene, i, visibility, shadowPass, shadowSlice, stats);
+-            if ((mesh.tuftCard || (nearProxy && material.alphaCutoff >= 0)) && msaaEnabled_)
++            if (temporalFar || ((mesh.tuftCard || (nearProxy && material.alphaCutoff >= 0)) && msaaEnabled_))
+                 commands_->SetPipelineState(cameraMode.mesh.get(encodedCamera_));
+             commands_->IASetVertexBuffers(1, 1, &instanceView_);
+             continue;
+@@ -5480,12 +5526,12 @@
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+         treeDepthReady_ = false;
+     }
+-    bool drewTerrain=false;
++    bool drewTerrain = !shadowPass && splitCamera_;
+     if (!farReceivers.empty())
+     {
+         // Resolve terrain into the same sample depths as all three grass layers.
+         // This also rejects distant plants hidden by the crest before lighting.
+-        if (!captureGeometryMask_)
++        if (!captureGeometryMask_ && !drewTerrain)
+         {
+             commands_->SetPipelineState(cameraMode.mesh.get(encodedCamera_));
+             stats.triangles += drawMesh(ground_,scene.groundMaterial,false,scene.groundShadows.receive,1,0);
+@@ -5760,7 +5806,7 @@
+     const float exposureScale = std::exp2(exposureEv);
+     commands_->SetGraphicsRootSignature(displayRoot_.Get());
+     commands_->SetPipelineState(displayPipeline_.Get());
+-    commands_->SetGraphicsRootDescriptorTable(0, sceneColorView_);
++    commands_->SetGraphicsRootDescriptorTable(0, temporalCamera_ ? aaView(2+(aaFrame_-1)%2) : sceneColorView_);
+     commands_->SetGraphicsRoot32BitConstant(1, std::bit_cast<UINT>(exposureScale), 0);
+     commands_->DrawInstanced(3, 1, 0, 0);
+ }
+@@ -5859,3 +5905,5 @@
+     commands_->IASetVertexBuffers(0, 1, &view);
+     commands_->DrawInstanced(4, count, 0, 0);
+ }
++
++#include "MeadowAA.inl"
+--- a/src/D3D12Renderer.h
++++ b/src/D3D12Renderer.h
+@@ -107,6 +107,11 @@
+     bool supportsMsaa() const;
+     bool msaaEnabled() const;
+     void toggleMsaa();
++    enum class MeadowAa { Off, Msaa, Weighted, Split, Temporal };
++    void configureMeadowAa();
++    void setMeadowAa(MeadowAa mode);
++    MeadowAa meadowAa() const { return meadowAa_; }
++    const wchar_t* meadowAaName() const;
+     void setScene(const ViewerScene& scene);
+     void updateCameraProjection(float nearPlane, float farPlane);
+     void updateOrbitCameraProjection(const ViewerScene& scene, float distance);
+@@ -544,6 +549,24 @@
+     void createMeshPipelineLayout();
+     void createSky(const std::filesystem::path& panorama);
+     void drawSky(ID3D12PipelineState* pipeline, const DirectX::XMFLOAT4X4& view, bool skyOnly);
++    MeadowAa meadowAa_ = MeadowAa::Msaa;
++    bool splitCamera_ = false, temporalCamera_ = false, aaHistoryValid_ = false;
++    UINT aaFrame_ = 0;
++    DirectX::XMFLOAT4X4 aaPrevious_{};
++    DirectX::XMFLOAT2 aaWind_{}, aaJitter_{}, aaPreviousJitter_{};
++    DirectX::XMFLOAT4X4 aaPreviousView_{};
++    D3D12_CPU_DESCRIPTOR_HANDLE aaCpu_{};
++    D3D12_GPU_DESCRIPTOR_HANDLE aaGpu_{};
++    std::array<D3D12_CPU_DESCRIPTOR_HANDLE,2> aaTargets_{};
++    std::array<ComPtr<ID3D12Resource>,2> aaHistory_;
++    ComPtr<ID3D12RootSignature> aaRoot_;
++    ComPtr<ID3D12PipelineState> aaWeighted_, aaSeed_, aaTemporal_;
++    void createMeadowAaPipelines();
++    void seedGrassSamples(const ViewerScene& scene, PassStats& stats);
++    void writeAaView(UINT slot, ID3D12Resource* resource, DXGI_FORMAT format, bool multisampled);
++    D3D12_GPU_DESCRIPTOR_HANDLE aaView(UINT slot) const;
++    void resolveWeighted(float exposure);
++    void resolveTemporal(DirectX::FXMMATRIX clip);
+     void createDisplayPipeline();
+     void drawDisplay(float exposureEv);
+     void createProbePipeline();
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -295,6 +295,7 @@
+         title = renderer.msaaEnabled() ? L"Custom Game Engine | MSAA 4x (M)"
+                                        : L"Custom Game Engine | MSAA off (M)";
+     }
++    if (!scene.oakPlacements.empty()) title = std::format(L"Four Oak Meadow | {} | AA 1-5 / F2", renderer.meadowAaName());
+     const auto size = renderer.viewportSize();
+     title += std::format(L" | {} x {}", static_cast<UINT>(size.x), static_cast<UINT>(size.y));
+     if (scene.foliage)
+@@ -579,8 +580,10 @@
+         if (review && enableMsaa && !renderer.supportsMsaa())
+             throw std::runtime_error("The selected D3D12 device does not support 4x MSAA for this renderer.");
+         if (renderer.msaaEnabled() != enableMsaa) renderer.toggleMsaa();
++        if (!scene->oakPlacements.empty()) renderer.configureMeadowAa();
+         renderer.setScene(*scene);
+         SceneInspector inspector(window, renderer);
++        if (!scene->oakPlacements.empty()) inspector.toggle(); // Start the foliage review unobstructed.
+         PerformanceHud hud;
+         WindClock wind;
+         if (review) wind.pauseAt(review->windTime);
+@@ -669,6 +672,26 @@
+                 if (initialKeyDown && message.wParam == VK_F1)
+                 {
+                     inspector.toggle();
++                    continue;
++                }
++                const bool aaDigit = message.wParam >= '1' && message.wParam <= '5';
++                if (initialKeyDown && !scene->oakPlacements.empty() &&
++                    (message.wParam == VK_F2 || (aaDigit && !SceneInspector::editingValue())))
++                {
++                    int index = static_cast<int>(renderer.meadowAa());
++                    if (aaDigit) index = static_cast<int>(message.wParam - '1');
++                    else
++                    {
++                        const int step = (GetKeyState(VK_SHIFT) & 0x8000) ? 4 : 1;
++                        do { index = (index + step) % 5; }
++                        while (!renderer.supportsMsaa() && index > 0 && index < 4);
++                    }
++                    if (renderer.supportsMsaa() || index == 0 || index == 4)
++                    {
++                        renderer.setMeadowAa(static_cast<D3D12Renderer::MeadowAa>(index));
++                        hud.reset();
++                        refreshTitle();
++                    }
+                     continue;
+                 }
+                 if (initialKeyDown && !SceneInspector::wantsKeyboard())
+--- a/src/SceneCapture.cpp
++++ b/src/SceneCapture.cpp
+@@ -764,6 +764,7 @@
+     if (options.msaa == 4 && !renderer.supportsMsaa())
+         throw std::runtime_error("The selected D3D12 device does not support 4x MSAA for this renderer.");
+     if (renderer.msaaEnabled() != (options.msaa == 4)) renderer.toggleMsaa();
++    if (!scene.oakPlacements.empty()) renderer.configureMeadowAa();
+     renderer.setScene(scene);
+ 
+     const auto start = captureCamera(scene, options);
+@@ -805,6 +806,8 @@
+         renderer.updateOrbitCameraProjection(scene, view.distance);
+         const auto matrix = view.matrix();
+         renderer.updateBranchLod(scene, matrix);
++        if (index==0 && renderer.meadowAa()==D3D12Renderer::MeadowAa::Temporal)
++            for (UINT warmup=0; warmup<16; ++warmup) renderer.drawFrame(scene,matrix,windPhaseAt(windTime),{});
+         if (options.profileOakRaster)
+             profileOakRaster(renderer, scene, matrix, windPhaseAt(windTime), output);
+         if (options.timingSamples)
+--- a/src/SceneInspector.cpp
++++ b/src/SceneInspector.cpp
+@@ -610,6 +610,11 @@
+     const auto handled = ImGui_ImplWin32_WndProcHandler(window, message, wParam, lParam);
+     const auto& io = ImGui::GetIO();
+     return handled != 0 || (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST && io.WantCaptureMouse);
++}
++
++bool SceneInspector::editingValue()
++{
++    return ImGui::GetIO().WantTextInput || ImGui::IsAnyItemActive();
+ }
+ 
+ bool SceneInspector::wantsKeyboard()
+--- a/src/SceneInspector.h
++++ b/src/SceneInspector.h
+@@ -33,6 +33,7 @@
+ 
+     static bool handleMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+     static bool wantsKeyboard();
++    static bool editingValue();
+ 
+     void toggle() { visible_ = !visible_; }
+     void resetSelection();
+--- a/src/TreeGpu.cpp
++++ b/src/TreeGpu.cpp
+@@ -1237,7 +1237,7 @@
+                                 transition(gpu.state.Get(), write, readState), transition(gpu.instances.Get(), write, readInstances)};
+         barriers(toDraw);
+         timestamp(slot, PackEnd);
+-        const auto& mode = msaaEnabled_ ? multisample_ : singleSample_;
++        const auto& mode = msaaEnabled_ && !splitCamera_ ? multisample_ : singleSample_;
+         commands_->SetPipelineState(shadowPass ? shadowPipeline_.Get() : mode.mesh.get(encodedCamera_));
+         for (const auto& batch : gpu.batches)
+         {

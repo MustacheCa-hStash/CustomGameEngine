@@ -1,0 +1,214 @@
+--- a/src/D3D12Renderer.h
++++ b/src/D3D12Renderer.h
+@@ -214,6 +214,10 @@
+         D3D12_INDEX_BUFFER_VIEW farGrassIndices{};
+         UINT farGrassCount = 0;
+         float farGrassError = 0;
++        ComPtr<ID3D12Resource> cameraGrassBuffer;
++        D3D12_INDEX_BUFFER_VIEW cameraGrassIndices{};
++        UINT cameraGrassCount = 0;
++        float cameraGrassError = 0;
+         std::vector<Bounds> diagnosticTuftBounds;
+         ComPtr<ID3D12Resource> vertexBuffer;
+         ComPtr<ID3D12Resource> indexBuffer;
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -2576,7 +2576,7 @@
+ 
+ // Each optimized lamina has eight folded rows (margin, keel, margin) and a tip.
+ // Retain every blade and choose the interior rows with the largest silhouette errors.
+-static std::vector<UINT> farBladeIndices(const MeshData& mesh, float& error)
++static std::vector<UINT> bladeLodIndices(const MeshData& mesh, float& error, bool flatRibbon)
+ {
+     constexpr UINT stride = 25;
+     if (mesh.vertices.size()%stride || mesh.indices.size()!=mesh.vertices.size()/stride*90) return {};
+@@ -2616,18 +2616,72 @@
+                     }
+                 }
+             }
+-            if (cuts.size()>=5) { error=std::max(error,worst); break; }
++            if (cuts.size() >= (flatRibbon ? 6u : 5u))
++            {
++                if (flatRibbon)
++                {
++                    float fold = 0;
++                    for (UINT row : cuts)
++                        fold = std::max(fold, XMVectorGetX(XMVector3Length(
++                            point(row,1)-XMVectorLerp(point(row,0),point(row,2),.5f))));
++                    worst += fold;
++                }
++                error = std::max(error,worst);
++                break;
++            }
+             cuts.insert(std::lower_bound(cuts.begin(),cuts.end(),split),split);
+         }
+         for (size_t j=1; j<cuts.size(); ++j)
+         {
+             const UINT a=cuts[j-1],b=cuts[j];
++            if (flatRibbon)
++            {
++                if (b<8) indices.insert(indices.end(),{id(a,0),id(b,0),id(b,2)});
++                indices.insert(indices.end(),{id(a,0),id(b,2),id(a,2)});
++                continue;
++            }
+             for (UINT k=0;k<2;++k)
+             {
+                 if (b<8) indices.insert(indices.end(),{id(a,k),id(b,k),id(b,k+1)});
+                 indices.insert(indices.end(),{id(a,k),id(b,k+1),id(a,k+1)});
+             }
+         }
++    }
++    return indices;
++}
++
++// The authored tubes use contiguous rings. Preserve each ring centre, both ends
++// and every panicle branch. Skip alternate radial vertices only on wide rings.
++static std::vector<UINT> cameraTubeIndices(const MeshData& mesh, float& error)
++{
++    std::vector<UINT> indices;
++    const auto& src = mesh.indices;
++    for (size_t cursor=0; cursor<src.size();)
++    {
++        if (cursor+6>src.size()) return {};
++        const UINT base=src[cursor], next=src[cursor+5];
++        const UINT sides=next-base;
++        if (next<=base || sides<3 || sides>12 || cursor+6*sides>src.size() ||
++            size_t(next)+sides>mesh.vertices.size()) return {};
++        for (UINT j=0;j<sides;++j)
++        {
++            const UINT k=(j+1)%sides;
++            const UINT face[]={base+j,base+k,next+k,base+j,next+k,next+j};
++            if (!std::equal(std::begin(face),std::end(face),src.begin()+cursor+6*j)) return {};
++        }
++        for (UINT j=0; j<sides;)
++        {
++            const UINT end=std::min(sides,j+(sides>=5 ? 2u : 1u)), k=end%sides;
++            indices.insert(indices.end(),{base+j,base+k,next+k,base+j,next+k,next+j});
++            if (end==j+2)
++                for (UINT ring : {base,next})
++                {
++                    const auto p=[&](UINT lane){ return XMLoadFloat3(&mesh.vertices[ring+lane].position); };
++                    error=std::max(error,XMVectorGetX(XMVector3Length(p(j+1)-XMVectorLerp(p(j),p(k),.5f))));
++                }
++            j=end;
++        }
++        cursor+=6*sides;
+     }
+     return indices;
+ }
+@@ -2651,7 +2705,7 @@
+     {
+         float error=0;
+         std::vector<UINT> proxy;
+-        if (material->name.starts_with("Lamina |")) proxy=farBladeIndices(mesh,error);
++        if (material->name.starts_with("Lamina |")) proxy=bladeLodIndices(mesh,error,false);
+         if (proxy.empty())
+         {
+             proxy.resize(mesh.indices.size());
+@@ -2671,6 +2725,27 @@
+             for (const auto& tuft : *mesh.instances)
+                 maxScale=std::max({maxScale,std::abs(tuft.scale.x),std::abs(tuft.scale.y),std::abs(tuft.scale.z)});
+             gpu.farGrassError=error*maxScale*maxLinearStretch(XMLoadFloat4x4(&mesh.localToWorld));
++        }
++    }
++    if (material && mesh.instances && mesh.name.starts_with("Full grass strip") &&
++        !GetEnvironmentVariableW(L"MEADOW_FULL_CAMERA_MESH",nullptr,0))
++    {
++        float error = 0;
++        std::vector<UINT> mid;
++        if (material->name.starts_with("Lamina |")) mid=bladeLodIndices(mesh,error,true);
++        else if (material->name=="Culm" || material->name.starts_with("Green sheath") || material->name=="Old sheath")
++            mid=cameraTubeIndices(mesh,error);
++        if (!mid.empty() && mid.size()<mesh.indices.size())
++        {
++            gpu.cameraGrassCount=static_cast<UINT>(mid.size());
++            const UINT bytes=gpu.cameraGrassCount*sizeof(UINT);
++            gpu.cameraGrassBuffer=uploadBuffer(mid.data(),bytes);
++            gpu.cameraGrassIndices={gpu.cameraGrassBuffer->GetGPUVirtualAddress(),bytes,DXGI_FORMAT_R32_UINT};
++            float scale=0;
++            for (const auto& tuft : *mesh.instances)
++                scale=std::max({scale,std::abs(tuft.scale.x),std::abs(tuft.scale.y),std::abs(tuft.scale.z)});
++            // The lower bound also protects nearby highlights on round stems.
++            gpu.cameraGrassError=std::max(.002f,error)*scale*maxLinearStretch(XMLoadFloat4x4(&mesh.localToWorld));
+         }
+     }
+     if (mesh.instances)
+@@ -4329,8 +4404,12 @@
+                 bindMesh(mesh, material, scene.foliage, receive, nullptr, tint, 0, 0, 0, 0);
+                 const bool farProxy = shadowPass && shadowSlice && *shadowSlice==2 && mesh.farGrassCount &&
+                     mesh.farGrassError*object.placement.w <= 0.65f*cascadeWorldUnitsPerTexel_[2];
+-                const UINT indexCount = farProxy ? mesh.farGrassCount : mesh.indexCount;
++                UINT indexCount = farProxy ? mesh.farGrassCount : mesh.indexCount;
+                 if (farProxy) commands_->IASetIndexBuffer(&mesh.farGrassIndices);
++                const bool selectCameraGrass = !shadowPass && mesh.cameraGrassCount;
++                XMFLOAT4X4 placementMatrix;
++                XMStoreFloat4x4(&placementMatrix, object.placementMatrix());
++                const XMFLOAT2 wind{frameWind_.x*object.placement.w, frameWind_.y*object.placement.w};
+                 UINT first = 0, count = 0;
+                 const auto flush = [&] {
+                     if (!count) return;
+@@ -4347,6 +4426,17 @@
+                     {
+                         flush();
+                         continue;
++                    }
++                    if (selectCameraGrass)
++                    {
++                        const bool mid = projectLodError(mesh.cameraGrassError,tile.bounds,placementMatrix,frameView_,wind) < .85f;
++                        const UINT desired = mid ? mesh.cameraGrassCount : mesh.indexCount;
++                        if (desired != indexCount)
++                        {
++                            flush();
++                            indexCount=desired;
++                            commands_->IASetIndexBuffer(mid ? &mesh.cameraGrassIndices : &mesh.indices);
++                        }
+                     }
+                     static const bool farCheckOnly = GetEnvironmentVariableW(L"MEADOW_TEST_FAR_CAMERA_TUFTS",nullptr,0) != 0;
+                     if (shadowPass && !mesh.diagnosticTuftBounds.empty() && (!farCheckOnly || farProxy))
+--- a/src/SceneCapture.cpp
++++ b/src/SceneCapture.cpp
+@@ -12,6 +12,7 @@
+ #include <cstring>
+ #include <cwchar>
+ #include <format>
++#include <fstream>
+ #include <stdexcept>
+ 
+ using Microsoft::WRL::ComPtr;
+@@ -22,6 +23,7 @@
+ struct CaptureOptions
+ {
+     fs::path linearHdr;
++    fs::path focusTrack;
+     SceneKind scene = SceneKind::Cube;
+     fs::path imported;
+     fs::path settings;
+@@ -192,6 +194,7 @@
+         else if (flag == L"--wind-time") options.windTime = number(value, 0, 1'000'000, "--wind-time");
+         else if (flag == L"--wind-strength")
+             options.windStrength = static_cast<float>(number(value, 0, maxWindStrength, "--wind-strength"));
++        else if (flag == L"--focus-track") options.focusTrack = value;
+         else if (flag == L"--focus-offset-x") options.focusOffset.x = static_cast<float>(number(value, -100, 100, "--focus-offset-x"));
+         else if (flag == L"--focus-offset-y") options.focusOffset.y = static_cast<float>(number(value, -100, 100, "--focus-offset-y"));
+         else if (flag == L"--focus-offset-z") options.focusOffset.z = static_cast<float>(number(value, -100, 100, "--focus-offset-z"));
+@@ -782,12 +785,20 @@
+         "camera_spray_wood_triangles,shadow_spray_wood_triangles,camera_coarse_wood_sprays,shadow_coarse_wood_sprays,"
+         "camera_triangles,shadow_triangles,camera_leaf_triangles,camera_voxel_bricks,gpu_asset_ms,gpu_bough_brick_ms,gpu_camera_ms,gpu_frame_ms" +
+         lodColumns;
++    std::ifstream focusTrack;
++    if (!options.focusTrack.empty())
++    {
++        focusTrack.open(options.focusTrack);
++        if (!focusTrack) throw std::runtime_error("Cannot open focus track.");
++    }
+     for (UINT index = 0; index < options.frames; ++index)
+     {
+         const double seconds = index / options.fps;
+         const double windTime = options.windTime + (options.animateWind ? seconds : 0);
+         const auto fraction = sequence ? static_cast<float>(index) / static_cast<float>(options.frames - 1) : 0;
+         auto view = start;
++        if (focusTrack.is_open() && !(focusTrack >> view.focus.x >> view.focus.y >> view.focus.z))
++            throw std::runtime_error("Missing position in focus track.");
+         view.yaw += orbitRadians * fraction;
+         view.pitch = std::lerp(start.pitch, endPitch, fraction);
+         view.distance = std::lerp(start.distance, endDistance, fraction);

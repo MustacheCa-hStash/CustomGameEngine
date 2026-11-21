@@ -1,5 +1,9 @@
 #include "D3D12Renderer.h"
 #include "MeshletPacking.h"
+#include "LiveCutClearCS.h"
+#include "LiveCutTraverseCS.h"
+#include "LiveCutEncodeCS.h"
+#include "LiveCutPackCS.h"
 #include "TreeBatchClipCS.h"
 #include "TreeBatchCullHistoryCS.h"
 #include "TreeBatchDepthCS.h"
@@ -95,6 +99,28 @@ void D3D12Renderer::createTreeGpuPipelines()
         desc.CS = shader;
         checkTree(device_->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline)), "Create tree compute pipeline");
     };
+    std::array<D3D12_ROOT_PARAMETER,14> live{};
+    live[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    live[0].Constants={0,0,9};
+    live[11].ParameterType=D3D12_ROOT_PARAMETER_TYPE_SRV;
+    live[11].Descriptor.ShaderRegister=5;
+    for (UINT i=12;i<14;++i) {
+        live[i].ParameterType=D3D12_ROOT_PARAMETER_TYPE_UAV;
+        live[i].Descriptor.ShaderRegister=i-7;
+    }
+    for (UINT i=0;i<5;++i)
+    {
+        live[1+i].ParameterType=D3D12_ROOT_PARAMETER_TYPE_SRV;
+        live[6+i].ParameterType=D3D12_ROOT_PARAMETER_TYPE_UAV;
+        live[1+i].Descriptor.ShaderRegister=live[6+i].Descriptor.ShaderRegister=i;
+    }
+    constexpr D3D12_SHADER_BYTECODE liveStages[]{{liveCutClearCS,sizeof(liveCutClearCS)},
+        {liveCutTraverseCS,sizeof(liveCutTraverseCS)}, {liveCutEncodeCS,sizeof(liveCutEncodeCS)},{liveCutPackCS,sizeof(liveCutPackCS)}};
+    for (size_t i=0;i<liveGpuPipelines_.size();++i) create(live,liveStages[i],liveGpuRoot_,liveGpuPipelines_[i]);
+    const D3D12_INDIRECT_ARGUMENT_DESC indexed{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED};
+    const D3D12_COMMAND_SIGNATURE_DESC signature{sizeof(D3D12_DRAW_INDEXED_ARGUMENTS),1,&indexed,0};
+    checkTree(device_->CreateCommandSignature(&signature,nullptr,IID_PPV_ARGS(&liveGpuSignature_)), "Create live draw signature");
+
     std::array<D3D12_ROOT_PARAMETER, 11> selection{};
     selection[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     for (UINT i = 0; i < 6; ++i)
@@ -142,6 +168,223 @@ void D3D12Renderer::createTreeGpuPipelines()
         {treeBatchRetestOcclusionCS, sizeof(treeBatchRetestOcclusionCS)}};
     for (std::size_t i = 0; i < treeBatchPipelines_.size(); ++i)
         create(batch, shaders[i], treeBatchRoot_, treeBatchPipelines_[i]);
+}
+
+void D3D12Renderer::prepareLiveGpu()
+{
+    auto& gpu=liveGpu_;
+    const auto& cut=liveCut_;
+    struct Geometry { LiveCut::Ranges ranges; UINT first, assembly; };
+    static_assert(sizeof(Geometry)==32 && sizeof(LiveGpu::View)==272);
+    std::vector<UINT> stack, depth(cut.nodes.size()), parent(cut.nodes.size()), remap(cut.nodes.size());
+    std::vector<UINT> capacities(cut.geometry.size());
+    std::vector<bool> assembly(cut.geometry.size(),cut.packAssembly);
+    UINT sprays=0;
+    // The disk cut is preorder. Repack by depth so a dispatch only consumes completed parents.
+    for (UINT i=0;i<cut.nodes.size();++i)
+    {
+        while (!stack.empty() && i>=cut.nodes[stack.back()].end) stack.pop_back();
+        const auto& n=cut.nodes[i];
+        if (!stack.empty() && n.end>cut.nodes[stack.back()].end)
+            throw std::runtime_error("Overlapping live cut subtrees.");
+        depth[i]=static_cast<UINT>(stack.size());
+        if (depth[i]==gpu.levels.size()) gpu.levels.push_back({});
+        ++gpu.levels[depth[i]][1];
+        parent[i]=stack.empty()? UINT_MAX : stack.back();
+        if (n.kind<2) stack.push_back(i);
+        else if (n.kind==2) {
+            ++capacities[n.geometry];
+            if (n.instance!=cut.placements.size()-1) assembly[n.geometry]=false;
+        }
+        else ++sprays;
+    }
+    UINT end=0;
+    std::vector<UINT> cursor;
+    for (auto& level:gpu.levels) { level[0]=end; cursor.push_back(end); end+=level[1]; }
+    std::vector<LiveCut::Node> nodes(cut.nodes.size());
+    for (UINT i=0;i<nodes.size();++i)
+    {
+        auto& n=nodes[remap[i]=cursor[depth[i]]++];
+        n=cut.nodes[i];
+        n.end=parent[i]==UINT_MAX ? UINT_MAX : remap[parent[i]];
+    }
+    // Each spray can choose any reachable tier. Each native cluster has one fixed bin.
+    std::vector<bool> sprayBin(capacities.size());
+    for (auto tier:cut.tiers) sprayBin[tier.geometry]=true;
+    std::vector<Geometry> geometry;
+    for (UINT i=0;i<capacities.size();++i)
+    {
+        const bool gather=assembly[i] && capacities[i] && !sprayBin[i];
+        geometry.push_back({cut.geometry[i],gpu.capacity,gather});
+        if (gather) for (UINT slot=0;slot<3;++slot) gpu.packSizes[slot]+=cut.geometry[i][slot].indexCount;
+        gpu.capacity+=capacities[i]+(sprayBin[i]?sprays:0);
+    }
+    if (!gpu.capacity || uint64_t(gpu.capacity)*sizeof(MeshInstance)>UINT_MAX)
+        throw std::runtime_error("Live cut exceeds the D3D instance view limit.");
+    const LiveCut::Tier emptyTier{};
+    gpu.inputs[0]=uploadBuffer(nodes.data(),nodes.size()*sizeof(nodes[0]));
+    gpu.inputs[1]=uploadBuffer(geometry.data(),geometry.size()*sizeof(Geometry));
+    gpu.inputs[2]=cut.tiers.empty()?uploadBuffer(&emptyTier,sizeof(emptyTier)):uploadBuffer(cut.tiers.data(),cut.tiers.size()*sizeof(emptyTier));
+    gpu.inputs[3]=uploadBuffer(cut.placements.data(),cut.placements.size()*sizeof(MeshInstance));
+    const size_t trees=cut.treeCount;
+    auto scratch=[&](size_t bytes){return buffer(device_.Get(),bytes*trees,D3D12_HEAP_TYPE_DEFAULT);};
+    gpu.views=createUploadBuffer(trees*sizeof(LiveGpu::View));
+    gpu.active=scratch(nodes.size()*sizeof(UINT));
+    gpu.bins=scratch(geometry.size()*sizeof(UINT));
+    gpu.instances=scratch(size_t(gpu.capacity)*sizeof(MeshInstance));
+    gpu.arguments=scratch(3*geometry.size()*sizeof(D3D12_DRAW_INDEXED_ARGUMENTS));
+    gpu.counts=scratch(6*sizeof(UINT));
+    const uint64_t packedIndices=uint64_t(gpu.packSizes[0])+gpu.packSizes[1]+gpu.packSizes[2];
+    if (packedIndices*sizeof(UINT)>UINT_MAX || packedIndices*trees>UINT_MAX)
+        throw std::runtime_error("Live assembly exceeds the D3D index buffer limit.");
+    gpu.packStride=static_cast<UINT>(packedIndices);
+    size_t readbackBytes=trees*6*sizeof(UINT);
+    if (gpu.packStride) {
+        gpu.packedIndices=scratch(gpu.packStride*sizeof(UINT));
+        gpu.packedDraws=scratch(3*sizeof(D3D12_DRAW_INDEXED_ARGUMENTS));
+        readbackBytes+=trees*3*sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
+    }
+    gpu.readback=buffer(device_.Get(),readbackBytes,D3D12_HEAP_TYPE_READBACK);
+}
+
+void D3D12Renderer::dispatchLiveGpu(const ViewerScene& scene, PassStats& stats)
+{
+    auto& gpu=liveGpu_;
+    const auto& cut=liveCut_;
+    const UINT trees=cut.treeCount, bins=static_cast<UINT>(cut.geometry.size());
+    const auto view=XMLoadFloat4x4(&frameView_);
+    const auto cols=XMMatrixTranspose(view*XMLoadFloat4x4(&projection_));
+    const auto w=cols.r[3];
+    const XMVECTOR planes[]={w+cols.r[0],w-cols.r[0],w+cols.r[1],w-cols.r[1],cols.r[2],w-cols.r[2]};
+    const D3D12_RANGE noReads{};
+    void* data;
+    checkTree(gpu.views->Map(0,&noReads,&data),"Map live camera inputs");
+    for (UINT i=0;i<trees;++i)
+    {
+        LiveGpu::View v{};
+        const auto& obj=scene.objects[i];
+        const auto world=obj.placementMatrix();
+        XMStoreFloat4x4(&v.world,world);
+        XMStoreFloat4x4(&v.view,world*view);
+        for (UINT p=0;p<6;++p) XMStoreFloat4(&v.planes[p],planes[p]);
+        v.scale=obj.placement.w;
+        const auto wind=XMVectorSet(frameWind_.x,0,frameWind_.y,0)*(.5f*v.scale);
+        XMStoreFloat4(&v.windFocal,wind);
+        XMStoreFloat4(&v.viewWindNear,XMVector3TransformNormal(wind,view));
+        v.windFocal.w=projection_._22*viewport_.Height*.5f*v.scale/scene.liveCutPixelError;
+        v.viewWindNear.w=cameraNearPlane_;
+        v.visible=cameraVisibility_.contains(i);
+        v.frustum=scene.sprayFrustumCulling;
+        static_cast<LiveGpu::View*>(data)[i]=v;
+    }
+    gpu.views->Unmap(0,nullptr);
+    constexpr auto uav=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    const auto countState=D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT|D3D12_RESOURCE_STATE_COPY_SOURCE);
+    const auto change=[&](bool output){
+        D3D12_RESOURCE_BARRIER b[]{transition(gpu.instances.Get(),uav,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
+            transition(gpu.arguments.Get(),uav,D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),transition(gpu.counts.Get(),uav,countState)};
+        if (!output) for (auto& barrier:b) std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);
+        commands_->ResourceBarrier(3,b);
+        if (gpu.packStride) {
+            D3D12_RESOURCE_BARRIER packed[]{transition(gpu.packedIndices.Get(),uav,D3D12_RESOURCE_STATE_INDEX_BUFFER),
+                                            transition(gpu.packedDraws.Get(),uav,countState)};
+            if (!output) for (auto& barrier:packed) std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);
+            commands_->ResourceBarrier(2,packed);
+        }
+    };
+    if (gpu.readable) change(false);
+    // Global UAV barriers order bin clears, parent visibility and instance writes across dispatches.
+    D3D12_RESOURCE_BARRIER sync{};
+    sync.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    commands_->SetComputeRootSignature(liveGpuRoot_.Get());
+    for (UINT i=0;i<gpu.inputs.size();++i)
+        commands_->SetComputeRootShaderResourceView(1+i,gpu.inputs[i]->GetGPUVirtualAddress());
+    commands_->SetComputeRootShaderResourceView(5,gpu.views->GetGPUVirtualAddress());
+    ID3D12Resource* outputs[]{gpu.active.Get(),gpu.bins.Get(),gpu.instances.Get(),gpu.arguments.Get(),gpu.counts.Get()};
+    for (UINT i=0;i<5;++i) commands_->SetComputeRootUnorderedAccessView(6+i,outputs[i]->GetGPUVirtualAddress());
+    commands_->SetComputeRootShaderResourceView(11,cut.mesh.indexBuffer->GetGPUVirtualAddress());
+    commands_->SetComputeRootUnorderedAccessView(12,(gpu.packStride?gpu.packedIndices:gpu.bins)->GetGPUVirtualAddress());
+    commands_->SetComputeRootUnorderedAccessView(13,(gpu.packStride?gpu.packedDraws:gpu.arguments)->GetGPUVirtualAddress());
+    const auto run=[&](UINT stage, UINT first, UINT count) {
+        const UINT args[]{first,count,static_cast<UINT>(cut.nodes.size()),bins,gpu.capacity,static_cast<UINT>(cut.tiers.size()),
+                          gpu.packSizes[0],gpu.packSizes[0]+gpu.packSizes[1],gpu.packStride};
+        commands_->SetComputeRoot32BitConstants(0,9,args,0);
+        commands_->SetPipelineState(liveGpuPipelines_[stage].Get());
+        if (stage==3) commands_->Dispatch(std::min(count,65535u),trees,(count+65534)/65535);
+        else commands_->Dispatch((count+63)/64,trees,1);
+        ++stats.gpuTreeDispatches;
+        commands_->ResourceBarrier(1,&sync);
+    };
+    run(0,0,std::max(6u,bins));
+    for (auto level:gpu.levels) run(1,level[0],level[1]);
+    run(gpu.packStride ? 3 : 2,0,bins);
+    change(true);
+    commands_->CopyBufferRegion(gpu.readback.Get(),0,gpu.counts.Get(),0,trees*6*sizeof(UINT));
+    if (gpu.packStride) commands_->CopyBufferRegion(gpu.readback.Get(),trees*6*sizeof(UINT),gpu.packedDraws.Get(),0,
+                                                     trees*3*sizeof(D3D12_DRAW_INDEXED_ARGUMENTS));
+    gpu.used=gpu.readable=true;
+}
+
+void D3D12Renderer::drawLiveGpu(const ViewerScene& scene, size_t meshIndex, UINT slot, UINT object, PassStats& stats)
+{
+    auto& gpu=liveGpu_;
+    auto& mesh=liveCut_.mesh;
+    mesh.material=meshes_[meshIndex].material;
+    const bool visibilityIds = oakRaster_ == OakRaster::Visibility;
+    const UINT keyBase = visibilityIds ? (object * 3 + slot) * gpu.capacity : 0;
+    bindMesh(mesh,scene.asset->materials[mesh.material],scene.foliage,scene.meshShadows[meshIndex].receive,
+             nullptr,FixedLodTint::Shaded,0,0,keyBase);
+    if (visibilityIds)
+    {
+        const D3D12_VERTEX_BUFFER_VIEW keys{oakPlacementKeys_->GetGPUVirtualAddress(), gpu.capacity * UINT(sizeof(UINT)), sizeof(UINT)};
+        commands_->IASetVertexBuffers(3, 1, &keys);
+    }
+    const UINT bytes=gpu.capacity*sizeof(MeshInstance);
+    const D3D12_VERTEX_BUFFER_VIEW streams[]{
+        {instanceView_.BufferLocation+(object+1)*sizeof(XMFLOAT4),sizeof(XMFLOAT4),0},
+        {gpu.instances->GetGPUVirtualAddress()+uint64_t(object)*bytes,bytes,sizeof(MeshInstance)}};
+    commands_->IASetVertexBuffers(1,2,streams);
+    const UINT bins=static_cast<UINT>(liveCut_.geometry.size());
+    commands_->ExecuteIndirect(liveGpuSignature_.Get(),bins,gpu.arguments.Get(),
+        size_t(object*3+slot)*bins*sizeof(D3D12_DRAW_INDEXED_ARGUMENTS),gpu.counts.Get(),(object*6+slot)*sizeof(UINT));
+    ++stats.treeSubmissionCalls;
+    if (gpu.packSizes[slot]) {
+        const UINT indexBytes=gpu.packStride*sizeof(UINT);
+        const D3D12_INDEX_BUFFER_VIEW indices{gpu.packedIndices->GetGPUVirtualAddress()+uint64_t(object)*indexBytes,
+                                               indexBytes,DXGI_FORMAT_R32_UINT};
+        commands_->IASetIndexBuffer(&indices);
+        commands_->IASetVertexBuffers(2,1,&identityMeshInstanceView_);
+        commands_->ExecuteIndirect(liveGpuSignature_.Get(),1,gpu.packedDraws.Get(),
+                                   size_t(object*3+slot)*sizeof(D3D12_DRAW_INDEXED_ARGUMENTS),nullptr,0);
+        ++stats.treeSubmissionCalls;
+    }
+}
+
+void D3D12Renderer::readLiveGpuStats(PassStats& stats)
+{
+    auto& gpu=liveGpu_;
+    if (!gpu.used) return;
+    gpu.used=false;
+    const D3D12_RANGE range{0,static_cast<size_t>(gpu.readback->GetDesc().Width)};
+    void* data;
+    checkTree(gpu.readback->Map(0,&range,&data),"Read live draw counters");
+    for (UINT i=0;i<liveCut_.treeCount;++i) {
+        const auto* r=static_cast<const UINT*>(data)+6*i;
+        UINT draws=r[0]+r[1]+r[2];
+        if (gpu.packStride) {
+            const auto* packed=reinterpret_cast<const D3D12_DRAW_INDEXED_ARGUMENTS*>(
+                static_cast<const UINT*>(data)+liveCut_.treeCount*6)+i*3;
+            for (UINT slot=0;slot<3;++slot) draws+=packed[slot].IndexCountPerInstance!=0;
+        }
+        stats.draws+=draws;
+        stats.treeDraws+=draws;
+        stats.triangles+=uint64_t(r[3])+r[4]+r[5];
+        stats.foliageTriangles+=r[3]; stats.treeCanopyTriangles[0]+=r[3];
+        stats.sprayWoodTriangles+=r[4]; stats.treeCanopyTriangles[1]+=r[4];
+        stats.treeTrunkTriangles+=r[5];
+    }
+    const D3D12_RANGE noWrites{};
+    gpu.readback->Unmap(0,&noWrites);
 }
 
 void D3D12Renderer::writeTreeDepthViews(D3D12_CPU_DESCRIPTOR_HANDLE first)

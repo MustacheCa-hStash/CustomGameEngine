@@ -74,7 +74,7 @@ void validatePart(const TreeLodPart& part, std::size_t placements)
         if (n.firstChild <= i || n.firstChild + static_cast<std::size_t>(n.childCount) > nodes.size())
             throw std::runtime_error("Invalid tree LOD children.");
         auto first = static_cast<std::size_t>(n.firstPlacement);
-        const bool alternatives = !part.instancedNodes.empty() && part.instancedNodes[i] == 2;
+        const bool alternatives = !part.instancedNodes.empty() && part.instancedNodes[i] >= 2;
         for (std::size_t child = n.firstChild; child < n.firstChild + static_cast<std::size_t>(n.childCount); ++child)
         {
             if (hasParent[child] || nodes[child].firstPlacement != (alternatives ? n.firstPlacement : first) ||
@@ -167,8 +167,8 @@ TreeHierarchy readTreeHierarchy(const SprayBoughSources& sources, const AssetDat
             if (!asset.meshes[part.meshIndex].instances || flags.size() != part.nodes.size())
                 throw std::runtime_error("Invalid instanced tree node count.");
             for (std::size_t i = 0; i < flags.size(); ++i)
-                if (flags[i] > 2 || (flags[i] == 1 && !part.nodes[i].geometry.indexCount) ||
-                    (flags[i] == 2 && (part.nodes[i].childCount != 2 || part.nodes[i].geometry.indexCount)))
+                if (flags[i] > 3 || (flags[i] == 1 && !part.nodes[i].geometry.indexCount) ||
+                    (flags[i] >= 2 && (part.nodes[i].childCount != 2 || part.nodes[i].geometry.indexCount)))
                     throw std::runtime_error("Invalid instanced tree geometry range.");
         }
     for (const auto& part : hierarchy.parts)

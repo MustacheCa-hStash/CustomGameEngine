@@ -1,0 +1,106 @@
+--- a/src/MeshData.h
++++ b/src/MeshData.h
+@@ -73,6 +73,7 @@
+     std::optional<TransmissionTexture> bladeNormal;
+     std::optional<std::size_t> soilSkyVisibility;
+     std::optional<std::size_t> meadowSward, meadowCover;
++    std::optional<std::size_t> meadowGrowth;
+     float normalScale = 1.0f;
+     float roughness = 1.0f;
+ };
+--- a/src/ViewerScene.cpp
++++ b/src/ViewerScene.cpp
+@@ -666,6 +666,12 @@
+             scene.asset->textures.push_back({"Living meadow sward",loadColorTexture(sward)});
+             scene.groundMaterial.meadowCover = scene.asset->textures.size();
+             scene.asset->textures.push_back({"Thatch and living cover",loadColorTexture(cover,true),true});
++            if (!GetEnvironmentVariableW(L"MEADOW_BASE_COLOUR", nullptr, 0))
++                for (auto& mat : scene.asset->materials)
++                    if ((mat.name == "Lamina | blade-green" || mat.name == "Lamina | blade-cool" ||
++                         mat.name == "Lamina | blade-olive") && mat.diffuseTransmission &&
++                        !mat.diffuseTransmission->strengthTexture)
++                        mat.meadowGrowth = scene.groundMaterial.meadowCover;
+         }
+     }
+     return entry.emplace(std::move(scene));
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -4795,6 +4795,13 @@
+         if (materialCull || (live && scene.liveCutGpu))
+             commands_->SetPipelineState((materialCull && i == scene.sprayLods[1]->meshIndex ? cameraMode.oneSidedMesh : cameraMode.mesh).get(encodedCamera_));
+         if (shadowPass && !flags.cast) continue;
++        static const bool hideTall = GetEnvironmentVariableW(L"MEADOW_HIDE_TALL_CAMERA", nullptr, 0) != 0;
++        static const bool hideGrass = GetEnvironmentVariableW(L"MEADOW_HIDE_ALL_GRASS_CAMERA", nullptr, 0) != 0;
++        if (!shadowPass && (hideTall || hideGrass))
++        {
++            const auto& name = scene.asset->meshes[i].name;
++            if (name.starts_with("Full grass strip") || (hideGrass && name.starts_with("Short grass"))) continue;
++        }
+         // Camera and shadow ablations are separate so an invisible oak's shadow can be measured.
+         static const bool omitOakCamera = GetEnvironmentVariableW(L"MEADOW_TEST_NO_OAK_CAMERA", nullptr, 0) != 0;
+         static const bool omitOakShadow = GetEnvironmentVariableW(L"MEADOW_TEST_NO_OAK_SHADOW", nullptr, 0) != 0;
+@@ -5078,6 +5085,11 @@
+     }
+     // A receiving ground draw and a blade draw use mutually exclusive surface maps.
+     if (material.soilSkyVisibility) constants.transmissionFlags |= 512u;
++    if (material.meadowGrowth)
++    {
++        constants.transmissionFlags |= 2048u;
++        transmissionStrength = material.meadowGrowth;
++    }
+     if (material.meadowSward && material.meadowCover)
+     {
+         constants.transmissionFlags |= 1024u;
+--- a/src/ProbeLighting.cpp
++++ b/src/ProbeLighting.cpp
+@@ -171,7 +171,24 @@
+             const auto world = localToAsset * scene.objects[i].placementMatrix();
+             if (mesh.instances)
+                 for (const auto& instance : *mesh.instances)
+-                    deposit(volume, samples, instance.matrix() * world, foliage, coverage, grass ? &color : nullptr, heights);
++                {
++                    const auto transform = instance.matrix() * world;
++                    auto tuftColor = color;
++                    if (material.meadowGrowth)
++                    {
++                        // The broad growth patch varies slowly across a single tuft.
++                        const auto& mask = scene.asset->textures[*material.meadowGrowth].mips.front();
++                        const float u = std::clamp((XMVectorGetX(transform.r[3])+48)/80, 0.f, 1.f);
++                        const float v = std::clamp((XMVectorGetZ(transform.r[3])+48)/80, 0.f, 1.f);
++                        const auto x = std::min(unsigned(u*mask.width), mask.width-1);
++                        const auto z = std::min(unsigned(v*mask.height), mask.height-1);
++                        const float growth = mask.rgba[4*(z*mask.width+x)+2]/255.f;
++                        tuftColor.x *= 1 + .62f*growth;
++                        tuftColor.y *= 1 + .36f*growth;
++                        tuftColor.z *= 1 - .18f*growth;
++                    }
++                    deposit(volume, samples, transform, foliage, coverage, grass ? &tuftColor : nullptr, heights);
++                }
+             else
+                 deposit(volume, samples, world, foliage, coverage, grass ? &color : nullptr, heights);
+         }
+--- a/shaders/Mesh.hlsl
++++ b/shaders/Mesh.hlsl
+@@ -393,6 +393,13 @@
+         return float4(0.15, 0.55, 0.32, 1);
+     }
+     float4 baseColor = sampleBaseColor(uv);
++    float3 growthTint = 1.0;
++    if (transmissionFlags & 2048u)
++    {
++        float growth = transmissionStrengthTexture.Sample(colorSampler, saturate((input.worldPositionAndViewDepth.xz + 48) / 80)).b;
++        growthTint = lerp(1.0, float3(1.62, 1.36, 0.82), growth);
++        baseColor.rgb *= growthTint;
++    }
+     if (transmissionFlags & 1024u)
+     {
+         const float2 fieldUV = (input.worldPositionAndViewDepth.xz + 48)/80;
+@@ -477,7 +484,7 @@
+     {
+         const uint colorUv = (transmissionFlags >> 1) & 3;
+         const uint strengthUv = (transmissionFlags >> 3) & 3;
+-        float3 tint = transmissionColor;
++        float3 tint = transmissionColor * growthTint;
+         float fraction = transmission;
+         if (colorUv)
+             tint *= transmissionColorTexture.Sample(colorSampler, colorUv == 1 ? input.texcoords.xy : input.texcoords.zw).rgb;

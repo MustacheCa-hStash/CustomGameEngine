@@ -1,0 +1,259 @@
+--- a/src/ViewerScene.cpp
++++ b/src/ViewerScene.cpp
+@@ -73,6 +73,9 @@
+         {{ extent, 0.0f, -extent}, {0.0f, 1.0f, 0.0f}, {}},
+     };
+     ground.indices = {0, 1, 2, 0, 2, 3};
++    ground.uvMask = 1;
++    for (auto& vertex : ground.vertices)
++        vertex.texcoords[0] = {vertex.position.x, vertex.position.z}; // one metre per tile
+     ground.localBounds = {{0.0f, 0.0f, 0.0f}, {extent, 0.0f, extent}};
+     XMStoreFloat4x4(&ground.localToWorld, XMMatrixIdentity());
+     return ground;
+@@ -642,5 +645,12 @@
+         }
+     }
+     scene.groundMaterial.color = {0.30f, 0.36f, 0.30f, 1.0f};
++    const auto soil = scene.source.parent_path() / "MeadowSoil.png";
++    if (kind == SceneKind::ForkedOak && std::filesystem::is_regular_file(soil))
++    {
++        scene.groundMaterial.color = {1,1,1,1};
++        scene.groundMaterial.colorTexture = scene.asset->textures.size();
++        scene.asset->textures.push_back({"Soil and flattened thatch",loadColorTexture(soil)});
++    }
+     return entry.emplace(std::move(scene));
+ }
+--- a/src/ProbeLighting.h
++++ b/src/ProbeLighting.h
+@@ -15,6 +15,8 @@
+     DirectX::XMUINT4 size;
+     // XYZ are projected foliage area per cubic meter. W is opaque wood area density.
+     std::vector<DirectX::XMFLOAT4> density;
++    // Per ground cell: linear effective reflectance and mean reflecting height above the soil.
++    std::vector<DirectX::XMFLOAT4> groundSurface;
+ };
+ 
+ ProbeProxyVolume buildProbeProxy(const ViewerScene& scene);
+--- a/src/ProbeLighting.cpp
++++ b/src/ProbeLighting.cpp
+@@ -58,7 +58,7 @@
+ }
+ 
+ void deposit(ProbeProxyVolume& volume, const SurfaceSamples& samples, FXMMATRIX transform,
+-             bool foliage, float coverage)
++             bool foliage, float coverage, const XMFLOAT3* grassColor, std::vector<float>& heights)
+ {
+     const auto origin = XMLoadFloat4(&volume.originCellSize);
+     const float step = volume.originCellSize.w;
+@@ -79,6 +79,18 @@
+         auto& cell = volume.density[index];
+         if (foliage) XMStoreFloat4(&cell, XMVectorSetW(XMLoadFloat4(&cell) + normal, cell.w));
+         else cell.w += XMVectorGetX(XMVector3Length(normal));
++        if (grassColor)
++        {
++            const unsigned groundIndex = (unsigned(coord.z)/2)*((volume.size.x+1)/2)+unsigned(coord.x)/2;
++            // Expected top-view area divided by ground cell area (four voxel faces).
++            const float weight = XMVectorGetY(normal) * step * 0.25f;
++            auto& surface = volume.groundSurface[groundIndex];
++            surface.x += grassColor->x * weight;
++            surface.y += grassColor->y * weight;
++            surface.z += grassColor->z * weight;
++            surface.w += weight;
++            heights[groundIndex] += weight * coord.y * step;
++        }
+     }
+ }
+ }
+@@ -117,11 +129,25 @@
+     volume.size = {(volume.probes.size.x - 1) * 4, (volume.probes.size.y - 1) * 4,
+                    (volume.probes.size.z - 1) * 4, 0};
+     volume.density.resize(static_cast<std::size_t>(volume.size.x) * volume.size.y * volume.size.z);
++    const unsigned width = (volume.size.x+1)/2, depth = (volume.size.z+1)/2;
++    volume.groundSurface.resize(width*depth);
++    std::vector<float> heights(width*depth);
++    const auto decode = [](unsigned v) {
++        float s = v/255.0f;
++        return s <= 0.04045f ? s/12.92f : std::pow((s+0.055f)/1.055f,2.4f);
++    };
+ 
+     for (const auto& mesh : scene.asset->meshes)
+     {
+         const auto& material = scene.asset->materials[mesh.material];
+         const bool foliage = material.hasBacklighting;
++        XMFLOAT3 color{material.color.x,material.color.y,material.color.z};
++        const bool grass = mesh.name.starts_with("Full grass strip") || mesh.name.starts_with("Short grass");
++        if (grass && material.colorTexture)
++        {
++            const auto& avg = scene.asset->textures[*material.colorTexture].mips.back().rgba;
++            color = {color.x*decode(avg[0]),color.y*decode(avg[1]),color.z*decode(avg[2])};
++        }
+         float coverage = 1.0f;
+         if (foliage && material.alphaCutoff >= 0 && material.colorTexture)
+             coverage = scene.asset->textures[*material.colorTexture].mips.back().rgba[3] / 255.0f;
+@@ -132,10 +158,36 @@
+             const auto world = localToAsset * scene.objects[i].placementMatrix();
+             if (mesh.instances)
+                 for (const auto& instance : *mesh.instances)
+-                    deposit(volume, samples, instance.matrix() * world, foliage, coverage);
++                    deposit(volume, samples, instance.matrix() * world, foliage, coverage, grass ? &color : nullptr, heights);
+             else
+-                deposit(volume, samples, world, foliage, coverage);
+-        }
++                deposit(volume, samples, world, foliage, coverage, grass ? &color : nullptr, heights);
++        }
++    }
++    const TextureMip* soil = nullptr;
++    if (const auto texture = scene.groundMaterial.colorTexture)
++    {
++        const auto& mips = scene.asset->textures[*texture].mips;
++        const auto level = std::max(0, int(std::floor(std::log2(mips.front().width*2*cell))));
++        soil = &mips[std::min<std::size_t>(level,mips.size()-1)];
++    }
++    for (unsigned z=0; z<depth; ++z) for (unsigned x=0; x<width; ++x)
++    {
++        const unsigned i = z*width+x;
++        auto& s = volume.groundSurface[i];
++        const auto tint = scene.groundMaterial.color;
++        XMFLOAT3 earth{tint.x,tint.y,tint.z};
++        if (soil)
++        {
++            const float u = volume.originCellSize.x+(x+0.5f)*2*cell;
++            const float v = volume.originCellSize.z+(z+0.5f)*2*cell;
++            const unsigned ix = unsigned((u-std::floor(u))*soil->width)%soil->width;
++            const unsigned iz = unsigned((v-std::floor(v))*soil->height)%soil->height;
++            const auto* pixel = &soil->rgba[4*(iz*soil->width+ix)];
++            earth = {earth.x*decode(pixel[0]),earth.y*decode(pixel[1]),earth.z*decode(pixel[2])};
++        }
++        const float cover = 1.0f-std::exp(-s.w);
++        const float f = cover/std::max(s.w,1e-8f);
++        s = {s.x*f+earth.x*(1-cover),s.y*f+earth.y*(1-cover),s.z*f+earth.z*(1-cover),heights[i]*f};
+     }
+     // Sparse wood covers only part of a cell face. Retain strong extinction once
+     // enough wood surface spans a cell, as on the trunk and larger boughs.
+--- a/src/D3D12Renderer.h
++++ b/src/D3D12Renderer.h
+@@ -800,6 +800,7 @@
+     ComPtr<ID3D12Resource> probeUpdateOrder_;
+     ComPtr<ID3D12Resource> diffuseProbes_;
+     ComPtr<ID3D12Resource> probeGroundLight_;
++    ComPtr<ID3D12Resource> probeGroundSurface_;
+     D3D12_CPU_DESCRIPTOR_HANDLE probeCpuView_{};
+     D3D12_GPU_DESCRIPTOR_HANDLE probeGpuView_{};
+     ComPtr<ID3D12RootSignature> displayRoot_;
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -588,6 +588,7 @@
+     advectedProbeDensity_.Reset();
+     probeUpdateOrder_.Reset();
+     probeGroundLight_.Reset();
++    probeGroundSurface_.Reset();
+     probesDirty_ = true;
+     probesPending_ = probeCursor_ = groundUpdateRow_ = 0;
+     cachedProbeWind_ = observedProbeWind_ = {};
+@@ -2941,9 +2942,11 @@
+     panorama.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+     panorama.NumDescriptors = 1;
+     panorama.BaseShaderRegister = 1;
+-    D3D12_ROOT_PARAMETER parameters[7]{};
++    D3D12_ROOT_PARAMETER parameters[8]{};
++    parameters[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
++    parameters[7].Descriptor.ShaderRegister = 3;
+     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+-    parameters[0].Constants.Num32BitValues = 38;
++    parameters[0].Constants.Num32BitValues = 39;
+     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+     parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+     parameters[2].DescriptorTable = {1, &panorama};
+@@ -2987,7 +2990,7 @@
+ {
+     if (!diffuseProbes_) return 0;
+     return diffuseProbes_->GetDesc().Width + probeDensity_->GetDesc().Width +
+-           probeGroundLight_->GetDesc().Width + probeUpdateOrder_->GetDesc().Width +
++           probeGroundLight_->GetDesc().Width + probeGroundSurface_->GetDesc().Width + probeUpdateOrder_->GetDesc().Width +
+            (advectedProbeDensity_ ? advectedProbeDensity_->GetDesc().Width : 0);
+ }
+ 
+@@ -3025,6 +3028,7 @@
+ {
+     if (!probePipeline_) createProbePipeline();
+     auto volume = buildProbeProxy(scene);
++    probeGroundSurface_ = uploadBuffer(volume.groundSurface.data(),volume.groundSurface.size()*sizeof(XMFLOAT4));
+     probeGrid_ = volume.probes;
+     probeDensityOrigin_ = volume.originCellSize;
+     probeDensitySize_ = volume.size;
+@@ -3077,7 +3081,13 @@
+ {
+     if (!probesActive_) return {};
+     const bool bounce = scene.probeLighting == ProbeLightingMode::GroundBounce;
+-    const XMFLOAT3 groundColor{scene.groundMaterial.color.x, scene.groundMaterial.color.y, scene.groundMaterial.color.z};
++    XMFLOAT3 groundColor{scene.groundMaterial.color.x, scene.groundMaterial.color.y, scene.groundMaterial.color.z};
++    if (const auto tex = scene.groundMaterial.colorTexture)
++    {
++        const auto& rgb = scene.asset->textures[*tex].mips.back().rgba;
++        groundColor = {groundColor.x*srgbToLinear(rgb[0]/255.f),groundColor.y*srgbToLinear(rgb[1]/255.f),
++                       groundColor.z*srgbToLinear(rgb[2]/255.f)};
++    }
+     const bool changed = cachedProbeMode_ != scene.probeLighting || (bounce &&
+         (cachedProbeLighting_ != scene.captureLighting ||
+          !XMVector3Equal(XMLoadFloat3(&cachedProbeSun_), XMLoadFloat3(&toSun_)) ||
+@@ -3136,12 +3146,14 @@
+         float inverseWindHeight;
+         UINT groundStride;
+         UINT groundRow;
++        UINT localReflectance;
+     };
+-    static_assert(sizeof(Constants) == 38 * sizeof(UINT));
++    static_assert(sizeof(Constants) == 39 * sizeof(UINT));
+     const auto& extent = scene.ground.localBounds.halfExtent;
+     const Constants constants{probeDensityOrigin_, probeDensitySize_, probeGrid_, skyRadianceScale_, probeCursor_, count, bounce,
+         toSun_, scene.captureLighting == CaptureLighting::SkyOnly ? 0.0f : 0.65f, groundColor, extent.x,
+-        openSkyGround_, extent.z, wind, windStart_, inverseWindHeight_, groundStride, groundRow};
++        openSkyGround_, extent.z, wind, windStart_, inverseWindHeight_, groundStride, groundRow,
++        UINT(scene.groundMaterial.colorTexture.has_value() && !GetEnvironmentVariableW(L"MEADOW_UNIFORM_BOUNCE",nullptr,0))};
+     transitionResource(commands_.Get(), diffuseProbes_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+     commands_->SetComputeRootSignature(probeRoot_.Get());
+@@ -3150,6 +3162,7 @@
+     commands_->SetComputeRootUnorderedAccessView(3, diffuseProbes_->GetGPUVirtualAddress());
+     commands_->SetComputeRootUnorderedAccessView(4, probeGroundLight_->GetGPUVirtualAddress());
+     commands_->SetComputeRootShaderResourceView(5, probeUpdateOrder_->GetGPUVirtualAddress());
++    commands_->SetComputeRootShaderResourceView(7, probeGroundSurface_->GetGPUVirtualAddress());
+     // Warp the coverage proxy once per distinct wind pose. Both tracing passes use the result.
+     if (advectDensity)
+     {
+--- a/shaders/ProbeTrace.hlsl
++++ b/shaders/ProbeTrace.hlsl
+@@ -25,11 +25,13 @@
+     float inverseWindHeight;
+     uint groundRowStride;
+     uint groundFirstRow;
++    uint localReflectance;
+ };
+ 
+ StructuredBuffer<float4> proxyDensity : register(t0);
+ Texture2D<float4> skyPanorama : register(t1);
+ StructuredBuffer<uint> updateOrder : register(t2);
++StructuredBuffer<float4> groundSurface : register(t3);
+ SamplerState panoramaSampler : register(s0);
+ RWStructuredBuffer<ProbeLobe> probes : register(u0);
+ RWStructuredBuffer<float4> groundLight : register(u1);
+@@ -133,7 +135,9 @@
+     if (any(cell >= size)) return;
+     const float step = proxyOriginCellSize.w;
+     const float2 coord = proxyOriginCellSize.xz + (cell + 0.5) * (2 * step);
+-    const float3 origin = float3(coord.x, proxyOriginCellSize.y + 0.08 * step, coord.y);
++    const uint index = cell.y*size.x+cell.x;
++    const float4 surface = localReflectance ? groundSurface[index] : float4(groundColor,0);
++    const float3 origin = float3(coord.x, proxyOriginCellSize.y + surface.w + 0.08 * step, coord.y);
+     const float limit = length(float3(proxySize.xyz)) * step;
+     const uint skyRays = 24;
+     float3 incoming = openSkyGround;
+@@ -154,7 +158,7 @@
+         const float visibility = traceProxy(origin, toSun, limit, blocker);
+         incoming += (sunStrength * toSun.y * visibility).xxx;
+     }
+-    groundLight[cell.y * size.x + cell.x] = float4(max(0, incoming) * groundColor, 0);
++    groundLight[index] = float4(max(0, incoming) * surface.rgb, surface.w);
+ }
+ 
+ float3 groundRadiance(float2 position)

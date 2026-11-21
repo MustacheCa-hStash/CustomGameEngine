@@ -1,0 +1,280 @@
+--- a/src/D3D12Renderer.h
++++ b/src/D3D12Renderer.h
+@@ -210,6 +210,10 @@
+             UINT first, count;
+         };
+         std::vector<GrassTile> grassTiles;
++        ComPtr<ID3D12Resource> farGrassBuffer;
++        D3D12_INDEX_BUFFER_VIEW farGrassIndices{};
++        UINT farGrassCount = 0;
++        float farGrassError = 0;
+         std::vector<Bounds> diagnosticTuftBounds;
+         ComPtr<ID3D12Resource> vertexBuffer;
+         ComPtr<ID3D12Resource> indexBuffer;
+@@ -571,7 +575,7 @@
+                                          std::vector<ComPtr<ID3D12Resource>>& staging,
+                                          DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_TYPELESS,
+                                          D3D12_RESOURCE_STATES ready = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+-    GpuMesh uploadMesh(const MeshData& mesh);
++    GpuMesh uploadMesh(const MeshData& mesh, const MaterialData* material = nullptr);
+     std::unique_ptr<GpuSprayLod> uploadSprayLod(const MeshData& mesh, const FixedLod& lod,
+                                                std::span<const std::uint32_t> boughMembers);
+     void buildSprayGroups(GpuSprayLod& lod, const MeshData& mesh, std::span<const std::uint32_t> boughMembers);
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -27,6 +27,7 @@
+ 
+ #include <d3d12sdklayers.h>
+ #include <DirectXCollision.h>
++#include <meshoptimizer.h>
+ 
+ #include <algorithm>
+ #include <bit>
+@@ -607,7 +608,7 @@
+         meshes.reserve(scene.asset->meshes.size());
+         for (const auto& mesh : scene.asset->meshes)
+         {
+-            meshes.push_back(uploadMesh(mesh));
++            meshes.push_back(uploadMesh(mesh, &scene.asset->materials[mesh.material]));
+         }
+         const std::span<const std::uint32_t> members = scene.sprayBough ? std::span(scene.sprayBough->placements)
+             : std::span<const std::uint32_t>{};
+@@ -2573,7 +2574,65 @@
+     return texture;
+ }
+ 
+-D3D12Renderer::GpuMesh D3D12Renderer::uploadMesh(const MeshData& mesh)
++// Each optimized lamina has eight folded rows (margin, keel, margin) and a tip.
++// Retain every blade and choose the interior rows with the largest silhouette errors.
++static std::vector<UINT> farBladeIndices(const MeshData& mesh, float& error)
++{
++    constexpr UINT stride = 25;
++    if (mesh.vertices.size()%stride || mesh.indices.size()!=mesh.vertices.size()/stride*90) return {};
++    std::vector<UINT> templateIndices;
++    for (UINT row=0; row<8; ++row)
++        for (UINT k=0; k<2; ++k)
++        {
++            const UINT a=row*3+k, b=std::min(24u,a+3), c=std::min(24u,a+4);
++            if (b!=c) templateIndices.insert(templateIndices.end(),{a,b,c});
++            templateIndices.insert(templateIndices.end(),{a,c,a+1});
++        }
++    for (size_t i=0; i<mesh.indices.size(); ++i)
++        if (mesh.indices[i] != (i/90)*stride+templateIndices[i%90]) return {};
++    std::vector<UINT> indices;
++    for (UINT base=0; base<mesh.vertices.size(); base+=stride)
++    {
++        const auto id = [&](UINT row, UINT lane) { return base+std::min(24u,row*3+lane); };
++        const auto point = [&](UINT row, UINT lane) { return XMLoadFloat3(&mesh.vertices[id(row,lane)].position); };
++        std::vector<UINT> cuts{0,8};
++        for (;;)
++        {
++            float worst=-1;
++            UINT split=0;
++            for (size_t j=1; j<cuts.size(); ++j)
++            {
++                const UINT a=cuts[j-1], b=cuts[j];
++                const auto chord=point(b,1)-point(a,1);
++                const float length2=std::max(1e-12f,XMVectorGetX(XMVector3LengthSq(chord)));
++                for (UINT row=a+1; row<b; ++row)
++                {
++                    const float t=std::clamp(XMVectorGetX(XMVector3Dot(point(row,1)-point(a,1),chord))/length2,0.f,1.f);
++                    for (UINT lane=0; lane<3; ++lane)
++                    {
++                        const auto delta=point(row,lane)-XMVectorLerp(point(a,lane),point(b,lane),t);
++                        const float d=XMVectorGetX(XMVector3Length(delta));
++                        if (d>worst) { worst=d; split=row; }
++                    }
++                }
++            }
++            if (cuts.size()>=5) { error=std::max(error,worst); break; }
++            cuts.insert(std::lower_bound(cuts.begin(),cuts.end(),split),split);
++        }
++        for (size_t j=1; j<cuts.size(); ++j)
++        {
++            const UINT a=cuts[j-1],b=cuts[j];
++            for (UINT k=0;k<2;++k)
++            {
++                if (b<8) indices.insert(indices.end(),{id(a,k),id(b,k),id(b,k+1)});
++                indices.insert(indices.end(),{id(a,k),id(b,k+1),id(a,k+1)});
++            }
++        }
++    }
++    return indices;
++}
++
++D3D12Renderer::GpuMesh D3D12Renderer::uploadMesh(const MeshData& mesh, const MaterialData* material)
+ {
+     GpuMesh gpu{};
+     const auto vertexBytes = mesh.vertices.size() * sizeof(Vertex);
+@@ -2587,6 +2646,33 @@
+     gpu.indices.Format = DXGI_FORMAT_R32_UINT;
+     gpu.indices.SizeInBytes = static_cast<UINT>(indexBytes);
+     gpu.indexCount = static_cast<UINT>(mesh.indices.size());
++    if (material && mesh.instances && mesh.name.starts_with("Full grass strip") &&
++        !GetEnvironmentVariableW(L"MEADOW_FULL_FAR_SHADOW",nullptr,0))
++    {
++        float error=0;
++        std::vector<UINT> proxy;
++        if (material->name.starts_with("Lamina |")) proxy=farBladeIndices(mesh,error);
++        if (proxy.empty())
++        {
++            proxy.resize(mesh.indices.size());
++            const auto count=meshopt_simplify(proxy.data(),mesh.indices.data(),mesh.indices.size(),
++                &mesh.vertices[0].position.x,mesh.vertices.size(),sizeof(Vertex),
++                std::max<size_t>(3,(mesh.indices.size()/15)*3),0.0025f,
++                meshopt_SimplifyPermissive|meshopt_SimplifyErrorAbsolute,&error);
++            proxy.resize(count);
++        }
++        if (!proxy.empty() && proxy.size()<mesh.indices.size())
++        {
++            gpu.farGrassCount=static_cast<UINT>(proxy.size());
++            const UINT bytes=gpu.farGrassCount*sizeof(UINT);
++            gpu.farGrassBuffer=uploadBuffer(proxy.data(),bytes);
++            gpu.farGrassIndices={gpu.farGrassBuffer->GetGPUVirtualAddress(),bytes,DXGI_FORMAT_R32_UINT};
++            float maxScale=0;
++            for (const auto& tuft : *mesh.instances)
++                maxScale=std::max({maxScale,std::abs(tuft.scale.x),std::abs(tuft.scale.y),std::abs(tuft.scale.z)});
++            gpu.farGrassError=error*maxScale*maxLinearStretch(XMLoadFloat4x4(&mesh.localToWorld));
++        }
++    }
+     if (mesh.instances)
+     {
+         const auto instanceBytes = static_cast<UINT>(mesh.instances->size() * sizeof(MeshInstance));
+@@ -2605,7 +2691,8 @@
+             }
+             const BoundingBox primitive(mesh.localBounds.center, mesh.localBounds.halfExtent);
+             std::vector<MeshInstance> ordered;
+-            const bool checkTufts = GetEnvironmentVariableW(L"MEADOW_TEST_CAMERA_TUFTS", nullptr, 0) != 0;
++            const bool checkTufts = GetEnvironmentVariableW(L"MEADOW_TEST_CAMERA_TUFTS", nullptr, 0) ||
++                                    GetEnvironmentVariableW(L"MEADOW_TEST_FAR_CAMERA_TUFTS", nullptr, 0);
+             ordered.reserve(mesh.instances->size());
+             for (const auto& [cell, ids] : bins)
+             {
+@@ -4240,11 +4327,15 @@
+                     return true;
+                 };
+                 bindMesh(mesh, material, scene.foliage, receive, nullptr, tint, 0, 0, 0, 0);
++                const bool farProxy = shadowPass && shadowSlice && *shadowSlice==2 && mesh.farGrassCount &&
++                    mesh.farGrassError*object.placement.w <= 0.65f*cascadeWorldUnitsPerTexel_[2];
++                const UINT indexCount = farProxy ? mesh.farGrassCount : mesh.indexCount;
++                if (farProxy) commands_->IASetIndexBuffer(&mesh.farGrassIndices);
+                 UINT first = 0, count = 0;
+                 const auto flush = [&] {
+                     if (!count) return;
+-                    commands_->DrawIndexedInstanced(mesh.indexCount, count, 0, 0, first);
+-                    record(count, std::uint64_t(mesh.indexCount / 3) * count);
++                    commands_->DrawIndexedInstanced(indexCount, count, 0, 0, first);
++                    record(count, std::uint64_t(indexCount / 3) * count);
+                     count = 0;
+                 };
+                 for (const auto& tile : mesh.grassTiles)
+@@ -4257,7 +4348,8 @@
+                         flush();
+                         continue;
+                     }
+-                    if (shadowPass && !mesh.diagnosticTuftBounds.empty())
++                    static const bool farCheckOnly = GetEnvironmentVariableW(L"MEADOW_TEST_FAR_CAMERA_TUFTS",nullptr,0) != 0;
++                    if (shadowPass && !mesh.diagnosticTuftBounds.empty() && (!farCheckOnly || farProxy))
+                     {
+                         for (UINT i = tile.first; i < tile.first + tile.count; ++i)
+                         {
+@@ -4986,6 +5078,12 @@
+     }
+     // A receiving ground draw and a blade draw use mutually exclusive surface maps.
+     if (material.soilSkyVisibility) constants.transmissionFlags |= 512u;
++    if (material.meadowSward && material.meadowCover)
++    {
++        constants.transmissionFlags |= 1024u;
++        transmissionColor = material.meadowSward;
++        transmissionStrength = material.meadowCover;
++    }
+     commands_->SetGraphicsRootDescriptorTable(9, textureHandle(material.soilSkyVisibility ? material.soilSkyVisibility : bladeNormal));
+     commands_->SetGraphicsRoot32BitConstants(0, drawConstantCount, &constants, 0);
+     commands_->SetGraphicsRootDescriptorTable(1, textureHandle(material.colorTexture));
+--- a/src/MeshData.h
++++ b/src/MeshData.h
+@@ -72,6 +72,7 @@
+     std::optional<DiffuseTransmission> diffuseTransmission;
+     std::optional<TransmissionTexture> bladeNormal;
+     std::optional<std::size_t> soilSkyVisibility;
++    std::optional<std::size_t> meadowSward, meadowCover;
+     float normalScale = 1.0f;
+     float roughness = 1.0f;
+ };
+--- a/src/ViewerScene.cpp
++++ b/src/ViewerScene.cpp
+@@ -657,6 +657,16 @@
+         scene.groundMaterial.color = {1,1,1,1};
+         scene.groundMaterial.colorTexture = scene.asset->textures.size();
+         scene.asset->textures.push_back({"Soil and flattened thatch",loadColorTexture(soil)});
++        const auto sward = soil.parent_path()/"MeadowSward.png";
++        const auto cover = soil.parent_path()/"MeadowCover.png";
++        if (std::filesystem::is_regular_file(sward) && std::filesystem::is_regular_file(cover) &&
++            !GetEnvironmentVariableW(L"MEADOW_SOIL_ONLY",nullptr,0))
++        {
++            scene.groundMaterial.meadowSward = scene.asset->textures.size();
++            scene.asset->textures.push_back({"Living meadow sward",loadColorTexture(sward)});
++            scene.groundMaterial.meadowCover = scene.asset->textures.size();
++            scene.asset->textures.push_back({"Thatch and living cover",loadColorTexture(cover,true),true});
++        }
+     }
+     return entry.emplace(std::move(scene));
+ }
+--- a/src/ProbeLighting.cpp
++++ b/src/ProbeLighting.cpp
+@@ -183,6 +183,14 @@
+         const auto level = std::max(0, int(std::floor(std::log2(mips.front().width*2*cell))));
+         soil = &mips[std::min<std::size_t>(level,mips.size()-1)];
+     }
++    const auto meadowMip = [&](std::optional<std::size_t> tex, float span) -> const TextureMip* {
++        if (!tex) return nullptr;
++        const auto& mips=scene.asset->textures[*tex].mips;
++        const auto lod=std::max(0,int(std::floor(std::log2(mips.front().width*2*cell/span))));
++        return &mips[std::min<size_t>(lod,mips.size()-1)];
++    };
++    const auto* sward=meadowMip(scene.groundMaterial.meadowSward,1);
++    const auto* coverMap=meadowMip(scene.groundMaterial.meadowCover,80);
+     for (unsigned z=0; z<depth; ++z) for (unsigned x=0; x<width; ++x)
+     {
+         const unsigned i = z*width+x;
+@@ -197,6 +205,22 @@
+             const unsigned iz = unsigned((v-std::floor(v))*soil->height)%soil->height;
+             const auto* pixel = &soil->rgba[4*(iz*soil->width+ix)];
+             earth = {earth.x*decode(pixel[0]),earth.y*decode(pixel[1]),earth.z*decode(pixel[2])};
++            if (sward && coverMap && u>=-48 && v>=-48 && u<32 && v<32)
++            {
++                const auto sample = [](const TextureMip& m,float x,float y) {
++                    const unsigned ix=std::min(unsigned(x*m.width),m.width-1);
++                    const unsigned iy=std::min(unsigned(y*m.height),m.height-1);
++                    return &m.rgba[4*(iy*m.width+ix)];
++                };
++                const auto* live=sample(*sward,u-std::floor(u),v-std::floor(v));
++                const auto* mask=sample(*coverMap,(u+48)/80,(v+48)/80);
++                const XMFLOAT3 rgb{decode(live[0]),decode(live[1]),decode(live[2])};
++                const float straw=.2126f*rgb.x+.7152f*rgb.y+.0722f*rgb.z;
++                const auto mix=[&](float soil,float dry,float green) {
++                    return std::lerp(std::lerp(soil,dry,mask[0]/255.f),green,mask[1]/255.f);
++                };
++                earth={mix(earth.x,1.28f*straw,rgb.x),mix(earth.y,1.02f*straw,rgb.y),mix(earth.z,.52f*straw,rgb.z)};
++            }
+         }
+         const float cover = 1.0f-std::exp(-s.w);
+         const float f = cover/std::max(s.w,1e-8f);
+--- a/shaders/Mesh.hlsl
++++ b/shaders/Mesh.hlsl
+@@ -393,6 +393,15 @@
+         return float4(0.15, 0.55, 0.32, 1);
+     }
+     float4 baseColor = sampleBaseColor(uv);
++    if (transmissionFlags & 1024u)
++    {
++        const float2 fieldUV = (input.worldPositionAndViewDepth.xz + 48)/80;
++        const float2 weights = transmissionStrengthTexture.Sample(colorSampler,saturate(fieldUV)).rg;
++        const float3 sward = transmissionColorTexture.Sample(colorSampler,uv).rgb;
++        const float straw = dot(sward,float3(0.2126,0.7152,0.0722));
++        const float3 thatch = straw * float3(1.28,1.02,0.52);
++        baseColor.rgb = lerp(lerp(baseColor.rgb,thatch,weights.r),sward,weights.g);
++    }
+     applyCutout(baseColor.a);
+     uint cascade = 0;
+     if (useCascades)

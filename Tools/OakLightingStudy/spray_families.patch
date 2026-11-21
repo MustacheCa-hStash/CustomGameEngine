@@ -1,0 +1,382 @@
+--- a/src/TreeHierarchy.h
++++ b/src/TreeHierarchy.h
+@@ -32,6 +32,7 @@
+ };
+ 
+ std::filesystem::path treeHierarchyPath(std::filesystem::path glb);
+-TreeHierarchy readTreeHierarchy(const SprayBoughSources& sources, const AssetData& asset);
++TreeHierarchy readTreeHierarchy(const SprayBoughSources& sources, const AssetData& asset,
++                                std::filesystem::path bake = {});
+ void writeTreeHierarchy(const std::filesystem::path& path, const SprayBoughSources& sources,
+                         const TreeHierarchy& hierarchy);
+--- a/src/TreeHierarchy.cpp
++++ b/src/TreeHierarchy.cpp
+@@ -100,9 +100,9 @@
+     return glb.replace_extension(L".treelod");
+ }
+ 
+-TreeHierarchy readTreeHierarchy(const SprayBoughSources& sources, const AssetData& asset)
+-{
+-    std::ifstream file(treeHierarchyPath(sources[0]), std::ios::binary);
++TreeHierarchy readTreeHierarchy(const SprayBoughSources& sources, const AssetData& asset, std::filesystem::path bake)
++{
++    std::ifstream file(bake.empty() ? treeHierarchyPath(sources[0]) : bake, std::ios::binary);
+     if (!file) throw std::runtime_error("Tree LOD hierarchy bake missing.");
+     auto signature = magic;
+     read(file, signature.data(), signature.size());
+--- a/src/ViewerScene.h
++++ b/src/ViewerScene.h
+@@ -185,6 +185,21 @@
+     std::shared_ptr<const FixedLod> fixedLod;
+     std::string fixedLodStatus;
+     std::array<std::shared_ptr<const FixedLod>, 2> sprayLods;
++    std::vector<decltype(sprayLods)> sprayFamilies;
++    const FixedLod* sprayBake(std::size_t mesh) const
++    {
++        for (const auto& pair : sprayFamilies)
++            for (const auto& lod : pair)
++                if (lod->meshIndex == mesh) return lod.get();
++        for (const auto& lod : sprayLods)
++            if (lod && lod->meshIndex == mesh) return lod.get();
++        return nullptr;
++    }
++    bool isLeafSpray(std::size_t mesh) const
++    {
++        const auto& part = asset->meshes[mesh];
++        return part.instances && asset->materials[part.material].hasBacklighting;
++    }
+     std::string sprayLodStatus;
+     std::shared_ptr<const SprayBough> sprayBough;
+     std::string sprayBoughStatus;
+@@ -207,6 +222,7 @@
+     bool sprayLocalLod = true;
+     bool leafGroupBounds = false;
+     bool sprayFrustumCulling = true;
++    bool guardSprayReference = false;
+     float sprayPixelLimit = 1.0f;
+     float sprayTemplatePixelLimit = 1.0f;
+     bool cullSprayWoodBackfaces = false;
+--- a/src/ViewerScene.cpp
++++ b/src/ViewerScene.cpp
+@@ -7,6 +7,8 @@
+ #include <bit>
+ #include <cmath>
+ #include <limits>
++#include <fstream>
++#include <sstream>
+ #include <random>
+ #include <stdexcept>
+ #include <utility>
+@@ -488,7 +490,53 @@
+                                 [](const MaterialData& material) { return material.hasBacklighting; });
+     if (kind == SceneKind::ForkedOak)
+     {
+-        try
++        auto manifest = scene.source;
++        manifest.replace_extension(".spraylods");
++        if (std::filesystem::is_regular_file(manifest))
++        {
++            auto hierarchy = std::make_shared<TreeHierarchy>();
++            std::vector<bool> registered(scene.asset->meshes.size());
++            std::ifstream input(manifest);
++            for (std::string line; std::getline(input, line);)
++            {
++                std::istringstream fields(line);
++                std::string leaf, wood, tree, extra;
++                if (!(fields >> leaf >> wood >> tree) || fields >> extra)
++                    throw std::runtime_error("Invalid spray family manifest.");
++                const auto local = [&](const std::filesystem::path& name) {
++                    if (name != name.filename()) throw std::runtime_error("Expected a local bake filename.");
++                    return manifest.parent_path() / name;
++                };
++                const SprayBoughSources sources{scene.source, local(leaf), local(wood)};
++                auto& pair = scene.sprayFamilies.emplace_back();
++                for (std::size_t i = 0; i < pair.size(); ++i)
++                    pair[i] = std::make_shared<FixedLod>(readFixedLod(scene.source, sources[i + 1], *scene.asset));
++                const auto a = pair[0]->meshIndex, b = pair[1]->meshIndex;
++                if (!scene.isLeafSpray(a) || scene.isLeafSpray(b) || registered[a] || registered[b] ||
++                    scene.asset->meshes[a].instances != scene.asset->meshes[b].instances)
++                    throw std::runtime_error("Incompatible shoot material roles or placement streams.");
++                auto group = readTreeHierarchy(sources, *scene.asset, local(tree));
++                for (auto& part : group.parts)
++                {
++                    const auto id = part.meshIndex;
++                    if (scene.asset->meshes[id].instances)
++                    {
++                        if (id != a && id != b) throw std::runtime_error("Unexpected shoot hierarchy part.");
++                        if (part.placementOrder.empty()) part.placementOrder = group.placementOrder;
++                    }
++                    else if (registered[id]) continue; // Legacy per-pair bakes include the same scaffold.
++                    registered[id] = true;
++                    hierarchy->parts.push_back(std::move(part));
++                }
++            }
++            if (scene.sprayFamilies.empty() || std::ranges::find(registered, false) != registered.end())
++                throw std::runtime_error("Incomplete spray family manifest.");
++            scene.sprayLods = scene.sprayFamilies.front();
++            scene.treeHierarchy = hierarchy;
++            scene.branchLod = automaticBranchLod;
++            scene.sprayTraversal = SprayTraversal::Hierarchy;
++        }
++        else try
+         {
+             const auto sources = sprayBoughSources(scene.source);
+             for (std::size_t part = 0; part < scene.sprayLods.size(); ++part)
+@@ -505,7 +553,7 @@
+             scene.sprayLods = {};
+             scene.sprayLodStatus = error.what();
+         }
+-        if (scene.sprayLods[0])
++        if (scene.sprayLods[0] && scene.sprayFamilies.empty())
+         {
+             try
+             {
+--- a/src/D3D12Renderer.h
++++ b/src/D3D12Renderer.h
+@@ -184,6 +184,8 @@
+         ComPtr<ID3D12Resource> proxyVertices;
+         std::vector<MeshInstance> groupedInstances;
+         std::vector<LodTag> groupedTags;
++        std::vector<LodTag> sourceTags;
++        Microsoft::WRL::ComPtr<ID3D12Resource> sourceTagBuffer;
+         std::vector<Group> groups;
+         std::size_t localGroupCount = 0;
+         struct LeafGroup
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -608,11 +608,16 @@
+             : std::span<const std::uint32_t>{};
+         sprayGroupTags_.clear();
+         spraySourceGroupTags_.Reset();
+-        for (const auto& lod : scene.sprayLods)
+-        {
+-            if (!lod) continue;
+-            meshes[lod->meshIndex].sprayLod = uploadSprayLod(scene.asset->meshes[lod->meshIndex], *lod, members);
+-        }
++        const auto uploadPair = [&](const auto& pair) {
++            sprayGroupTags_.clear();
++            for (const auto& lod : pair)
++            {
++                if (!lod) continue;
++                meshes[lod->meshIndex].sprayLod = uploadSprayLod(scene.asset->meshes[lod->meshIndex], *lod, members);
++            }
++        };
++        if (scene.sprayFamilies.empty()) uploadPair(scene.sprayLods);
++        else for (const auto& pair : scene.sprayFamilies) uploadPair(pair);
+         loadLiveCut(scene);
+         uploadTreeHierarchy(scene, meshes);
+         sprayBoughMeshes_ = {};
+@@ -2780,6 +2785,8 @@
+         }
+         spraySourceGroupTags_ = uploadBuffer(sprayGroupTags_.data(), sprayGroupTags_.size() * sizeof(LodTag));
+     }
++    lod.sourceTags = sprayGroupTags_;
++    lod.sourceTagBuffer = spraySourceGroupTags_;
+     lod.groupedInstances.reserve(order.size());
+     lod.groupedTags.reserve(order.size());
+     for (auto index : order)
+@@ -3698,7 +3705,7 @@
+         {
+             const auto& instance = (*source.instances)[id];
+             gpu.instances.push_back(instance);
+-            if (id < sprayGroupTags_.size()) gpu.tags.push_back(sprayGroupTags_[id]);
++            if (const auto* lod = meshes[part.meshIndex].sprayLod.get()) gpu.tags.push_back(lod->sourceTags.at(id));
+             scales.push_back(maxLinearStretch(instance.matrix() * model));
+         }
+         for (const auto& node : part.nodes)
+@@ -4125,7 +4132,7 @@
+             }
+             if (!selectLod && !cull)
+             {
+-                const auto tags = groupTint ? spraySourceGroupTags_->GetGPUVirtualAddress() : 0;
++                const auto tags = groupTint && lod ? lod->sourceTagBuffer->GetGPUVirtualAddress() : 0;
+                 record(mesh.meshInstanceCount,
+                        drawMesh(mesh, material, scene.foliage, receive, mesh.meshInstanceCount, 0,
+                                 nullptr, tint, 0, 0, {}, tags));
+@@ -4175,7 +4182,7 @@
+ 
+             const auto drawIndexed = [&](const GpuFixedLodLevel* baked, UINT level, FixedLodIndexRange range,
+                                          UINT count, std::size_t offset, bool full, bool local) {
+-                const auto tags = !groupTint ? 0 : full ? spraySourceGroupTags_->GetGPUVirtualAddress()
++                const auto tags = !groupTint ? 0 : full ? lod->sourceTagBuffer->GetGPUVirtualAddress()
+                                                        : sprayInstanceTags_->GetGPUVirtualAddress();
+                 const auto address = sprayInstances_->GetGPUVirtualAddress() + offset * sizeof(MeshInstance);
+                 const D3D12_VERTEX_BUFFER_VIEW instanceView = full ? mesh.meshInstanceView : D3D12_VERTEX_BUFFER_VIEW{
+@@ -4214,7 +4221,7 @@
+                     if (const auto level = classify(instances[i], cull))
+                     {
+                         sprayBatches_[*level].push_back(instances[i]);
+-                        if (groupTint) sprayTagBatches_[*level].push_back(sprayGroupTags_[i]);
++                        if (groupTint) sprayTagBatches_[*level].push_back(lod->sourceTags[i]);
+                     }
+                 }
+                 for (std::size_t level = 0; level < levelCount; ++level)
+--- a/src/TreeGpu.cpp
++++ b/src/TreeGpu.cpp
+@@ -529,7 +529,7 @@
+                 plans.push_back({p.error, first, static_cast<UINT>(buckets.size()) - first});
+             }
+             part.localPlanCount = static_cast<UINT>(plans.size());
+-            const UINT minimum = scene.sprayLods[0] && index == scene.sprayLods[0]->meshIndex ? fixedLodRimLevel : 0;
++            const UINT minimum = scene.isLeafSpray(index) ? fixedLodRimLevel : 0;
+             for (UINT i = minimum; i < lod->levels.size(); ++i)
+             {
+                 plans.push_back({i == minimum ? 0 : lod->errors[i], static_cast<UINT>(buckets.size()), 1});
+@@ -681,7 +681,7 @@
+             stats.treeNodeTests += result.nodesTested;
+             stats.treeDepthRejects += result.occluded;
+             stats.treeCutHash = (stats.treeCutHash ^ result.hash) * 1099511628211ull;
+-            if (scene.sprayLods[0] && item.part == scene.sprayLods[0]->meshIndex)
++            if (scene.isLeafSpray(item.part))
+             {
+                 stats.foliageTriangles += result.triangles;
+                 stats.foliageDraws += draws;
+@@ -689,7 +689,7 @@
+                 stats.treeProxySprays[0] += result.proxyPlacements;
+                 stats.treeCanopyTriangles[0] += result.proxyTriangles;
+             }
+-            else if (scene.sprayLods[1] && item.part == scene.sprayLods[1]->meshIndex)
++            else if ((meshes_[item.part].meshInstanceCount && !scene.isLeafSpray(item.part)))
+             {
+                 stats.sprayWoodTriangles += result.triangles;
+                 stats.treeProxySprays[1] += result.proxyPlacements;
+@@ -725,6 +725,7 @@
+     XMFLOAT4 center, extent;
+     UINT nodeFirst, nodeCount, placementFirst, placementCount;
+     UINT planFirst, localPlans, wholePlans, firstBin;
++    UINT referencePlans;
+ };
+ 
+ struct BatchPose
+@@ -750,7 +751,7 @@
+     UINT next, bin;
+ };
+ 
+-static_assert(sizeof(BatchPart) == 64 && sizeof(BatchPose) == 256 && sizeof(BatchView) == 224);
++static_assert(sizeof(BatchPart) == 68 && sizeof(BatchPose) == 256 && sizeof(BatchView) == 224);
+ static_assert(sizeof(BatchCluster) == 32);
+ 
+ Bounds mergeClusterBounds(const Bounds& a, const Bounds& b)
+@@ -874,6 +875,7 @@
+         info.placementFirst = static_cast<UINT>(placements.size());
+         info.placementCount = part.placementCount;
+         info.planFirst = static_cast<UINT>(plans.size());
++        info.referencePlans = lod ? fixedLodFarLevel + 1 - (scene.isLeafSpray(meshIndex) ? fixedLodRimLevel : 0) : 0;
+         info.localPlans = part.localPlanCount;
+         info.wholePlans = part.wholePlanCount;
+         info.firstBin = first;
+@@ -914,9 +916,7 @@
+         const auto& part = treeParts_[batch.meshIndex];
+         const auto& mesh = batch.proxy ? part.bake->geometry : scene.asset->meshes[batch.meshIndex];
+         const auto* lod = batch.proxy ? nullptr : meshes_[batch.meshIndex].sprayLod.get();
+-        const auto baked = !lod ? nullptr :
+-            scene.sprayLods[0] && scene.sprayLods[0]->meshIndex == batch.meshIndex ? scene.sprayLods[0].get() :
+-            scene.sprayLods[1].get();
++        const auto baked = lod ? scene.sprayBake(batch.meshIndex) : nullptr;
+         std::span<const Vertex> vertices = mesh.vertices;
+         std::span<const UINT> indices = mesh.indices;
+         std::span<const FixedLodIndexRange> bakedClusters;
+@@ -1175,7 +1175,8 @@
+                   gpu.partCount, visibility.count, gpu.recordCapacity};
+     view.options = {(scene.sprayFrustumCulling ? 1u : 0u) | (shadowPass ? 2u : 0u) |
+                     (scene.sprayLocalLod ? 4u : 0u) | (tint == FixedLodTint::SprayGroup ? 8u : 0u) |
+-                    (sparse ? 16u : 0u) | (history ? 32u : 0u), enabledParts, 0, 0};
++                    (sparse ? 16u : 0u) | (history ? 32u : 0u) |
++                    (!shadowPass && scene.guardSprayReference ? 64u : 0u), enabledParts, 0, 0};
+     const auto address = gpu.instances->GetGPUVirtualAddress();
+     view.instanceAddress = {static_cast<UINT>(address), static_cast<UINT>(address >> 32), 0, 0};
+     view.previousClip = gpu.previousClip;
+@@ -1328,8 +1329,9 @@
+     }
+     if (occlusion) stats.gpuTreeDispatches += pyramidLevels;
+     stats.treeSubmissionMilliseconds += std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+-    if (scene.sprayLods[0] && (!shadowPass || scene.meshShadows[scene.sprayLods[0]->meshIndex].cast))
+-        stats.sprayPlacements += visibility.count * meshes_[scene.sprayLods[0]->meshIndex].meshInstanceCount;
++    for (const auto id : gpu.meshIndices)
++        if (scene.isLeafSpray(id) && (!shadowPass || scene.meshShadows[id].cast))
++            stats.sprayPlacements += visibility.count * meshes_[id].meshInstanceCount;
+     return true;
+ }
+ 
+@@ -1408,8 +1410,8 @@
+             {
+                 stats.treeNodeTests += nodes[p];
+                 const auto mesh = gpu.meshIndices[p];
+-                const bool leaves = scene.sprayLods[0] && mesh == scene.sprayLods[0]->meshIndex;
+-                const bool wood = scene.sprayLods[1] && mesh == scene.sprayLods[1]->meshIndex;
++                const bool leaves = scene.isLeafSpray(mesh);
++                const bool wood = (meshes_[mesh].meshInstanceCount && !scene.isLeafSpray(mesh));
+                 if (leaves) stats.visibleSprayPlacements += visibleSprays[p];
+                 if (pass.sparse)
+                 {
+@@ -1426,8 +1428,8 @@
+                 if (!count) continue;
+                 const auto& baked = gpu.bins[bin];
+                 const auto& batch = gpu.batches[baked.batch];
+-                const bool leaves = scene.sprayLods[0] && batch.meshIndex == scene.sprayLods[0]->meshIndex;
+-                const bool wood = scene.sprayLods[1] && batch.meshIndex == scene.sprayLods[1]->meshIndex;
++                const bool leaves = scene.isLeafSpray(batch.meshIndex);
++                const bool wood = (meshes_[batch.meshIndex].meshInstanceCount && !scene.isLeafSpray(batch.meshIndex));
+                 const auto triangles = static_cast<std::uint64_t>(baked.triangles) * count;
+                 ++stats.draws;
+                 ++stats.treeDraws;
+--- a/src/SceneCapture.cpp
++++ b/src/SceneCapture.cpp
+@@ -62,6 +62,7 @@
+     std::optional<float> backlighting;
+     std::optional<float> exposureEv;
+     bool noLeafShadowReception = false;
++    bool guardSprayReference = false;
+     bool geometryMask = false;
+     bool cullMeshBackfaces = false;
+     bool cullSprayWoodBackfaces = false;
+@@ -116,6 +117,7 @@
+             options.noLeafShadowReception = true;
+             continue;
+         }
++        if (flag == L"--guard-spray-reference") { options.guardSprayReference = true; continue; }
+         if (flag == L"--geometry-mask")
+         {
+             options.geometryMask = true;
+@@ -408,6 +410,9 @@
+     scene.captureBoughDepth = options.boughDepth;
+     if ((options.boughDepth || options.boughMaterials) && !options.geometryMask)
+         throw std::runtime_error("Bough depth and material captures require --geometry-mask.");
++    if (options.guardSprayReference && (scene.sprayFamilies.empty() || scene.treeSubmission != TreeSubmission::GpuBatched))
++        throw std::runtime_error("The qualified spray reference needs a family bake and batched GPU traversal.");
++    scene.guardSprayReference = options.guardSprayReference;
+     scene.captureGeometryMask = options.geometryMask;
+     scene.captureLighting = options.lighting;
+     scene.probeLighting = options.probeLighting.value_or(scene.probeLighting);
+--- a/shaders/TreeBatch.hlsl
++++ b/shaders/TreeBatch.hlsl
+@@ -6,6 +6,7 @@
+     float4 sprayCenter, sprayExtent;
+     uint nodeFirst, nodeCount, placementFirst, placementCount;
+     uint planFirst, localPlans, wholePlans, firstBin;
++    uint referencePlans;
+ };
+ 
+ struct Pose
+@@ -159,7 +160,7 @@
+                 float3 extent = halfExtent(node.extent, pose.toWorld) + abs(pose.wind.xyz);
+                 if (!intersectsFrustum(center, extent, worldToClip, 0)) continue;
+             }
+-            if (node.indexCount)
++            if (node.indexCount && (!(options.x & 64) || !part.placementCount))
+             {
+                 float scale = shadow ? shadowScale
+                     : pixelsPerUnit(node.center, node.extent, pose.toView, pose.viewWind.xyz, projection.yz);
+@@ -245,9 +246,10 @@
+             float scale = options.x & 2 ? shadowTexelsPerUnit(toClip, projection.w)
+                 : pixelsPerUnit(part.sprayCenter.xyz, part.sprayExtent.xyz, mul(spray.toAsset, pose.toView),
+                                 pose.viewWind.xyz, projection.yz);
+-            const bool local = (options.x & 4) && part.localPlans;
++            const bool guarded = (options.x & 64) != 0;
++            const bool local = !guarded && (options.x & 4) && part.localPlans;
+             const uint begin = part.planFirst + (local ? 0 : part.localPlans);
+-            const uint count = local ? part.localPlans : part.wholePlans;
++            const uint count = local ? part.localPlans : guarded ? min(part.referencePlans, part.wholePlans) : part.wholePlans;
+             plan = plans[selectPlan(plans, begin, count, projection.x, scale)];
+             if (pose.wind.w != 0)
+                 clip = classifyFrustum(part.sprayCenter.xyz, part.sprayExtent.xyz, toClip, pose.clipWind) == 1;

@@ -1,0 +1,130 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -62,7 +62,7 @@
+     COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E VSOakVisibility -Fh "${oak_visibility_vs}" -Vn oakVisibilityVS "${mesh_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E ShadowVS -Fh "${shadow_vs}" -Vn shadowVS "${mesh_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E ShadowPS -Fh "${shadow_ps}" -Vn shadowPS "${mesh_shader}"
+-    DEPENDS "${mesh_shader}" "${leaf_lighting_shader}" "${skylight_shader}" "${probe_lighting_shader}" "${DXC_EXECUTABLE}"
++    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/OakStudy.hlsli" "${mesh_shader}" "${leaf_lighting_shader}" "${skylight_shader}" "${probe_lighting_shader}" "${DXC_EXECUTABLE}"
+     COMMENT "Compiling Mesh.hlsl with DXC"
+     VERBATIM
+ )
+@@ -378,7 +378,7 @@
+     DEPENDS "${branch_bake}" "${branch_bake}.txt" ${branch_voxel_assets} ${forked_oak_bakes} "${bough_bake}" "${tree_hierarchy_bake}"
+     VERBATIM
+ )
+-add_dependencies(CustomGameEngine viewer_assets)
++# This isolated viewer uses the frozen benchmark assets staged alongside its executable.
+ 
+ set(crown_glb "${CMAKE_CURRENT_SOURCE_DIR}/assets/LowBranchedWhiteOak-Modeled.glb")
+ set(crown_bake "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/bakes/LowBranchedWhiteOak-Modeled.fixedlod")
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -127,6 +127,7 @@
+     UINT lightingMode;
+     UINT probePadding;
+     DiffuseProbeGrid probes;
++    XMFLOAT4 studyEye;
+ };
+ 
+ struct VoxelFrameConstants
+@@ -2859,6 +2860,7 @@
+ XMFLOAT2 D3D12Renderer::updateFrameConstants(const ViewerScene& scene, FXMMATRIX viewProjection, float windPhase)
+ {
+     FrameConstants constants{};
++    XMStoreFloat4(&constants.studyEye, XMMatrixInverse(nullptr, XMLoadFloat4x4(&frameView_)).r[3]);
+     XMStoreFloat4x4(&constants.viewProjection, viewProjection);
+     constants.lightViewProjection = lightViewProjection_;
+     constants.toSun = toSun_;
+@@ -3209,8 +3211,8 @@
+         updateShadowCascades(cascadeFitView ? *cascadeFitView : view, scene);
+     }
+     const auto viewProjection = XMLoadFloat4x4(&view) * XMLoadFloat4x4(&projection_);
++    frameView_ = view;
+     const auto windOffset = updateFrameConstants(scene, viewProjection, windPhase);
+-    frameView_ = view;
+     frameWind_ = windOffset;
+     sprayInstanceOffset_ = 0;
+     treeArgumentOffset_ = 0;
+@@ -4802,6 +4804,9 @@
+             constants.transmissionFlags |= (leaf.strengthTexture->texcoord + 1) << 3;
+         }
+     }
++    static const bool study = GetEnvironmentVariableW(L"OAK_LIGHTING_STUDY_BASELINE", nullptr, 0) == 0;
++    if (study && material.name == "White Oak Leaves") constants.transmissionFlags |= 32u;
++    if (study && material.name == "M_Oak_Twig") constants.transmissionFlags |= 64u;
+     commands_->SetGraphicsRoot32BitConstants(0, drawConstantCount, &constants, 0);
+     commands_->SetGraphicsRootDescriptorTable(1, textureHandle(material.colorTexture));
+     commands_->SetGraphicsRootDescriptorTable(6, textureHandle(transmissionColor));
+--- a/shaders/Mesh.hlsl
++++ b/shaders/Mesh.hlsl
+@@ -1,5 +1,6 @@
+ #include "LeafLighting.hlsli"
+ #include "ProbeLighting.hlsli"
++#include "OakStudy.hlsli"
+ 
+ cbuffer DrawConstants : register(b0)
+ {
+@@ -49,6 +50,7 @@
+     uint probePadding;
+     float4 probeOriginSpacing;
+     uint4 probeSize;
++    float4 studyEye;
+ };
+ 
+ Texture2D<float4> colorTexture : register(t0);
+@@ -393,8 +395,15 @@
+         if (strengthUv)
+             fraction *= transmissionStrengthTexture.Sample(colorSampler, strengthUv == 1 ? input.texcoords.xy : input.texcoords.zw).a;
+         LeafIncidentLight light = leafIncidentLight(worldNormal, normalToSun, directionalSkylight);
++        const LeafIncidentLight openLight = light;
+         localDiffuse(input.worldPositionAndViewDepth.xyz, worldNormal, probeOriginSpacing,
+                      probeSize.xyz, true, light.skyFront, light.skyBack);
++        if (transmissionFlags & 32u)
++        {
++            const float3 v = normalize(studyEye.xyz - input.worldPositionAndViewDepth.xyz);
++            return float4(studyLeaf(light, openLight, visibility, baseColor.rgb, tint, fraction,
++                                    worldNormal, v, toSun, lightingMode), 1.0);
++        }
+         return float4(shadeLeaf(light, visibility, lightingMode, baseColor.rgb, tint, fraction), 1.0);
+     }
+     if (lightingMode == transmissionOnly) return float4(0, 0, 0, 1);
+@@ -404,6 +413,8 @@
+                  false, ambient, unusedBack);
+     const float direct = lightingMode == skyOnly ? 0.0 : 0.65 * diffuse * visibility;
+     float3 lit = baseColor.rgb * (ambient + direct);
++    if (transmissionFlags & 64u)
++        lit = studyTwig(baseColor.rgb, ambient, direct, normalToSun, visibility);
+     return float4(encodedCamera && hasColorTexture ? encodeSrgb(lit) : lit, 1.0);
+ }
+ 
+--- a/src/SceneCapture.cpp
++++ b/src/SceneCapture.cpp
+@@ -40,6 +40,7 @@
+     std::optional<float> distance;
+     std::optional<float> endDistance;
+     float orbitDegrees = 0;
++    DirectX::XMFLOAT3 focusOffset{};
+     std::optional<int> lod;
+     std::optional<SprayTraversal> sprayTraversal;
+     std::optional<TreeSubmission> treeSubmission;
+@@ -189,6 +190,9 @@
+         else if (flag == L"--wind-time") options.windTime = number(value, 0, 1'000'000, "--wind-time");
+         else if (flag == L"--wind-strength")
+             options.windStrength = static_cast<float>(number(value, 0, maxWindStrength, "--wind-strength"));
++        else if (flag == L"--focus-offset-x") options.focusOffset.x = static_cast<float>(number(value, -100, 100, "--focus-offset-x"));
++        else if (flag == L"--focus-offset-y") options.focusOffset.y = static_cast<float>(number(value, -100, 100, "--focus-offset-y"));
++        else if (flag == L"--focus-offset-z") options.focusOffset.z = static_cast<float>(number(value, -100, 100, "--focus-offset-z"));
+         else if (flag == L"--yaw-degrees") options.yaw = static_cast<float>(number(value, -360, 360, "--yaw-degrees"));
+         else if (flag == L"--pitch-degrees")
+             options.pitch = static_cast<float>(number(value, -83, 83, "--pitch-degrees"));
+@@ -619,6 +623,9 @@
+ CameraView captureCamera(const ViewerScene& scene, const CaptureOptions& options)
+ {
+     auto view = scene.cameraView(options.camera);
++    view.focus.x += options.focusOffset.x;
++    view.focus.y += options.focusOffset.y;
++    view.focus.z += options.focusOffset.z;
+     if (options.yaw) view.yaw = DirectX::XMConvertToRadians(*options.yaw);
+     if (options.pitch) view.pitch = DirectX::XMConvertToRadians(*options.pitch);
+     view.distance = options.distance.value_or(view.distance);

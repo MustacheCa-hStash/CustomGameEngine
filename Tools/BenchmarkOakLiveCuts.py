@@ -48,15 +48,16 @@ def native_paths(subject,d,y):
         return UE/(stem+".png"),UE/(stem+"-fine.png")
     return ue_images(int(subject),d,y)
 
-def command(subject,arm,d,y,limit=1.,wind=0):
+def command(subject,arm,d,y,limit=1.,wind=0,probe_gi="off"):
     ordered=arm.endswith("-ordered")
     arm=arm.removesuffix("-ordered")
     ref=arm=="source"
     exe=viewer(subject,ref,arm=="production",ordered)
     args=["--scene","forked-oak","--camera","overview","--width","3840","--height","2160","--msaa","1",
           "--distance",str(d),"--pitch-degrees","-5.46" if d==41 else "-2.235","--yaw-degrees",str(y),
-          "--wind-strength",str(wind),"--wind-time","0","--lighting","combined","--probe-gi","off",
+          "--wind-strength",str(wind),"--wind-time","0","--lighting","combined",
           "--cull-spray-wood-backfaces"]
+    if probe_gi is not None: args.extend(["--probe-gi",probe_gi])
     if ref and subject=="crown":
         # UE imported the 1,504-leaf / 950-wood cut, which is D3D fixed LOD 4.
         args+=["--lod","4"]
@@ -444,7 +445,7 @@ if __name__=="__main__":
         guards=json.loads((OUT/"guard.json").read_text()) if (OUT/"guard.json").exists() else {"sprays":.9,"hybrid":.85}
         x=guards.get(base,x)
         if args.pixel_error is not None:x=args.pixel_error
-        exe,flags=command(args.subject,args.arm,args.distance,132,x)
+        exe,flags=command(args.subject,args.arm,args.distance,132,x,probe_gi=None)
         if "--live-cut" in flags and not Path(flags[flags.index("--live-cut")+1]).is_file():
             raise FileNotFoundError(flags[flags.index("--live-cut")+1])
         if args.action=="view":subprocess.Popen([exe,"--review-capture",*flags])

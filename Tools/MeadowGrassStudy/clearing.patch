@@ -1,0 +1,145 @@
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -2652,7 +2652,7 @@
+ 
+ // The authored tubes use contiguous rings. Preserve each ring centre, both ends
+ // and every panicle branch. Skip alternate radial vertices only on wide rings.
+-static std::vector<UINT> cameraTubeIndices(const MeshData& mesh, float& error)
++static std::vector<UINT> cameraTubeIndices(const MeshData& mesh, float& error, bool refineStems)
+ {
+     std::vector<UINT> indices;
+     const auto& src = mesh.indices;
+@@ -2669,19 +2669,54 @@
+             const UINT face[]={base+j,base+k,next+k,base+j,next+k,next+j};
+             if (!std::equal(std::begin(face),std::end(face),src.begin()+cursor+6*j)) return {};
+         }
++        // A second strip can share the end ring. Bridge it only when the
++        // complete intermediate ring stays within 0.3 mm of the ruled surface.
++        UINT last = next;
++        size_t consumed = 6*sides;
++        float axialError = 0;
++        if (refineStems && cursor+2*consumed<=src.size())
++        {
++            const UINT end = next+sides;
++            bool connected = size_t(end)+sides<=mesh.vertices.size();
++            for (UINT j=0; connected && j<sides; ++j)
++            {
++                const UINT k=(j+1)%sides;
++                const UINT nextFace[]={next+j,next+k,end+k,next+j,end+k,end+j};
++                connected=std::equal(std::begin(nextFace),std::end(nextFace),src.begin()+cursor+consumed+6*j);
++            }
++            if (connected)
++            {
++                const auto pos=[&](UINT id){ return XMLoadFloat3(&mesh.vertices[id].position); };
++                const auto chord=pos(end)-pos(base);
++                const float t=std::clamp(XMVectorGetX(XMVector3Dot(pos(next)-pos(base),chord))/
++                    std::max(1e-12f,XMVectorGetX(XMVector3LengthSq(chord))),0.f,1.f);
++                float deviation=0;
++                for (UINT j=0; j<sides; ++j)
++                    deviation=std::max(deviation,XMVectorGetX(XMVector3Length(
++                        pos(next+j)-XMVectorLerp(pos(base+j),pos(end+j),t))));
++                if (deviation<=.0003f)
++                {
++                    axialError=deviation;
++                    last=end;
++                    consumed*=2;
++                }
++            }
++        }
++        error=std::max(error,axialError);
+         for (UINT j=0; j<sides;)
+         {
+-            const UINT end=std::min(sides,j+(sides>=5 ? 2u : 1u)), k=end%sides;
+-            indices.insert(indices.end(),{base+j,base+k,next+k,base+j,next+k,next+j});
++            const bool skip = sides>=5 || (refineStems && sides==4 && j==0);
++            const UINT end=std::min(sides,j+(skip ? 2u : 1u)), k=end%sides;
++            indices.insert(indices.end(),{base+j,base+k,last+k,base+j,last+k,last+j});
+             if (end==j+2)
+-                for (UINT ring : {base,next})
++                for (UINT ring : {base,last})
+                 {
+                     const auto p=[&](UINT lane){ return XMLoadFloat3(&mesh.vertices[ring+lane].position); };
+-                    error=std::max(error,XMVectorGetX(XMVector3Length(p(j+1)-XMVectorLerp(p(j),p(k),.5f))));
++                    error=std::max(error,axialError+XMVectorGetX(XMVector3Length(p(j+1)-XMVectorLerp(p(j),p(k),.5f))));
+                 }
+             j=end;
+         }
+-        cursor+=6*sides;
++        cursor+=consumed;
+     }
+     return indices;
+ }
+@@ -2732,9 +2767,10 @@
+     {
+         float error = 0;
+         std::vector<UINT> mid;
++        static const bool lightStems = GetEnvironmentVariableW(L"MEADOW_LIGHT_STEMS", nullptr, 0) != 0;
++        const bool stem = material->name=="Culm" || material->name.starts_with("Green sheath") || material->name=="Old sheath";
+         if (material->name.starts_with("Lamina |")) mid=bladeLodIndices(mesh,error,true);
+-        else if (material->name=="Culm" || material->name.starts_with("Green sheath") || material->name=="Old sheath")
+-            mid=cameraTubeIndices(mesh,error);
++        else if (stem) mid=cameraTubeIndices(mesh,error,lightStems);
+         if (!mid.empty() && mid.size()<mesh.indices.size())
+         {
+             gpu.cameraGrassCount=static_cast<UINT>(mid.size());
+@@ -2745,7 +2781,8 @@
+             for (const auto& tuft : *mesh.instances)
+                 scale=std::max({scale,std::abs(tuft.scale.x),std::abs(tuft.scale.y),std::abs(tuft.scale.z)});
+             // The lower bound also protects nearby highlights on round stems.
+-            gpu.cameraGrassError=std::max(.002f,error)*scale*maxLinearStretch(XMLoadFloat4x4(&mesh.localToWorld));
++            const float floor = lightStems && stem ? .00035f : .002f;
++            gpu.cameraGrassError=std::max(floor,error)*scale*maxLinearStretch(XMLoadFloat4x4(&mesh.localToWorld));
+         }
+     }
+     if (mesh.instances)
+@@ -4885,6 +4922,17 @@
+         if (materialCull || (live && scene.liveCutGpu))
+             commands_->SetPipelineState((materialCull && i == scene.sprayLods[1]->meshIndex ? cameraMode.oneSidedMesh : cameraMode.mesh).get(encodedCamera_));
+         if (shadowPass && !flags.cast) continue;
++        static const bool hideBlades = GetEnvironmentVariableW(L"MEADOW_HIDE_BLADES", nullptr, 0) != 0;
++        static const bool hideStems = GetEnvironmentVariableW(L"MEADOW_HIDE_STEMS", nullptr, 0) != 0;
++        static const bool hideHeads = GetEnvironmentVariableW(L"MEADOW_HIDE_HEADS", nullptr, 0) != 0;
++        if (!shadowPass && (hideBlades || hideStems || hideHeads) &&
++            scene.asset->meshes[i].name.starts_with("Full grass strip"))
++        {
++            const auto& name = scene.asset->materials[meshes_[i].material].name;
++            if ((hideBlades && name.starts_with("Lamina |")) ||
++                (hideStems && (name=="Culm" || name.starts_with("Green sheath") || name=="Old sheath")) ||
++                (hideHeads && name.starts_with("Glume |"))) continue;
++        }
+         static const bool hideTall = GetEnvironmentVariableW(L"MEADOW_HIDE_TALL_CAMERA", nullptr, 0) != 0;
+         static const bool hideGrass = GetEnvironmentVariableW(L"MEADOW_HIDE_ALL_GRASS_CAMERA", nullptr, 0) != 0;
+         if (!shadowPass && (hideTall || hideGrass))
+@@ -5172,6 +5220,10 @@
+         constants.transmissionFlags |= (material.bladeNormal->texcoord + 1u) << 7;
+         constants.bladeNormalScale = material.normalScale;
+         constants.bladeRoughness = material.roughness;
++        static const bool noBladeNormal = GetEnvironmentVariableW(L"MEADOW_NO_BLADE_NORMAL", nullptr, 0) != 0;
++        static const bool noBladeGlint = GetEnvironmentVariableW(L"MEADOW_NO_BLADE_GLINT", nullptr, 0) != 0;
++        if (noBladeNormal) constants.transmissionFlags |= 4096u;
++        if (noBladeGlint) constants.transmissionFlags |= 8192u;
+     }
+     // A receiving ground draw and a blade draw use mutually exclusive surface maps.
+     if (material.soilSkyVisibility) constants.transmissionFlags |= 512u;
+--- a/shaders/Mesh.hlsl
++++ b/shaders/Mesh.hlsl
+@@ -494,11 +494,14 @@
+         float sunGlint = 0.0;
+         if (normalUv)
+         {
+-            const float side = twoSidedNormalSign ? (isFrontFace ? 1.0 : -1.0) * twoSidedNormalSign : 1.0;
+-            worldNormal = side * bladeShadingNormal(input.worldPositionAndViewDepth.xyz, side * worldNormal,
+-                                normalUv == 1 ? input.texcoords.xy : input.texcoords.zw);
+-            normalToSun = dot(worldNormal,toSun);
+-            if (lightingMode != skyOnly && lightingMode != transmissionOnly)
++            [branch] if (!(transmissionFlags & 4096u))
++            {
++                const float side = twoSidedNormalSign ? (isFrontFace ? 1.0 : -1.0) * twoSidedNormalSign : 1.0;
++                worldNormal = side * bladeShadingNormal(input.worldPositionAndViewDepth.xyz, side * worldNormal,
++                                    normalUv == 1 ? input.texcoords.xy : input.texcoords.zw);
++                normalToSun = dot(worldNormal,toSun);
++            }
++            [branch] if (!(transmissionFlags & 8192u) && lightingMode != skyOnly && lightingMode != transmissionOnly)
+                 sunGlint = visibility * bladeSunReflection(worldNormal,
+                     normalize(studyEye.xyz - input.worldPositionAndViewDepth.xyz), bladeRoughness);
+         }

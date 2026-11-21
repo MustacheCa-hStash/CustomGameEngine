@@ -1,0 +1,371 @@
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -2762,11 +2762,11 @@
+             gpu.farGrassError=error*maxScale*maxLinearStretch(XMLoadFloat4x4(&mesh.localToWorld));
+         }
+     }
++    std::vector<UINT> mid;
+     if (material && mesh.instances && mesh.name.starts_with("Full grass strip") &&
+         !GetEnvironmentVariableW(L"MEADOW_FULL_CAMERA_MESH",nullptr,0))
+     {
+         float error = 0;
+-        std::vector<UINT> mid;
+         static const bool lightStems = GetEnvironmentVariableW(L"MEADOW_LIGHT_STEMS", nullptr, 0) != 0;
+         const bool stem = material->name=="Culm" || material->name.starts_with("Green sheath") || material->name=="Old sheath";
+         if (material->name.starts_with("Lamina |")) mid=bladeLodIndices(mesh,error,true);
+@@ -2785,6 +2785,76 @@
+             gpu.cameraGrassError=std::max(floor,error)*scale*maxLinearStretch(XMLoadFloat4x4(&mesh.localToWorld));
+         }
+     }
++    const bool tall=mesh.name.starts_with("Full grass strip"), shortGrass=mesh.name.starts_with("Short grass");
++    if ((tall || shortGrass) && mesh.instances && material && material->name.starts_with("Lamina |") &&
++        material->textureCoordinateSet==0 && (!material->bladeNormal || material->bladeNormal->texcoord==0) &&
++        (!material->diffuseTransmission || ((!material->diffuseTransmission->colorTexture ||
++            material->diffuseTransmission->colorTexture->texcoord==0) && (!material->diffuseTransmission->strengthTexture ||
++            material->diffuseTransmission->strengthTexture->texcoord==0))) &&
++        GetEnvironmentVariableW(L"MEADOW_SPARSE_BLADES",nullptr,0))
++    {
++        const UINT rows=tall ? 8u : 6u, stride=3*rows+1, perBlade=12*(rows-1)+6;
++        const UINT blades=static_cast<UINT>(mesh.vertices.size()/stride);
++        const auto grouped=[&](const auto& indices, UINT per) {
++            if (!per || indices.size()!=size_t(blades)*per) return false;
++            for (size_t i=0; i<indices.size(); ++i)
++                if (indices[i]/stride!=i/per) return false;
++            return true;
++        };
++        if (blades && blades<4096 && mesh.vertices.size()==size_t(blades)*stride &&
++            grouped(mesh.indices,perBlade) && (mid.empty() || grouped(mid,static_cast<UINT>(mid.size()/blades))))
++        {
++            // Farthest-point ordering of tips gives every prefix an angular and height spread.
++            std::vector<UINT> order;
++            std::vector<float> nearest(blades,FLT_MAX);
++            UINT chosen=0;
++            for (UINT rank=0; rank<blades; ++rank)
++            {
++                order.push_back(chosen);
++                const auto tip=[&](UINT b){ return XMLoadFloat3(&mesh.vertices[(b+1)*stride-1].position); };
++                for (UINT b=0; b<blades; ++b)
++                    nearest[b]=std::min(nearest[b],XMVectorGetX(XMVector3LengthSq(tip(chosen)-tip(b))));
++                nearest[chosen]=-1;
++                chosen=static_cast<UINT>(std::max_element(nearest.begin(),nearest.end())-nearest.begin());
++            }
++            auto vertices=mesh.vertices;
++            float maxOffset=0;
++            for (UINT rank=0; rank<blades; ++rank)
++                for (UINT j=0; j<stride; ++j)
++                {
++                    const UINT first=order[rank]*stride;
++                    auto& v=vertices[first+j];
++                    const auto center=XMLoadFloat3(&vertices[first+std::min(stride-1,(j/3)*3+1)].position);
++                    const auto offset=XMLoadFloat3(&v.position)-center;
++                    XMFLOAT3 d;
++                    XMStoreFloat3(&d,offset);
++                    maxOffset=std::max(maxOffset,XMVectorGetX(XMVector3Length(offset)));
++                    // Integer-valued floats use a spare UV set only in the private camera buffer.
++                    const auto pack=[](float x){ return std::clamp(int(std::lround(x*65536))+2048,0,4095); };
++                    v.texcoords[1]={float(pack(d.x)+4096*pack(d.y)),float(pack(d.z)+4096*rank)};
++                }
++            if (maxOffset<.031f)
++            {
++                std::vector<UINT> indices;
++                const auto append=[&](const auto& input) {
++                    const auto count=input.size()/blades;
++                    for (UINT b:order)
++                        indices.insert(indices.end(),input.begin()+b*count,input.begin()+(b+1)*count);
++                };
++                append(mesh.indices);
++                append(mid);
++                const UINT bytes=static_cast<UINT>(indices.size()*sizeof(UINT));
++                gpu.sparseIndexBuffer=uploadBuffer(indices.data(),bytes);
++                gpu.sparseIndices={gpu.sparseIndexBuffer->GetGPUVirtualAddress(),bytes,DXGI_FORMAT_R32_UINT};
++                gpu.sparseVertexBuffer=uploadBuffer(vertices.data(),vertexBytes);
++                gpu.sparseVertices={gpu.sparseVertexBuffer->GetGPUVirtualAddress(),static_cast<UINT>(vertexBytes),sizeof(Vertex)};
++                gpu.sparseBlades=blades;
++                float scale=0;
++                for (const auto& tuft:*mesh.instances) scale=std::max({scale,std::abs(tuft.scale.x),std::abs(tuft.scale.y),std::abs(tuft.scale.z)});
++                gpu.sparsePadding=(maxOffset+.00003f)*1.6f*scale*maxLinearStretch(XMLoadFloat4x4(&mesh.localToWorld));
++            }
++        }
++    }
+     if (mesh.instances)
+     {
+         const auto instanceBytes = static_cast<UINT>(mesh.instances->size() * sizeof(MeshInstance));
+@@ -2803,16 +2873,31 @@
+             }
+             const BoundingBox primitive(mesh.localBounds.center, mesh.localBounds.halfExtent);
+             std::vector<MeshInstance> ordered;
++            std::vector<MeshInstance> ranked;
++            const bool stratified=GetEnvironmentVariableW(L"MEADOW_SPREAD_TUFTS",nullptr,0)!=0;
++            gpu.stratifiedTufts=stratified && tall && std::all_of(mesh.instances->begin(),mesh.instances->end(),
++                [](const auto& i){ return i.rotation.x==0 && i.rotation.z==0; });
++            const bool patchDensity=gpu.stratifiedTufts || GetEnvironmentVariableW(L"MEADOW_PATCH_DENSITY",nullptr,0)!=0;
++            const auto tuftRank=[](const MeshInstance& tuft) {
++                UINT h=std::bit_cast<UINT>(tuft.translation.x)*0x9e3779b9u ^ std::bit_cast<UINT>(tuft.translation.z);
++                h^=h>>16; h*=0x85ebca6bu; h^=h>>13;
++                return float(h>>8)/16777216.f;
++            };
+             const bool checkTufts = GetEnvironmentVariableW(L"MEADOW_TEST_CAMERA_TUFTS", nullptr, 0) ||
+                                     GetEnvironmentVariableW(L"MEADOW_TEST_FAR_CAMERA_TUFTS", nullptr, 0);
+             ordered.reserve(mesh.instances->size());
+             for (const auto& [cell, ids] : bins)
+             {
+                 const UINT first = static_cast<UINT>(ordered.size());
+-                BoundingBox box;
++                BoundingBox box,roots;
+                 for (UINT id : ids)
+                 {
+                     const auto& tuft = (*mesh.instances)[id];
++                    XMFLOAT3 root;
++                    XMStoreFloat3(&root,XMVector3TransformCoord(XMLoadFloat3(&tuft.translation),node));
++                    const BoundingBox rootPoint(root,{0,0,0});
++                    if (ordered.size()==first) roots=rootPoint;
++                    else BoundingBox::CreateMerged(roots,roots,rootPoint);
+                     BoundingBox bounds;
+                     primitive.Transform(bounds, tuft.matrix() * node);
+                     if (checkTufts) gpu.diagnosticTuftBounds.push_back({bounds.Center,bounds.Extents});
+@@ -2820,9 +2905,55 @@
+                     else BoundingBox::CreateMerged(box, box, bounds);
+                     ordered.push_back(tuft);
+                 }
+-                gpu.grassTiles.push_back({{box.Center, box.Extents}, first, static_cast<UINT>(ids.size())});
++                gpu.grassTiles.push_back({{box.Center, box.Extents}, first, static_cast<UINT>(ids.size()),
++                    {(cell.second+.5f)*tileMetres,(cell.first+.5f)*tileMetres},{roots.Center,roots.Extents}});
++                if (patchDensity)
++                {
++                    ranked.insert(ranked.end(),ordered.begin()+first,ordered.end());
++                    std::stable_sort(ranked.begin()+first,ranked.end(),[&](const auto& a,const auto& b){ return tuftRank(a)<tuftRank(b); });
++                    for (size_t i=first;i<ranked.size();++i)
++                    {
++                        float rank=tuftRank(ranked[i]);
++                        if (gpu.stratifiedTufts)
++                        {
++                            rank=(float(i-first)+.5f)/float(ids.size());
++                            if (i==first) rank=std::min(.18f,rank);
++                            // Camera-only copies of validated yaw rotations carry the rank in their unused X lane.
++                            ranked[i].rotation.x=rank;
++                        }
++                        gpu.patchRanks.push_back(rank);
++                    }
++                }
+             }
+             gpu.meshInstances = uploadBuffer(ordered.data(), instanceBytes);
++            if (patchDensity)
++            {
++                if (gpu.stratifiedTufts)
++                {
++                    // Group equal density bands across tiles so distant draws coalesce.
++                    std::vector<MeshInstance> byBand;
++                    std::vector<float> ranks;
++                    byBand.reserve(ranked.size());
++                    ranks.reserve(ranked.size());
++                    for (UINT band=0;band<8;++band)
++                        for (auto tile:gpu.grassTiles)
++                        {
++                            const auto begin=gpu.patchRanks.begin()+tile.first,end=begin+tile.count;
++                            const auto lo=std::lower_bound(begin,end,band/8.f);
++                            const auto hi=std::lower_bound(lo,end,(band+1)/8.f);
++                            if (lo==hi) continue;
++                            tile.first=static_cast<UINT>(byBand.size());
++                            tile.count=static_cast<UINT>(hi-lo);
++                            gpu.patchTiles.push_back(tile);
++                            byBand.insert(byBand.end(),ranked.begin()+(lo-gpu.patchRanks.begin()),ranked.begin()+(hi-gpu.patchRanks.begin()));
++                            ranks.insert(ranks.end(),lo,hi);
++                        }
++                    ranked.swap(byBand);
++                    gpu.patchRanks.swap(ranks);
++                }
++                gpu.patchInstances=uploadBuffer(ranked.data(),instanceBytes);
++                gpu.patchInstanceView={gpu.patchInstances->GetGPUVirtualAddress(),instanceBytes,sizeof(MeshInstance)};
++            }
+         }
+         else gpu.meshInstances = uploadBuffer(mesh.instances->data(), instanceBytes);
+         gpu.meshInstanceView = {gpu.meshInstances->GetGPUVirtualAddress(), instanceBytes, sizeof(MeshInstance)};
+@@ -4438,7 +4569,17 @@
+                     }
+                     return true;
+                 };
+-                bindMesh(mesh, material, scene.foliage, receive, nullptr, tint, 0, 0, 0, 0);
++                const bool sparse=!shadowPass && mesh.sparseBlades;
++                const bool patch=!shadowPass && !mesh.patchRanks.empty();
++                bindMesh(mesh, material, scene.foliage, receive, nullptr, tint, 0,
++                    (sparse ? (0x80000000u | mesh.sparseBlades) : 0) | (patch ? 0x40000000u : 0) |
++                    (patch && mesh.stratifiedTufts ? 0x20000000u : 0), 0, 0);
++                if (patch) commands_->IASetVertexBuffers(2,1,&mesh.patchInstanceView);
++                if (sparse)
++                {
++                    commands_->IASetVertexBuffers(0,1,&mesh.sparseVertices);
++                    commands_->IASetIndexBuffer(&mesh.sparseIndices);
++                }
+                 const bool farProxy = shadowPass && shadowSlice && *shadowSlice==2 && mesh.farGrassCount &&
+                     mesh.farGrassError*object.placement.w <= 0.65f*cascadeWorldUnitsPerTexel_[2];
+                 UINT indexCount = farProxy ? mesh.farGrassCount : mesh.indexCount;
+@@ -4447,16 +4588,19 @@
+                 XMFLOAT4X4 placementMatrix;
+                 XMStoreFloat4x4(&placementMatrix, object.placementMatrix());
+                 const XMFLOAT2 wind{frameWind_.x*object.placement.w, frameWind_.y*object.placement.w};
+-                UINT first = 0, count = 0;
++                const auto eye=XMMatrixInverse(nullptr,view).r[3];
++                UINT first = 0, count = 0, firstIndex=0;
+                 const auto flush = [&] {
+                     if (!count) return;
+-                    commands_->DrawIndexedInstanced(indexCount, count, 0, 0, first);
++                    commands_->DrawIndexedInstanced(indexCount, count, firstIndex, 0, first);
+                     record(count, std::uint64_t(indexCount / 3) * count);
+                     count = 0;
+                 };
+-                for (const auto& tile : mesh.grassTiles)
++                for (const auto& tile : (patch && mesh.stratifiedTufts ? mesh.patchTiles : mesh.grassTiles))
+                 {
+-                    const BoundingBox box(tile.bounds.center, tile.bounds.halfExtent);
++                    BoundingBox box(tile.bounds.center, tile.bounds.halfExtent);
++                    if (sparse) { box.Extents.x+=mesh.sparsePadding; box.Extents.y+=mesh.sparsePadding; box.Extents.z+=mesh.sparsePadding; }
++                    if (patch) BoundingBox::CreateMerged(box,box,BoundingBox(tile.rootBounds.center,tile.rootBounds.halfExtent));
+                     if (!keepAll && (!intersectsFrustum(box, tilePlanes) ||
+                         (checkReceivers && !canReachReceivers(tile.bounds)) ||
+                         (testCameraShadows && shadowPass && !intersectsFrustum(box, cameraPlanes))))
+@@ -4464,15 +4608,42 @@
+                         flush();
+                         continue;
+                     }
+-                    if (selectCameraGrass)
++                    float t=0;
++                    if (sparse || patch)
+                     {
+-                        const bool mid = projectLodError(mesh.cameraGrassError,tile.bounds,placementMatrix,frameView_,wind) < .85f;
+-                        const UINT desired = mid ? mesh.cameraGrassCount : mesh.indexCount;
+-                        if (desired != indexCount)
++                        const auto center=XMVector3TransformCoord(XMVectorSet(tile.rootCellCenter.x,0,tile.rootCellCenter.y,1),
++                            object.placementMatrix());
++                        const auto d=center-eye;
++                        const float nearDistance=std::hypot(XMVectorGetX(d),XMVectorGetZ(d))-1.415f*std::abs(object.placement.w);
++                        const float linear=std::clamp((nearDistance-2.5f)/9.5f,0.f,1.f);
++                        t=linear*linear*(3-2*linear);
++                    }
++                    UINT visibleTufts=tile.count;
++                    if (patch && t>0)
++                    {
++                        const auto begin=mesh.patchRanks.begin()+tile.first;
++                        const float cutoff=1.10f-.74f*t+.00001f;
++                        visibleTufts=static_cast<UINT>(std::upper_bound(begin,begin+tile.count,cutoff)-begin);
++                        if (!visibleTufts) { flush(); continue; }
++                    }
++                    if (selectCameraGrass || sparse)
++                    {
++                        const bool mid = selectCameraGrass && projectLodError(mesh.cameraGrassError,tile.bounds,placementMatrix,frameView_,wind) < .85f;
++                        UINT desired = mid ? mesh.cameraGrassCount : mesh.indexCount;
++                        const UINT start=sparse && mid ? mesh.indexCount : 0;
++                        if (sparse)
++                        {
++                            const float fraction=1.f-(patch ? .15f : .72f)*t;
++                            // Round up into eighths for batching. The VS fades the final blade per actual tuft.
++                            const UINT bucket=std::min(8u,static_cast<UINT>(std::ceil(8*fraction+.00001f)));
++                            desired=(desired/mesh.sparseBlades)*((mesh.sparseBlades*bucket+7)/8);
++                        }
++                        if (desired != indexCount || start!=firstIndex)
+                         {
+                             flush();
+                             indexCount=desired;
+-                            commands_->IASetIndexBuffer(mid ? &mesh.cameraGrassIndices : &mesh.indices);
++                            firstIndex=start;
++                            if (!sparse) commands_->IASetIndexBuffer(mid ? &mesh.cameraGrassIndices : &mesh.indices);
+                         }
+                     }
+                     static const bool farCheckOnly = GetEnvironmentVariableW(L"MEADOW_TEST_FAR_CAMERA_TUFTS",nullptr,0) != 0;
+@@ -4489,7 +4660,8 @@
+                     else
+                     {
+                         if (!count) first = tile.first;
+-                        count += tile.count;
++                        count += visibleTufts;
++                        if (visibleTufts<tile.count) flush();
+                     }
+                 }
+                 flush();
+@@ -4922,6 +5094,13 @@
+         if (materialCull || (live && scene.liveCutGpu))
+             commands_->SetPipelineState((materialCull && i == scene.sprayLods[1]->meshIndex ? cameraMode.oneSidedMesh : cameraMode.mesh).get(encodedCamera_));
+         if (shadowPass && !flags.cast) continue;
++        static const bool contactGrass=GetEnvironmentVariableW(L"MEADOW_CONTACT_GRASS_ONLY",nullptr,0)!=0;
++        static const bool nearGrass=GetEnvironmentVariableW(L"MEADOW_NEAR_GRASS_ONLY",nullptr,0)!=0;
++        if (shadowPass && (contactGrass || (nearGrass && shadowSlice && *shadowSlice>0)))
++        {
++            const auto& name=scene.asset->meshes[i].name;
++            if (name.starts_with("Full grass strip") || name.starts_with("Short grass")) continue;
++        }
+         static const bool hideBlades = GetEnvironmentVariableW(L"MEADOW_HIDE_BLADES", nullptr, 0) != 0;
+         static const bool hideStems = GetEnvironmentVariableW(L"MEADOW_HIDE_STEMS", nullptr, 0) != 0;
+         static const bool hideHeads = GetEnvironmentVariableW(L"MEADOW_HIDE_HEADS", nullptr, 0) != 0;
+--- a/src/D3D12Renderer.h
++++ b/src/D3D12Renderer.h
+@@ -208,6 +208,8 @@
+         {
+             Bounds bounds;
+             UINT first, count;
++            DirectX::XMFLOAT2 rootCellCenter;
++            Bounds rootBounds;
+         };
+         std::vector<GrassTile> grassTiles;
+         ComPtr<ID3D12Resource> farGrassBuffer;
+@@ -218,6 +220,16 @@
+         D3D12_INDEX_BUFFER_VIEW cameraGrassIndices{};
+         UINT cameraGrassCount = 0;
+         float cameraGrassError = 0;
++        ComPtr<ID3D12Resource> sparseVertexBuffer, sparseIndexBuffer;
++        D3D12_VERTEX_BUFFER_VIEW sparseVertices{};
++        D3D12_INDEX_BUFFER_VIEW sparseIndices{};
++        UINT sparseBlades = 0;
++        float sparsePadding = 0;
++        ComPtr<ID3D12Resource> patchInstances;
++        D3D12_VERTEX_BUFFER_VIEW patchInstanceView{};
++        std::vector<float> patchRanks;
++        std::vector<GrassTile> patchTiles;
++        bool stratifiedTufts=false;
+         std::vector<Bounds> diagnosticTuftBounds;
+         ComPtr<ID3D12Resource> vertexBuffer;
+         ComPtr<ID3D12Resource> indexBuffer;
+--- a/shaders/Mesh.hlsl
++++ b/shaders/Mesh.hlsl
+@@ -144,6 +144,43 @@
+ PixelInput VSMain(VertexInput input, uint instanceId : SV_InstanceID)
+ {
+     PixelInput output;
++    if (lodLevel & 0xc0000000u)
++    {
++        float4 root=mul(float4(input.meshTranslation,1),model);
++        float2 rootXZ=rotateXZ(root.xz,input.instance.z)*input.instance.w+input.instance.xy;
++        float t=smoothstep(2.5,12.0,length(rootXZ-studyEye.xz));
++        float fraction=1-.72*t;
++        float scale=1, width=1;
++        if (lodLevel & 0x40000000u)
++        {
++            float rank=input.meshRotation.x;
++            if (lodLevel & 0x20000000u) input.meshRotation.x=0;
++            else
++            {
++                uint h=asuint(input.meshTranslation.x)*0x9e3779b9u ^ asuint(input.meshTranslation.z);
++                h^=h>>16; h*=0x85ebca6bu; h^=h>>13;
++                rank=(h>>8)/16777216.0;
++            }
++            scale=smoothstep(0,.10,1.10-.74*t-rank);
++        }
++        if (lodLevel & 0x80000000u)
++        {
++            uint2 packed=(uint2)input.uv1;
++            float blades=(float)(lodLevel & 0xfffu);
++            float desired=max(1.0,blades*((lodLevel & 0x40000000u) ? (1-.15*t) : fraction));
++            width=min(2.6,rcp(max(1.0/blades,fraction)))*saturate(desired-(packed.y>>12));
++            float3 offset=(float3(packed.x&4095u,packed.x>>12,packed.y&4095u)-2048)/65536;
++            input.position+=offset*(width-1);
++            input.uv1=0;
++        }
++        if (width<=0 || scale<=0)
++        {
++            output=(PixelInput)0;
++            output.position=float4(0,0,-1,1);
++            return output;
++        }
++        input.position*=scale;
++    }
+     float2 bendSlope;
+     float4 world = bendPosition(input, bendSlope);
+     output.position = mul(world, viewProjection);

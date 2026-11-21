@@ -20,7 +20,8 @@ struct TreeLodPart
     std::vector<TreeLodNode> nodes;
     MeshData geometry;
     std::vector<std::uint32_t> placementOrder; // Optional per-part order for independently grouped materials.
-    // 1 draws the local range per placement. 2 chooses the reusable or stock subtree.
+    // 1 draws a local range per placement. 2 chooses reusable or stock geometry.
+    // 3 chooses the triangle residual of a resident mixed brick cut or its triangle fallback.
     std::vector<std::uint8_t> instancedNodes;
 };
 

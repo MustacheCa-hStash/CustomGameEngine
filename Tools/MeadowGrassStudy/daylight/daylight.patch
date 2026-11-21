@@ -1,0 +1,827 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -15,6 +15,7 @@
+ set(probe_trace_shader "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ProbeTrace.hlsl")
+ set(probe_cs "${CMAKE_CURRENT_BINARY_DIR}/ProbeCS.h")
+ set(ground_probe_cs "${CMAKE_CURRENT_BINARY_DIR}/GroundProbeCS.h")
++set(oak_light_cs "${CMAKE_CURRENT_BINARY_DIR}/OakLightCS.h")
+ set(advect_probe_cs "${CMAKE_CURRENT_BINARY_DIR}/AdvectProbeCS.h")
+ set(tree_select_cs "${CMAKE_CURRENT_BINARY_DIR}/TreeSelectCS.h")
+ set(tree_depth_cs "${CMAKE_CURRENT_BINARY_DIR}/TreeDepthCS.h")
+@@ -45,7 +46,7 @@
+     set(header "${CMAKE_CURRENT_BINARY_DIR}/${entry}.h")
+     add_custom_command(OUTPUT "${header}"
+         COMMAND "${DXC_EXECUTABLE}" -T "${stage}_6_6" -E "${entry}" -Fh "${header}" -Vn "${entry}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/BrickRaster.hlsl"
+-        DEPENDS shaders/BrickRaster.hlsl "${voxel_shader}" shaders/LeafLighting.hlsli shaders/ProbeLighting.hlsli shaders/Skylight.hlsli
++        DEPENDS shaders/BrickRaster.hlsl "${voxel_shader}" shaders/LeafLighting.hlsli shaders/ProbeLighting.hlsli shaders/Skylight.hlsli shaders/Daylight.h
+         VERBATIM)
+     list(APPEND brick_raster_headers "${header}")
+ endforeach()
+@@ -72,7 +73,7 @@
+     COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E VSOakVisibility -Fh "${oak_visibility_vs}" -Vn oakVisibilityVS "${mesh_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E ShadowVS -Fh "${shadow_vs}" -Vn shadowVS "${mesh_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E ShadowPS -Fh "${shadow_ps}" -Vn shadowPS "${mesh_shader}"
+-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/OakStudy.hlsli" "${mesh_shader}" "${leaf_lighting_shader}" "${skylight_shader}" "${probe_lighting_shader}" "${DXC_EXECUTABLE}"
++    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/OakStudy.hlsli" "${mesh_shader}" "${leaf_lighting_shader}" "${skylight_shader}" "${probe_lighting_shader}" "${DXC_EXECUTABLE}" shaders/Daylight.h
+     COMMENT "Compiling Mesh.hlsl with DXC"
+     VERBATIM
+ )
+@@ -89,7 +90,7 @@
+     COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E VSMain -Fh "${voxel_vs}" -Vn voxelVS "${voxel_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -Fh "${voxel_ps}" -Vn voxelPS "${voxel_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E ShadowPS -Fh "${voxel_shadow_ps}" -Vn voxelShadowPS "${voxel_shader}"
+-    DEPENDS "${voxel_shader}" "${leaf_lighting_shader}" "${skylight_shader}" "${probe_lighting_shader}" "${DXC_EXECUTABLE}"
++    DEPENDS "${voxel_shader}" "${leaf_lighting_shader}" "${skylight_shader}" "${probe_lighting_shader}" "${DXC_EXECUTABLE}" shaders/Daylight.h
+     COMMENT "Compiling Voxel.hlsl with DXC"
+     VERBATIM
+ )
+@@ -98,7 +99,7 @@
+     OUTPUT "${sky_vs}" "${sky_ps}"
+     COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E VSMain -Fh "${sky_vs}" -Vn skyVS "${sky_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -Fh "${sky_ps}" -Vn skyPS "${sky_shader}"
+-    DEPENDS "${sky_shader}" "${DXC_EXECUTABLE}"
++    DEPENDS "${sky_shader}" "${DXC_EXECUTABLE}" shaders/Daylight.h
+     COMMENT "Compiling Sky.hlsl with DXC"
+     VERBATIM
+ )
+@@ -113,11 +114,12 @@
+ )
+ 
+ add_custom_command(
+-    OUTPUT "${probe_cs}" "${ground_probe_cs}" "${advect_probe_cs}"
++    OUTPUT "${oak_light_cs}" "${probe_cs}" "${ground_probe_cs}" "${advect_probe_cs}"
+     COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain -Fh "${probe_cs}" -Vn probeCS "${probe_trace_shader}"
++    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E OakLightCS -Fh "${oak_light_cs}" -Vn oakLightCS "${probe_trace_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E GroundCS -Fh "${ground_probe_cs}" -Vn groundProbeCS "${probe_trace_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E AdvectCS -Fh "${advect_probe_cs}" -Vn advectProbeCS "${probe_trace_shader}"
+-    DEPENDS "${probe_trace_shader}" "${DXC_EXECUTABLE}"
++    DEPENDS "${probe_trace_shader}" "${DXC_EXECUTABLE}" shaders/Daylight.h
+     COMMENT "Compiling ProbeTrace.hlsl with DXC"
+     VERBATIM
+ )
+@@ -158,7 +160,7 @@
+ add_custom_command(OUTPUT "${far_temporal_ps}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -D DISTANT_GRASS_LIGHT=1
+         -Fh "${far_temporal_ps}" -Vn farTemporalPS "${mesh_shader}"
+-    DEPENDS "${mesh_shader}" shaders/ProbeLighting.hlsli shaders/LeafLighting.hlsli shaders/OakStudy.hlsli "${DXC_EXECUTABLE}" VERBATIM)
++    DEPENDS "${mesh_shader}" shaders/ProbeLighting.hlsli shaders/LeafLighting.hlsli shaders/OakStudy.hlsli "${DXC_EXECUTABLE}" shaders/Daylight.h VERBATIM)
+ list(APPEND tree_batch_headers "${far_temporal_ps}")
+ foreach(stage IN ITEMS Weighted Seed Temporal)
+     set(header "${CMAKE_CURRENT_BINARY_DIR}/Meadow${stage}PS.h")
+@@ -228,6 +230,7 @@
+     "${display_ps}"
+     "${probe_cs}"
+     "${ground_probe_cs}"
++    "${oak_light_cs}"
+     "${advect_probe_cs}"
+     "${tree_select_cs}"
+     "${tree_depth_cs}"
+--- a/shaders/Display.hlsl
++++ b/shaders/Display.hlsl
+@@ -16,7 +16,7 @@
+     float3 rgb = max(sceneColor.Load(int3(int2(position.xy), 0)).rgb, 0.0) * exposureScale;
+     const float peak = max(rgb.r, max(rgb.g, rgb.b));
+     // Keep diffuse values below the knee unchanged and roll off bright values with a shared RGB scale.
+-    const float knee = 0.75;
++    const float knee = 0.68;
+     const float headroom = 1.0 - knee;
+     if (peak > knee)
+     {
+--- a/shaders/LeafLighting.hlsli
++++ b/shaders/LeafLighting.hlsli
+@@ -1,3 +1,4 @@
++#include "Daylight.h"
+ #include "Skylight.hlsli"
+ 
+ // Matches CaptureLighting in ViewerScene.h.
+@@ -29,7 +30,7 @@
+     const float fraction = saturate(transmission);
+     const float3 reflectance = saturate(baseColor) * (1.0 - fraction);
+     const float3 transmittance = saturate(transmissionColor) * fraction;
+-    const float2 sun = mode == skyOnly ? 0.0 : (0.65 * visibility) * light.sunCosines;
++    const float2 sun = mode == skyOnly ? 0.0 : (meadowSunStrength * visibility) * light.sunCosines;
+     const float3 back = sun.y + (mode == sunOnly ? 0.0 : light.skyBack);
+     const float3 throughLeaf = back * transmittance;
+     if (mode == transmissionOnly) return throughLeaf;
+--- a/shaders/Mesh.hlsl
++++ b/shaders/Mesh.hlsl
+@@ -370,7 +370,7 @@
+     float smith = 0.5 / max(nl*sqrt(a2+(1-a2)*nv*nv) + nv*sqrt(a2+(1-a2)*nl*nl), 1e-5);
+     // Dielectric cuticle with the Blender material's IOR of 1.42.
+     float fresnel = 0.0301 + 0.9699*pow(1.0-vh,5.0);
+-    return 0.65 * nl * (a2/(d*d)) * smith * fresnel;
++    return meadowSunStrength * nl * (a2/(d*d)) * smith * fresnel;
+ }
+ 
+ float sunVisibility(float4 lightPosition, float3 worldNormal, float normalToSun)
+@@ -717,7 +717,7 @@
+     float3 unusedBack = 0;
+     localDiffuse(input.worldPositionAndViewDepth.xyz, worldNormal, probeOriginSpacing, probeSize.xyz,
+                  false, ambient, unusedBack);
+-    const float direct = lightingMode == skyOnly ? 0.0 : 0.65 * diffuse * visibility;
++    const float direct = lightingMode == skyOnly ? 0.0 : meadowSunStrength * diffuse * visibility;
+     if (transmissionFlags & 512u)
+     {
+         // Registered, linear sky visibility from the actual stationary grass.
+--- a/shaders/OakStudy.hlsli
++++ b/shaders/OakStudy.hlsli
+@@ -23,7 +23,7 @@
+     // Reduce off-axis transmission while retaining the forward peak.
+     const float alignment = dot(-v, sun);
+     const float angularWeight = lerp(0.60, 1.0, smoothstep(0.80, 0.995, alignment));
+-    const float direct = 0.65 * visibility;
++    const float direct = meadowSunStrength * visibility;
+     result += direct * light.sunCosines.y * saturate(tint) * saturate(fraction) *
+               (lerp(1.0, phase, 0.80) * angularWeight - 1.0);
+     if (mode == transmissionOnly) return result;
+--- a/shaders/ProbeTrace.hlsl
++++ b/shaders/ProbeTrace.hlsl
+@@ -1,3 +1,5 @@
++#include "Daylight.h"
++
+ struct ProbeLobe
+ {
+     float3 correction;
+@@ -37,6 +39,10 @@
+ RWStructuredBuffer<float4> groundLight : register(u1);
+ RWStructuredBuffer<float4> advectedDensity : register(u2);
+ 
++StructuredBuffer<uint4> oakMaterial : register(t4);
++StructuredBuffer<float4> restDensity : register(t5);
++RWStructuredBuffer<float4> oakLight : register(u3);
++
+ static const uint rayCount = 96;
+ static const float3 axes[6] = {
+     float3(1,0,0), float3(-1,0,0), float3(0,1,0),
+@@ -48,7 +54,8 @@
+     if (ray.y <= 0) return 0;
+     const float2 uv = float2(0.5 + atan2(ray.x, ray.z + 1e-8) * 0.1591549431,
+                              0.5 - asin(clamp(ray.y, -1.0, 1.0)) * 0.3183098862);
+-    return skyPanorama.SampleLevel(panoramaSampler, uv, 4).rgb * skyRadianceScale;
++    return skyPanorama.SampleLevel(panoramaSampler, uv, 4).rgb * skyRadianceScale
++         + float3(hazeRed,hazeGreen,hazeBlue) * circumsolarRadiance(dot(ray,toSun));
+ }
+ 
+ uint densityIndex(uint3 cell)
+@@ -80,7 +87,7 @@
+     advectedDensity[index] = float4(lerp(low, high, f.y), proxyDensity[index].w);
+ }
+ 
+-float traceProxy(float3 origin, float3 direction, float limit, out float blockerDistance)
++float traceProxy(float3 origin, float3 direction, float limit, out float blockerDistance, bool gatherOak, out float3 reflected)
+ {
+     const float step = proxyOriginCellSize.w;
+     const float3 start = (origin - proxyOriginCellSize.xyz) / step;
+@@ -91,6 +98,7 @@
+     const float3 farT = max(a, b);
+     float t = max(0, max(nearT.x, max(nearT.y, nearT.z)));
+     const float exit = min(limit / step, min(farT.x, min(farT.y, farT.z)));
++    reflected = 0;
+     blockerDistance = limit;
+     if (exit <= t) return 1;
+ 
+@@ -109,7 +117,10 @@
+         // all three unsigned projections as independent blockers.
+         const float foliage = length(density.xyz * abs(direction)) * 0.92;
+         // Wood extinction is baked into the static channel of the coverage proxy.
++        const float before = visibility;
+         visibility *= exp(-(foliage + density.w) * segmentLength);
++        if (gatherOak && before > visibility)
++            reflected += (before - visibility) * oakLight[densityIndex(uint3(cell))].rgb;
+         if (visibility < 0.60 && blockerDistance == limit)
+             blockerDistance = min(boundary * step, limit);
+         if (visibility < 0.002) return 0;
+@@ -120,6 +131,82 @@
+         t = boundary;
+     }
+     return visibility;
++}
++
++float traceVisibility(float3 origin, float3 direction, float limit)
++{
++    float blocker;
++    float3 unused;
++    return traceProxy(origin,direction,limit,blocker,false,unused);
++}
++
++float4 unpackRGBA(uint packed)
++{
++    return float4(packed & 255,(packed >> 8) & 255,(packed >> 16) & 255,packed >> 24) / 255.0;
++}
++
++// Average outward cosine for a distribution of normals within a proxy voxel.
++// Leaves return direct diffuse energy into two hemispheres; bark has one front face.
++float meanCosine(float3 average, bool leaf)
++{
++    float coherence = length(average);
++    float cosine = dot(average,toSun) / max(coherence,1e-5);
++    return lerp(.25,leaf ? .5*abs(cosine) : saturate(cosine),saturate(coherence));
++}
++
++float3 leafReflectance(uint4 material)
++{
++    const float4 leaf = unpackRGBA(material.x);
++    return leaf.rgb*leaf.rgb*leaf.a * meanCosine(2*unpackRGBA(material.z).rgb-1,true);
++}
++
++[numthreads(8,4,4)]
++void OakLightCS(uint3 cell : SV_DispatchThreadID)
++{
++    if (any(cell >= proxySize.xyz)) return;
++    uint index = densityIndex(cell);
++    float4 density = proxyDensity[index];
++    float leafArea = length(density.xyz) * .92;
++    float total = leafArea + density.w;
++    float3 outgoing = 0;
++    if (total > 0 && sunStrength > 0)
++    {
++        float3 center = proxyOriginCellSize.xyz + (float3(cell)+.5)*proxyOriginCellSize.w;
++        float wind = saturate((center.y-windStart)*inverseWindHeight);
++        float2 rest = cell.xz - proxyWind * (wind*wind/proxyOriginCellSize.w);
++        // Sample area-weighted leaf color and orientation across the same wind footprint as extinction.
++        int2 corner = int2(floor(rest));
++        float2 f = frac(rest);
++        uint4 local = oakMaterial[index];
++        float3 leafResponse = leafReflectance(local);
++        if (any(proxyWind != 0) && leafArea > 0)
++        {
++            leafResponse = 0;
++            float sum = 0;
++            [unroll] for (int i=0;i<4;++i)
++            {
++                int2 offset = int2(i&1,i>>1);
++                int2 p = corner+offset;
++                if (any(p<0) || any(p>=int2(proxySize.xz))) continue;
++                uint neighbor = densityIndex(uint3(p.x,cell.y,p.y));
++                float2 w = lerp(1-f,f,float2(offset));
++                float area = w.x*w.y*length(restDensity[neighbor].xyz);
++                sum += area;
++                leafResponse += area * leafReflectance(oakMaterial[neighbor]);
++            }
++            leafResponse /= max(sum,1e-8);
++        }
++        float4 bark = unpackRGBA(local.y);
++        float3 woodResponse = bark.rgb*bark.rgb*bark.a * meanCosine(2*unpackRGBA(local.w).rgb-1,false);
++        float3 response = (leafArea*leafResponse + density.w*woodResponse)/total;
++        if (any(response > 0))
++        {
++            float limit = length(float3(proxySize.xyz))*proxyOriginCellSize.w;
++            float visibility = traceVisibility(center + .32*proxyOriginCellSize.w*toSun,toSun,limit);
++            outgoing = response * (sunStrength*visibility);
++        }
++    }
++    oakLight[index] = float4(outgoing,0);
+ }
+ 
+ uint2 groundSize()
+@@ -150,12 +237,12 @@
+         sincos(i * 2.39996323 + 0.5, sine, cosine);
+         const float3 direction = float3(sqrt(r2) * cosine, sqrt(1 - r2), sqrt(r2) * sine);
+         float blocker;
+-        incoming += skyRadiance(direction) * (traceProxy(origin, direction, limit, blocker) - 1) / skyRays;
++        incoming += skyRadiance(direction) * (traceVisibility(origin, direction, limit) - 1) / skyRays;
+     }
+     if (sunStrength > 0 && toSun.y > 0)
+     {
+         float blocker;
+-        const float visibility = traceProxy(origin, toSun, limit, blocker);
++        const float visibility = traceVisibility(origin, toSun, limit);
+         incoming += (sunStrength * toSun.y * visibility).xxx;
+     }
+     groundLight[index] = float4(max(0, incoming) * surface.rgb, surface.w);
+@@ -213,8 +300,9 @@
+             }
+         }
+         float blocker;
+-        const float visibility = traceProxy(origin, direction, min(groundDistance, traceRange), blocker);
+-        float3 correction = skyRadiance(direction) * (visibility - 1);
++        float3 oakBounce;
++        const float visibility = traceProxy(origin, direction, min(groundDistance, traceRange), blocker, includeBounce == 2, oakBounce);
++        float3 correction = oakBounce + skyRadiance(direction) * (visibility - 1);
+         if (includeBounce && y < 0)
+             correction += visibility * groundRadiance(origin.xz + direction.xz * groundDistance);
+         const float distance = saturate(blocker / momentRange);
+--- a/shaders/Sky.hlsl
++++ b/shaders/Sky.hlsl
+@@ -1,9 +1,12 @@
++#include "Daylight.h"
++
+ cbuffer SkyConstants : register(b0)
+ {
+     row_major float4x4 viewRayTransform;
+     float3 toSun;
+     uint encodedCamera;
+     uint skyOnly;
++    float domeScale;
+ }
+ 
+ Texture2D<float4> panorama : register(t0);
+@@ -38,7 +41,8 @@
+     const float3 sky = panorama.SampleGrad(skySampler, uv, dx, dy).rgb;
+ 
+     const float sun = skyOnly ? 0.0 : smoothstep(0.999986, 0.999992, dot(ray, toSun));
+-    const float3 linearColor = lerp(sky, float3(1.0, 0.96, 0.87), sun);
++    const float3 linearColor = sky * domeScale + float3(hazeRed,hazeGreen,hazeBlue) * circumsolarRadiance(dot(ray,toSun))
++                             + sun * float3(18.0,17.2,15.5);
+     if (!encodedCamera) return float4(linearColor, 1);
+     const float3 display = lerp(12.92 * linearColor, 1.055 * pow(linearColor, 1.0 / 2.4) - 0.055,
+                                 step(0.0031308, linearColor));
+--- a/shaders/Voxel.hlsl
++++ b/shaders/Voxel.hlsl
+@@ -404,7 +404,7 @@
+         return output;
+     }
+     if (lightingMode == sunOnly) ambient = 0;
+-    const float direct = lightingMode == skyOnly ? 0.0 : 0.65 * diffuse * visibility;
++    const float direct = lightingMode == skyOnly ? 0.0 : meadowSunStrength * diffuse * visibility;
+     float3 lit = baseColor * (ambient + direct);
+     output.color = float4(encodedCamera ? displayColor(saturate(lit)) : lit, 1);
+     return output;
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -25,11 +25,13 @@
+ #include "SkyVS.h"
+ #include "SkyPS.h"
+ #include "SkyLighting.h"
++#include "../shaders/Daylight.h"
+ #include "DisplayVS.h"
+ #include "DisplayPS.h"
+ #include "ProbeCS.h"
+ #include "GroundProbeCS.h"
+ #include "AdvectProbeCS.h"
++#include "OakLightCS.h"
+ 
+ #include <d3d12sdklayers.h>
+ #include <DirectXCollision.h>
+@@ -75,6 +77,7 @@
+     XMFLOAT3 toSun;
+     UINT encodedCamera;
+     UINT skyOnly;
++    float domeScale;
+ };
+ 
+ struct SkyIrradianceConstants
+@@ -601,6 +604,8 @@
+     probeUpdateOrder_.Reset();
+     probeGroundLight_.Reset();
+     probeGroundSurface_.Reset();
++    oakMaterial_.Reset();
++    oakLight_.Reset();
+     probesDirty_ = true;
+     probesPending_ = probeCursor_ = groundUpdateRow_ = 0;
+     cachedProbeWind_ = observedProbeWind_ = {};
+@@ -1486,6 +1491,15 @@
+ void D3D12Renderer::updateSun(const ViewerScene& scene)
+ {
+     toSun_ = scene.sunDirection();
++    if (skyPanorama_)
++    {
++        const SkyIrradianceConstants light{daylightIrradiance(baseSky_, toSun_)};
++        const auto& sh = light.coefficients;
++        XMStoreFloat3(&openSkyGround_, XMLoadFloat4(&sh[0]) + XMLoadFloat4(&sh[2]) + 2 * XMLoadFloat4(&sh[6]));
++        // Sun edits are infrequent. Finish outstanding readers before replacing their constant buffer.
++        waitForGpu();
++        skyIrradiance_ = uploadBuffer(&light, sizeof(light));
++    }
+     // Fit the light to conservative placement bounds. A sun edit needs no GPU resource rebuild.
+     const auto rotation = XMMatrixLookToRH(XMVectorZero(), -XMLoadFloat3(&toSun_),
+                                            XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
+@@ -1850,6 +1864,7 @@
+     }
+ 
+     const auto sky = loadSkyLighting(panorama);
++    baseSky_ = sky.irradiance;
+     skyRadianceScale_ = sky.radianceScale;
+     XMStoreFloat3(&openSkyGround_, XMLoadFloat4(&sky.irradiance[0]) + XMLoadFloat4(&sky.irradiance[2]) +
+                                    2.0f * XMLoadFloat4(&sky.irradiance[6]));
+@@ -1877,6 +1892,7 @@
+     constants.toSun = toSun_;
+     constants.encodedCamera = encodedCamera_;
+     constants.skyOnly = skyOnly;
++    constants.domeScale = skyRadianceScale_;
+ 
+     commands_->SetGraphicsRootSignature(skyRoot_.Get());
+     commands_->SetPipelineState(pipeline);
+@@ -3419,7 +3435,13 @@
+     panorama.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+     panorama.NumDescriptors = 1;
+     panorama.BaseShaderRegister = 1;
+-    D3D12_ROOT_PARAMETER parameters[8]{};
++    D3D12_ROOT_PARAMETER parameters[11]{};
++    parameters[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
++    parameters[10].Descriptor.ShaderRegister = 5;
++    parameters[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
++    parameters[8].Descriptor.ShaderRegister = 4;
++    parameters[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
++    parameters[9].Descriptor.ShaderRegister = 3;
+     parameters[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+     parameters[7].Descriptor.ShaderRegister = 3;
+     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+@@ -3454,6 +3476,8 @@
+     check(device_->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&probePipeline_)), "Create probe update pipeline");
+     pipeline.CS = {groundProbeCS, sizeof(groundProbeCS)};
+     check(device_->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&groundProbePipeline_)), "Create ground lighting pipeline");
++    pipeline.CS = {oakLightCS, sizeof(oakLightCS)};
++    check(device_->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&oakLightPipeline_)), "Create oak relighting pipeline");
+     pipeline.CS = {advectProbeCS, sizeof(advectProbeCS)};
+     check(device_->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&advectProbePipeline_)), "Create probe density advection pipeline");
+ }
+@@ -3466,7 +3490,7 @@
+ std::uint64_t D3D12Renderer::probeBytes() const
+ {
+     if (!diffuseProbes_) return 0;
+-    return diffuseProbes_->GetDesc().Width + probeDensity_->GetDesc().Width +
++    return (oakLight_ ? oakLight_->GetDesc().Width + oakMaterial_->GetDesc().Width : 0) + diffuseProbes_->GetDesc().Width + probeDensity_->GetDesc().Width +
+            probeGroundLight_->GetDesc().Width + probeGroundSurface_->GetDesc().Width + probeUpdateOrder_->GetDesc().Width +
+            (advectedProbeDensity_ ? advectedProbeDensity_->GetDesc().Width : 0);
+ }
+@@ -3504,7 +3528,18 @@
+ void D3D12Renderer::initializeProbeField(const ViewerScene& scene)
+ {
+     if (!probePipeline_) createProbePipeline();
+-    auto volume = buildProbeProxy(scene);
++    wchar_t mode[2]{};
++    const bool oakBounce = GetEnvironmentVariableW(L"MEADOW_OAK_BOUNCE",mode,2) == 1 && mode[0] == L'1';
++    auto volume = buildProbeProxy(scene, oakBounce);
++    ComPtr<ID3D12Resource> materialUpload;
++    if (!volume.oakMaterial.empty())
++    {
++        const auto bytes = volume.oakMaterial.size()*sizeof(XMUINT4);
++        materialUpload = uploadBuffer(volume.oakMaterial.data(),bytes);
++        oakMaterial_ = createProbeBuffer(bytes,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST);
++        oakLight_ = createProbeBuffer(volume.oakMaterial.size()*sizeof(XMFLOAT4),
++            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++    }
+     probeGroundSurface_ = uploadBuffer(volume.groundSurface.data(),volume.groundSurface.size()*sizeof(XMFLOAT4));
+     probeGrid_ = volume.probes;
+     probeDensityOrigin_ = volume.originCellSize;
+@@ -3521,6 +3556,12 @@
+     auto staging = uploadBuffer(volume.density.data(), densityBytes);
+     check(allocator_->Reset(), "Reset probe upload allocator");
+     check(commands_->Reset(allocator_.Get(), nullptr), "Reset probe upload command list");
++    if (materialUpload)
++    {
++        commands_->CopyBufferRegion(oakMaterial_.Get(),0,materialUpload.Get(),0,oakMaterial_->GetDesc().Width);
++        transitionResource(commands_.Get(),oakMaterial_.Get(),D3D12_RESOURCE_STATE_COPY_DEST,
++                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    }
+     commands_->CopyBufferRegion(probeDensity_.Get(), 0, staging.Get(), 0, densityBytes);
+     transitionResource(commands_.Get(), probeDensity_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+@@ -3627,8 +3668,8 @@
+     };
+     static_assert(sizeof(Constants) == 39 * sizeof(UINT));
+     const auto& extent = scene.ground.localBounds.halfExtent;
+-    const Constants constants{probeDensityOrigin_, probeDensitySize_, probeGrid_, skyRadianceScale_, probeCursor_, count, bounce,
+-        toSun_, scene.captureLighting == CaptureLighting::SkyOnly ? 0.0f : 0.65f, groundColor, extent.x,
++    const Constants constants{probeDensityOrigin_, probeDensitySize_, probeGrid_, skyRadianceScale_, probeCursor_, count, bounce ? (oakLight_ ? 2u : 1u) : 0u,
++        toSun_, scene.captureLighting == CaptureLighting::SkyOnly ? 0.0f : meadowSunStrength, groundColor, extent.x,
+         openSkyGround_, extent.z, wind, windStart_, inverseWindHeight_, groundStride, groundRow,
+         UINT(scene.groundMaterial.colorTexture.has_value() && !GetEnvironmentVariableW(L"MEADOW_UNIFORM_BOUNCE",nullptr,0))};
+     transitionResource(commands_.Get(), diffuseProbes_.Get(), (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+@@ -3655,6 +3696,18 @@
+     }
+     const auto& density = windDisplaced ? advectedProbeDensity_ : probeDensity_;
+     commands_->SetComputeRootShaderResourceView(1, density->GetGPUVirtualAddress());
++    commands_->SetComputeRootShaderResourceView(8,(oakMaterial_ ? oakMaterial_ : probeGroundSurface_)->GetGPUVirtualAddress());
++    commands_->SetComputeRootUnorderedAccessView(9,(oakLight_ ? oakLight_ : probeGroundLight_)->GetGPUVirtualAddress());
++    commands_->SetComputeRootShaderResourceView(10,probeDensity_->GetGPUVirtualAddress());
++    if (oakLight_ && updateGround)
++    {
++        commands_->SetPipelineState(oakLightPipeline_.Get());
++        commands_->Dispatch((probeDensitySize_.x+7)/8,(probeDensitySize_.y+3)/4,(probeDensitySize_.z+3)/4);
++        D3D12_RESOURCE_BARRIER ready{};
++        ready.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
++        ready.UAV.pResource = oakLight_.Get();
++        commands_->ResourceBarrier(1,&ready);
++    }
+     if (updateGround)
+     {
+         commands_->SetPipelineState(groundProbePipeline_.Get());
+--- a/src/D3D12Renderer.h
++++ b/src/D3D12Renderer.h
+@@ -833,6 +833,7 @@
+     ComPtr<ID3D12RootSignature> skyRoot_;
+     ComPtr<ID3D12Resource> skyPanorama_;
+     ComPtr<ID3D12Resource> skyIrradiance_;
++    std::array<DirectX::XMFLOAT4, 9> baseSky_{};
+     float skyRadianceScale_ = 1;
+     DirectX::XMFLOAT3 openSkyGround_{};
+     D3D12_GPU_DESCRIPTOR_HANDLE skyTexture_{};
+@@ -864,6 +865,8 @@
+     ComPtr<ID3D12Resource> diffuseProbes_;
+     ComPtr<ID3D12Resource> probeGroundLight_;
+     ComPtr<ID3D12Resource> probeGroundSurface_;
++    ComPtr<ID3D12PipelineState> oakLightPipeline_;
++    ComPtr<ID3D12Resource> oakMaterial_, oakLight_;
+     D3D12_CPU_DESCRIPTOR_HANDLE probeCpuView_{};
+     D3D12_GPU_DESCRIPTOR_HANDLE probeGpuView_{};
+     ComPtr<ID3D12RootSignature> displayRoot_;
+--- a/src/ProbeLighting.cpp
++++ b/src/ProbeLighting.cpp
+@@ -13,6 +13,7 @@
+ {
+     XMFLOAT3 point;
+     XMFLOAT3 unitNormal;
++    XMFLOAT4 albedo{};
+ };
+ 
+ struct SurfaceSamples
+@@ -21,7 +22,7 @@
+     float areaPerSample = 0;
+ };
+ 
+-SurfaceSamples sampleSurface(const MeshData& mesh, unsigned budget)
++SurfaceSamples sampleSurface(const MeshData& mesh, unsigned budget, const MaterialData* oak, const TextureMip* texture)
+ {
+     SurfaceSamples samples;
+     std::vector<double> areas;
+@@ -51,14 +52,50 @@
+         float v = static_cast<float>(std::fmod((i + 0.5) * 0.5698402909981, 1.0));
+         if (u + v > 1.0f) { u = 1.0f - u; v = 1.0f - v; }
+         auto& sample = samples.points.emplace_back();
++        if (oak)
++        {
++            sample.albedo = oak->color;
++            if (texture)
++            {
++                const auto uv = [&](unsigned corner) {
++                    return XMLoadFloat2(&mesh.vertices[mesh.indices[first + corner]].texcoords[oak->textureCoordinateSet]);
++                };
++                XMFLOAT2 st;
++                XMStoreFloat2(&st, uv(0)*(1-u-v) + uv(1)*u + uv(2)*v);
++                const unsigned x = std::min(unsigned((st.x-std::floor(st.x))*texture->width),texture->width-1);
++                const unsigned y = std::min(unsigned((st.y-std::floor(st.y))*texture->height),texture->height-1);
++                const auto* rgba = &texture->rgba[4*(y*texture->width+x)];
++                const auto linear = [](unsigned b) {
++                    float s = b/255.f;
++                    return s <= .04045f ? s/12.92f : std::pow((s+.055f)/1.055f,2.4f);
++                };
++                sample.albedo.x *= linear(rgba[0]);
++                sample.albedo.y *= linear(rgba[1]);
++                sample.albedo.z *= linear(rgba[2]);
++                sample.albedo.w *= rgba[3]/255.f;
++            }
++        }
+         XMStoreFloat3(&sample.point, a + u * ab + v * ac);
+         XMStoreFloat3(&sample.unitNormal, XMVector3Normalize(XMVector3Cross(ab, ac)));
+     }
+     return samples;
+ }
+ 
++struct OakSurface
++{
++    XMFLOAT3 albedo{}, normal{};
++    float oakWeight = 0, totalArea = 0;
++};
++using OakCell = std::array<OakSurface,2>;
++
++unsigned packRgb(XMFLOAT3 rgb, float alpha)
++{
++    const auto byte = [](float v) { return unsigned(std::lround(std::clamp(v,0.f,1.f)*255)); };
++    return byte(rgb.x) | byte(rgb.y)<<8 | byte(rgb.z)<<16 | byte(alpha)<<24;
++}
++
+ void deposit(ProbeProxyVolume& volume, const SurfaceSamples& samples, FXMMATRIX transform,
+-             bool foliage, float coverage, const XMFLOAT3* grassColor, std::vector<float>& heights)
++             bool foliage, float coverage, const XMFLOAT3* grassColor, std::vector<float>& heights, std::vector<OakCell>& surfaces, bool oak)
+ {
+     const auto origin = XMLoadFloat4(&volume.originCellSize);
+     const float step = volume.originCellSize.w;
+@@ -76,6 +113,21 @@
+                            volume.size.x + static_cast<unsigned>(coord.x);
+         const auto normal = XMVectorAbs(XMVector3TransformNormal(XMLoadFloat3(&sample.unitNormal), areaTransform)) *
+                             densityScale;
++        if (!surfaces.empty())
++        {
++            auto& surface = surfaces[index][foliage ? 0 : 1];
++            const float area = XMVectorGetX(XMVector3Length(normal));
++            surface.totalArea += area;
++            if (oak && area > 0)
++            {
++                const float weight = area * sample.albedo.w / std::max(coverage,1e-6f);
++                auto n = XMVector3Normalize(XMVector3TransformNormal(XMLoadFloat3(&sample.unitNormal),areaTransform));
++                if (foliage && XMVectorGetY(n)<0) n = -n;
++                XMStoreFloat3(&surface.normal, XMLoadFloat3(&surface.normal)+weight*n);
++                XMStoreFloat3(&surface.albedo, XMLoadFloat3(&surface.albedo)+weight*XMLoadFloat4(&sample.albedo));
++                surface.oakWeight += weight;
++            }
++        }
+         auto& cell = volume.density[index];
+         if (foliage) XMStoreFloat4(&cell, XMVectorSetW(XMLoadFloat4(&cell) + normal, cell.w));
+         else cell.w += XMVectorGetX(XMVector3Length(normal));
+@@ -95,7 +147,7 @@
+ }
+ }
+ 
+-ProbeProxyVolume buildProbeProxy(const ViewerScene& scene)
++ProbeProxyVolume buildProbeProxy(const ViewerScene& scene, bool oakBounce)
+ {
+     const BoundingBox local(scene.assetBounds.center, scene.assetBounds.halfExtent);
+     auto lower = XMVectorReplicate(FLT_MAX);
+@@ -142,6 +194,7 @@
+     volume.size = {(volume.probes.size.x - 1) * 4, (volume.probes.size.y - 1) * 4,
+                    (volume.probes.size.z - 1) * 4, 0};
+     volume.density.resize(static_cast<std::size_t>(volume.size.x) * volume.size.y * volume.size.z);
++    std::vector<OakCell> surfaces(oakBounce ? volume.density.size() : 0);
+     const unsigned width = (volume.size.x+1)/2, depth = (volume.size.z+1)/2;
+     volume.groundSurface.resize(width*depth);
+     std::vector<float> heights(width*depth);
+@@ -150,7 +203,7 @@
+         return s <= 0.04045f ? s/12.92f : std::pow((s+0.055f)/1.055f,2.4f);
+     };
+ 
+-    const auto depositMesh = [&](const MeshData& mesh) {
++    const auto depositMesh = [&](const MeshData& mesh, bool oak) {
+         if (mesh.name.starts_with("Meadow tuft card") || mesh.name.starts_with("Near tuft |")) return; // source tufts already feed the probes
+         const auto& material = scene.asset->materials[mesh.material];
+         const bool foliage = material.hasBacklighting;
+@@ -164,7 +217,13 @@
+         float coverage = 1.0f;
+         if (foliage && material.alphaCutoff >= 0 && material.colorTexture)
+             coverage = scene.asset->textures[*material.colorTexture].mips.back().rgba[3] / 255.0f;
+-        const auto samples = sampleSurface(mesh, mesh.instances ? (foliage ? 1152u : 512u) : 24576u);
++        const TextureMip* texture = nullptr;
++        if (oakBounce && oak && material.colorTexture)
++        {
++            const auto& mips = scene.asset->textures[*material.colorTexture].mips;
++            texture = &mips[std::min<size_t>(2, mips.size()-1)];
++        }
++        const auto samples = sampleSurface(mesh, mesh.instances ? (foliage ? 1152u : 512u) : 24576u, oakBounce && oak ? &material : nullptr, texture);
+         const auto localToAsset = XMLoadFloat4x4(&mesh.localToWorld);
+         for (unsigned i = 0; i < placements; ++i)
+         {
+@@ -187,14 +246,14 @@
+                         tuftColor.y *= 1 + .36f*growth;
+                         tuftColor.z *= 1 - .18f*growth;
+                     }
+-                    deposit(volume, samples, transform, foliage, coverage, grass ? &tuftColor : nullptr, heights);
++                    deposit(volume, samples, transform, foliage, coverage, grass ? &tuftColor : nullptr, heights, surfaces, oak);
+                 }
+             else
+-                deposit(volume, samples, world, foliage, coverage, grass ? &color : nullptr, heights);
++                deposit(volume, samples, world, foliage, coverage, grass ? &color : nullptr, heights, surfaces, oak);
+         }
+     };
+-    for (const auto& mesh : scene.oakProbeMeshes) depositMesh(mesh);
+-    for (const auto& mesh : std::span(scene.asset->meshes).subspan(scene.oakPartCount)) depositMesh(mesh);
++    for (const auto& mesh : scene.oakProbeMeshes) depositMesh(mesh, true);
++    for (const auto& mesh : std::span(scene.asset->meshes).subspan(scene.oakPartCount)) depositMesh(mesh, false);
+     const TextureMip* soil = nullptr;
+     if (const auto texture = scene.groundMaterial.colorTexture)
+     {
+@@ -255,5 +314,22 @@
+         const float coverage = t * t * (3.0f - 2.0f * t);
+         density.w *= std::lerp(0.25f, 3.0f, coverage);
+     }
++    volume.oakMaterial.resize(surfaces.size());
++    for (size_t i=0; i<surfaces.size(); ++i)
++    {
++        unsigned colors[2]{}, normals[2]{};
++        for (unsigned k=0; k<2; ++k)
++        {
++            const auto& s = surfaces[i][k];
++            if (s.oakWeight <= 0) continue;
++            const auto rgb = XMLoadFloat3(&s.albedo)/s.oakWeight;
++            XMFLOAT3 color, normal;
++            XMStoreFloat3(&color, XMVectorSqrt(rgb));
++            XMStoreFloat3(&normal, .5f*(XMLoadFloat3(&s.normal)/s.oakWeight+XMVectorReplicate(1)));
++            colors[k] = packRgb(color,s.oakWeight/std::max(1e-8f,s.totalArea));
++            normals[k] = packRgb(normal,0);
++        }
++        volume.oakMaterial[i]={colors[0],colors[1],normals[0],normals[1]};
++    }
+     return volume;
+ }
+--- a/src/ProbeLighting.h
++++ b/src/ProbeLighting.h
+@@ -15,8 +15,10 @@
+     DirectX::XMUINT4 size;
+     // XYZ are projected foliage area per cubic meter. W is opaque wood area density.
+     std::vector<DirectX::XMFLOAT4> density;
++    // Leaf RGB / oak share, wood RGB / oak share and their mean normals, packed as RGBA8.
++    std::vector<DirectX::XMUINT4> oakMaterial;
+     // Per ground cell: linear effective reflectance and mean reflecting height above the soil.
+     std::vector<DirectX::XMFLOAT4> groundSurface;
+ };
+ 
+-ProbeProxyVolume buildProbeProxy(const ViewerScene& scene);
++ProbeProxyVolume buildProbeProxy(const ViewerScene& scene, bool oakBounce);
+--- a/src/SceneCapture.cpp
++++ b/src/SceneCapture.cpp
+@@ -786,6 +786,8 @@
+         "camera_spray_wood_triangles,shadow_spray_wood_triangles,camera_coarse_wood_sprays,shadow_coarse_wood_sprays,"
+         "camera_triangles,shadow_triangles,camera_leaf_triangles,camera_voxel_bricks,gpu_asset_ms,gpu_bough_brick_ms,gpu_camera_ms,gpu_frame_ms" +
+         lodColumns;
++    manifest.pop_back();
++    manifest += ",gpu_probe_ms,probes_updated\n";
+     std::ifstream focusTrack;
+     if (!options.focusTrack.empty())
+     {
+@@ -812,8 +814,8 @@
+             profileOakRaster(renderer, scene, matrix, windPhaseAt(windTime), output);
+         if (options.timingSamples)
+         {
+-            for (int warmup = 0; warmup < 2; ++warmup)
+-                renderer.drawFrame(scene, matrix, windPhaseAt(windTime), {});
++            const auto initial = renderer.drawFrame(scene, matrix, windPhaseAt(windTime), {});
++            renderer.drawFrame(scene, matrix, windPhaseAt(windTime), {});
+             std::string csv =
+                 "sample,cpu_ms,gpu_frame_ms,gpu_camera_ms,gpu_shadow_ms,camera_triangles,shadow_triangles,"
+                 "camera_leaf_triangles,shadow_leaf_triangles,camera_spray_wood_triangles,shadow_spray_wood_triangles,"
+@@ -822,7 +824,7 @@
+                 "camera_bough_triangles,shadow_bough_triangles,camera_bough_sprays,shadow_bough_sprays,"
+                 "camera_coarse_wood_sprays,shadow_coarse_wood_sprays,camera_voxel_bricks,shadow_voxel_bricks,scene_far_m,camera_selection_cpu_ms,camera_mesh_vs_invocations,camera_mesh_ps_invocations,fenced_frame_ms,gpu_asset_ms,gpu_live_cut_ms" + lodColumns;
+             csv.pop_back();
+-            csv += ",cascade0_triangles,cascade1_triangles,cascade2_triangles,cascade0_gpu_ms,cascade1_gpu_ms,cascade2_gpu_ms\n";
++            csv += ",cascade0_triangles,cascade1_triangles,cascade2_triangles,cascade0_gpu_ms,cascade1_gpu_ms,cascade2_gpu_ms,probe_ms,probes_updated,initial_probe_ms,initial_probes_updated,probe_bytes\n";
+             for (UINT sample = 0; sample < options.timingSamples; ++sample)
+             {
+                 const auto frameStart = std::chrono::steady_clock::now();
+@@ -851,6 +853,8 @@
+                 csv.pop_back();
+                 for (const auto& slice : t.shadowCascades) csv += std::format(",{}", slice.triangles);
+                 for (double ms : t.cascadeGpuMs) csv += std::format(",{:.6f}", ms);
++                csv += std::format(",{:.6f},{},{:.6f},{},{}", t.gpuProbeMilliseconds.value_or(0), t.probesUpdated,
++                                   initial.gpuProbeMilliseconds.value_or(0), initial.probesUpdated, renderer.probeBytes());
+                 csv += '\n';
+             }
+             writeNewFile(timingPath, std::as_bytes(std::span(csv)));
+@@ -878,6 +882,8 @@
+                 timing.camera.voxelBricks, timing.gpuAssetMilliseconds.value_or(0),
+                 timing.gpuBoughBrickMilliseconds, timing.gpuCameraMilliseconds.value_or(0), timing.gpuMilliseconds.value_or(0));
+             appendSprayLodCounts(manifest, timing);
++            manifest.pop_back();
++            manifest += std::format(",{:.6f},{}\n",timing.gpuProbeMilliseconds.value_or(0),timing.probesUpdated);
+         }
+     }
+     if (sequence) writeNewFile(output / L"frames.csv", std::as_bytes(std::span(manifest)));
+--- a/src/SkyLighting.cpp
++++ b/src/SkyLighting.cpp
+@@ -1,4 +1,5 @@
+ #include "SkyLighting.h"
++#include "../shaders/Daylight.h"
+ 
+ #include <DirectXPackedVector.h>
+ 
+@@ -86,7 +87,7 @@
+     return pixels;
+ }
+ 
+-SkyIrradiance projectIrradiance(std::span<const XMFLOAT3> radiance, unsigned width, unsigned height, float& gain)
++SkyIrradiance projectIrradiance(std::span<const XMFLOAT3> radiance, unsigned width, unsigned height, float& gain, bool normalize = true)
+ {
+     // Use the same longitude and latitude as Sky.hlsl. Only the upper hemisphere supplies sky light.
+     const double longitudeStep = 2 * pi / width;
+@@ -138,9 +139,9 @@
+     // Match the legacy diffuse fill on upward-facing neutral surfaces at the same exposure.
+     const auto up = XMLoadFloat4(&result[0]) + XMLoadFloat4(&result[2]) + 2.0f * XMLoadFloat4(&result[6]);
+     const float upLuminance = XMVectorGetX(XMVector3Dot(up, XMVectorSet(0.2126f, 0.7152f, 0.0722f, 0.0f)));
+-    if (upLuminance > 0.0f)
+-    {
+-        gain = 0.35f / upLuminance;
++    if (normalize && upLuminance > 0.0f)
++    {
++        gain = 0.21f / upLuminance;
+         for (auto& coefficient : result)
+             XMStoreFloat4(&coefficient, XMLoadFloat4(&coefficient) * gain);
+     }
+@@ -179,6 +180,28 @@
+     }
+     return next;
+ }
++}
++
++SkyIrradiance daylightIrradiance(SkyIrradiance base, XMFLOAT3 sun)
++{
++    constexpr unsigned width = 64, height = 32;
++    std::vector<XMFLOAT3> pixels(width * height);
++    for (unsigned row = 0; row < height / 2; ++row)
++    {
++        const float lat = float(pi * (0.5 - (row + 0.5) / height));
++        for (unsigned col = 0; col < width; ++col)
++        {
++            const float lon = float(pi * (2 * (col + 0.5) / width - 1));
++            const float cosine = std::cos(lat) * (std::sin(lon)*sun.x + std::cos(lon)*sun.z) + std::sin(lat)*sun.y;
++            const float h = circumsolarRadiance(cosine);
++            pixels[row*width+col] = {h*hazeRed, h*hazeGreen, h*hazeBlue};
++        }
++    }
++    float unused = 1;
++    const auto haze = projectIrradiance(pixels, width, height, unused, false);
++    for (unsigned i = 0; i < base.size(); ++i)
++        XMStoreFloat4(&base[i], XMLoadFloat4(&base[i]) + XMLoadFloat4(&haze[i]));
++    return base;
+ }
+ 
+ SkyLighting loadSkyLighting(const std::filesystem::path& panorama)
+--- a/src/SkyLighting.h
++++ b/src/SkyLighting.h
+@@ -14,5 +14,7 @@
+     float radianceScale = 1;
+ };
+ 
++SkyIrradiance daylightIrradiance(SkyIrradiance base, DirectX::XMFLOAT3 sun);
++
+ // Load an equirectangular RGBE dome into linear RGBA16F and project its upper hemisphere.
+ SkyLighting loadSkyLighting(const std::filesystem::path& panorama);

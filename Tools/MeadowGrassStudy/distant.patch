@@ -1,0 +1,362 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -21,6 +21,10 @@
+ set(tree_batch_depth_cs "${CMAKE_CURRENT_BINARY_DIR}/TreeBatchDepthCS.h")
+ set(mesh_vs "${CMAKE_CURRENT_BINARY_DIR}/MeshVS.h")
+ set(mesh_ps "${CMAKE_CURRENT_BINARY_DIR}/MeshPS.h")
++set(far_equal_ps "${CMAKE_CURRENT_BINARY_DIR}/FarEqualPS.h")
++set(far_grass_vs "${CMAKE_CURRENT_BINARY_DIR}/FarGrassVS.h")
++set(far_grass_ps "${CMAKE_CURRENT_BINARY_DIR}/FarGrassPS.h")
++set(grass_depth_ps "${CMAKE_CURRENT_BINARY_DIR}/GrassDepthPS.h")
+ set(grass_ps "${CMAKE_CURRENT_BINARY_DIR}/GrassCoveragePS.h")
+ set(oak_flat_ps "${CMAKE_CURRENT_BINARY_DIR}/OakFlatPS.h")
+ set(oak_early_ps "${CMAKE_CURRENT_BINARY_DIR}/OakEarlyPS.h")
+@@ -53,10 +57,14 @@
+ set(display_vs "${CMAKE_CURRENT_BINARY_DIR}/DisplayVS.h")
+ set(display_ps "${CMAKE_CURRENT_BINARY_DIR}/DisplayPS.h")
+ add_custom_command(
+-    OUTPUT "${mesh_vs}" "${mesh_ps}" "${grass_ps}" "${shadow_vs}" "${shadow_ps}"
++    OUTPUT "${mesh_vs}" "${mesh_ps}" "${grass_ps}" "${far_equal_ps}" "${far_grass_vs}" "${far_grass_ps}" "${grass_depth_ps}" "${shadow_vs}" "${shadow_ps}"
+            "${oak_flat_ps}" "${oak_early_ps}" "${oak_visibility_ps}" "${oak_visibility_vs}"
+     COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E VSMain -Fh "${mesh_vs}" -Vn meshVS "${mesh_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -Fh "${mesh_ps}" -Vn meshPS "${mesh_shader}"
++    COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -D OAK_PROFILE_EARLY_DEPTH=1 -D DISTANT_GRASS_LIGHT=1 -Fh "${far_equal_ps}" -Vn farEqualPS "${mesh_shader}"
++    COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E VSMain -D DISTANT_GRASS_LIGHT=1 -Fh "${far_grass_vs}" -Vn farGrassVS "${mesh_shader}"
++    COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSGrassCoverage -D DISTANT_GRASS_LIGHT=1 -Fh "${far_grass_ps}" -Vn farGrassPS "${mesh_shader}"
++    COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSGrassDepth -Fh "${grass_depth_ps}" -Vn grassDepthPS "${mesh_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSGrassCoverage -Fh "${grass_ps}" -Vn grassCoveragePS "${mesh_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSOakFlat -Fh "${oak_flat_ps}" -Vn oakFlatPS "${mesh_shader}"
+     COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -D OAK_PROFILE_EARLY_DEPTH=1 -Fh "${oak_early_ps}" -Vn oakEarlyPS "${mesh_shader}"
+@@ -183,6 +191,10 @@
+     "${mesh_vs}"
+     "${mesh_ps}"
+     "${grass_ps}"
++    "${grass_depth_ps}"
++    "${far_grass_vs}"
++    "${far_equal_ps}"
++    "${far_grass_ps}"
+     "${oak_flat_ps}"
+     "${oak_early_ps}"
+     "${oak_visibility_ps}"
+--- a/shaders/Mesh.hlsl
++++ b/shaders/Mesh.hlsl
+@@ -87,6 +87,9 @@
+     float4 worldPositionAndViewDepth : TEXCOORD2;
+     nointerpolation uint meshInstanceId : TEXCOORD3;
+     nointerpolation float cardBlend : TEXCOORD4;
++#ifdef DISTANT_GRASS_LIGHT
++    float3 probeCube[6] : TEXCOORD5;
++#endif
+ };
+ 
+ struct ShadowInput
+@@ -159,6 +162,20 @@
+         const int azimuth=(int)floor(viewIndex+.5);
+         const uint tile=uint(azimuth)&7u;
+         const uint neighbor=uint(azimuth+(viewIndex<azimuth ? -1 : 1))&7u;
++        if ((transmissionFlags & 524288u) && abs(input.uv0.x-.5)>1e-5)
++        {
++            uint2 packed=(uint2)input.uv1;
++            bool left=input.uv0.x<.5;
++            float bound=((packed[tile/4]>>(6*(tile%4)))&63u)/63.0;
++            if (abs(viewIndex-azimuth)>.30)
++            {
++                float other=((packed[neighbor/4]>>(6*(neighbor%4)))&63u)/63.0;
++                bound=left ? min(bound,other) : max(bound,other);
++            }
++            float u=left ? max(input.uv0.x,bound) : min(input.uv0.x,bound);
++            input.position.x*=(u-.5)/(input.uv0.x-.5);
++            input.uv0.x=u;
++        }
+         input.uv1=(float2(neighbor%4,neighbor/4)+input.uv0)*float2(.25,.5);
+         input.uv0=(float2(tile%4,tile/4)+input.uv0)*float2(.25,.5);
+         output.cardBlend=.5*smoothstep(.30,.50,abs(viewIndex-azimuth));
+@@ -223,6 +240,36 @@
+     output.texcoords = float4(input.uv0, input.uv1);
+     output.lightPosition = mul(world, lightViewProjection);
+     output.worldPositionAndViewDepth = float4(world.xyz, output.position.w);
++#ifdef DISTANT_GRASS_LIGHT
++    // Evaluate the low-frequency local light field on the card. Keep its six
++    // directional lobes so each texel still uses its own baked blade normal.
++    [unroll] for (uint l=0;l<6;++l) output.probeCube[l]=0;
++    if (probeSize.x)
++    {
++        float3 grid=(world.xyz-probeOriginSpacing.xyz)/probeOriginSpacing.w;
++        float3 boundary=min(grid,float3(probeSize.xyz-1)-grid);
++        float blend=saturate(min(boundary.x,boundary.z))*saturate(min(grid.y+1,boundary.y+max(0,-grid.y)));
++        if (blend>0)
++        {
++            float3 q=clamp(grid,0,float3(probeSize.xyz-1));
++            uint3 cell=min((uint3)q,probeSize.xyz-2);
++            float3 f=q-cell;
++            float sum=0;
++            [unroll] for (uint corner=0;corner<8;++corner)
++            {
++                uint3 offset=uint3(corner&1,(corner>>1)&1,corner>>2);
++                uint3 coord=cell+offset;
++                uint probe=((coord.z*probeSize.y+coord.y)*probeSize.x+coord.x)*6;
++                float3 factor=lerp(1-f,f,float3(offset));
++                float weight=factor.x*factor.y*factor.z*
++                    probeVisibility(probe,world.xyz-(probeOriginSpacing.xyz+coord*probeOriginSpacing.w),probeOriginSpacing.w);
++                [unroll] for (uint l=0;l<6;++l) output.probeCube[l]+=weight*diffuseProbes[probe+l].correction;
++                sum+=weight;
++            }
++            [unroll] for (uint l=0;l<6;++l) output.probeCube[l]*=blend/max(sum,1e-5);
++        }
++    }
++#endif
+     output.meshInstanceId = instanceId;
+     if (transmissionFlags & (32768u | 65536u | 262144u))
+     {
+@@ -340,6 +387,12 @@
+     return uint(depth >= cascadeSplits.x) + uint(depth >= cascadeSplits.y) + uint(depth >= cascadeSplits.z);
+ }
+ 
++#ifdef DISTANT_GRASS_LIGHT
++// These two shader binaries are bound exclusively to textured distant cards.
++// Keep authored growth tint optional and eliminate unrelated material branches.
++uint farGrassFlags() { return 32768u | 65536u | 131072u | (transmissionFlags & 2048u); }
++#define transmissionFlags farGrassFlags()
++#endif
+ float sampleCascade(float3 worldPosition, uint cascade, float3 grazingNormal, float2 receiverSlope)
+ {
+     worldPosition += grazingNormal * cascadeNormalBias[cascade];
+@@ -582,8 +635,20 @@
+     if (transmissionFlags & (32768u | 262144u))
+     {
+         LeafIncidentLight light=leafIncidentLight(worldNormal,normalToSun,directionalSkylight);
++#ifdef DISTANT_GRASS_LIGHT
++        float3 w=worldNormal*worldNormal;
++        float3 x=worldNormal.x<0 ? input.probeCube[1] : input.probeCube[0];
++        float3 y=worldNormal.y<0 ? input.probeCube[3] : input.probeCube[2];
++        float3 z=worldNormal.z<0 ? input.probeCube[5] : input.probeCube[4];
++        float3 front=x*w.x+y*w.y+z*w.z;
++        float3 total=(input.probeCube[0]+input.probeCube[1])*w.x+
++                     (input.probeCube[2]+input.probeCube[3])*w.y+(input.probeCube[4]+input.probeCube[5])*w.z;
++        light.skyFront=max(0,light.skyFront+front);
++        light.skyBack=max(0,light.skyBack+total-front);
++#else
+         localDiffuse(input.worldPositionAndViewDepth.xyz,worldNormal,probeOriginSpacing,probeSize.xyz,
+                      true,light.skyFront,light.skyBack);
++#endif
+         float3 shaded=shadeLeaf(light,visibility,lightingMode,baseColor.rgb,baseColor.rgb,.28*bladeCoverage);
+         if (lightingMode!=skyOnly && lightingMode!=transmissionOnly)
+             shaded+=bladeCoverage*visibility*bladeSunReflection(worldNormal,
+@@ -649,8 +714,7 @@
+     return float4(encodedCamera && hasColorTexture ? encodeSrgb(lit) : lit, 1.0);
+ }
+ 
+-float4 PSGrassCoverage(PixelInput input, bool front : SV_IsFrontFace, uint primitive : SV_PrimitiveID,
+-                       uint raster : SV_Coverage, out uint samples : SV_Coverage) : SV_Target
++uint grassCoverage(PixelInput input, uint raster)
+ {
+     // Sample priority must vary between plants. Otherwise overlapping fine stems
+     // all cover the same MSAA subsamples, leaving sky visible through a dense stand.
+@@ -659,7 +723,18 @@
+     const uint count=min(4u,(uint)(4*alpha+float(key>>8)*(1.0/16777216)));
+     const uint lowMask=(1u<<count)-1u;
+     const uint shift=key&3u;
+-    samples=raster & ((lowMask<<shift)|(lowMask>>(4u-shift)));
++    return alpha<.002 ? 0 : raster & ((lowMask<<shift)|(lowMask>>(4u-shift)));
++}
++
++void PSGrassDepth(PixelInput input,uint raster : SV_Coverage,out uint samples : SV_Coverage)
++{
++    samples=grassCoverage(input,raster);
++}
++
++float4 PSGrassCoverage(PixelInput input, bool front : SV_IsFrontFace, uint primitive : SV_PrimitiveID,
++                       uint raster : SV_Coverage, out uint samples : SV_Coverage) : SV_Target
++{
++    samples=grassCoverage(input,raster);
+     clip(float(samples)-.5);
+     return PSMain(input,front,primitive);
+ }
+--- a/src/D3D12Renderer.cpp
++++ b/src/D3D12Renderer.cpp
+@@ -1,6 +1,10 @@
+ #include "D3D12Renderer.h"
+ #include "MeshPS.h"
+ #include "GrassCoveragePS.h"
++#include "GrassDepthPS.h"
++#include "FarGrassPS.h"
++#include "FarGrassVS.h"
++#include "FarEqualPS.h"
+ #include "OakFlatPS.h"
+ #include "OakEarlyPS.h"
+ #include "OakVisibilityPS.h"
+@@ -1719,7 +1723,7 @@
+     parameters[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+     parameters[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+     parameters[8].DescriptorTable = {1, &probeView};
+-    parameters[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    parameters[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+ 
+     D3D12_STATIC_SAMPLER_DESC sampler{};
+     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+@@ -2392,6 +2396,21 @@
+         description.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;
+         description.PS={grassCoveragePS,sizeof(grassCoveragePS)};
+         multisample_.coverageMesh=createCameraPipeline(description,"Create grass sample-coverage pipelines");
++        auto farDescription=description;
++        farDescription.VS={farGrassVS,sizeof(farGrassVS)};
++        farDescription.PS={farGrassPS,sizeof(farGrassPS)};
++        multisample_.farGrass=createCameraPipeline(farDescription,"Create distant grass lighting pipelines");
++        description.PS={grassDepthPS,sizeof(grassDepthPS)};
++        description.BlendState.RenderTarget[0].RenderTargetWriteMask=0;
++        multisample_.grassDepth=createCameraPipeline(description,"Create grass coverage depth pipelines");
++        description.BlendState.RenderTarget[0].RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
++        description.DepthStencilState.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ZERO;
++        description.DepthStencilState.DepthFunc=D3D12_COMPARISON_FUNC_EQUAL;
++        description.PS={oakEarlyPS,sizeof(oakEarlyPS)};
++        multisample_.grassEqual=createCameraPipeline(description,"Create depth-equal grass shading pipelines");
++        description.VS={farGrassVS,sizeof(farGrassVS)};
++        description.PS={farEqualPS,sizeof(farEqualPS)};
++        multisample_.farEqual=createCameraPipeline(description,"Create depth-equal distant probe pipelines");
+     }
+ 
+     // The frame loop fences each submission. Commit the whole set between frames.
+@@ -2922,6 +2941,7 @@
+     {
+         const auto instanceBytes = static_cast<UINT>(mesh.instances->size() * sizeof(MeshInstance));
+         gpu.tuftCard = mesh.name.starts_with("Meadow tuft card");
++        gpu.hasCardOutline = gpu.tuftCard && (mesh.uvMask & 2u);
+         const bool grass = tall || shortGrass || gpu.tuftCard || mesh.name.starts_with("Near tuft |");
+         if (grass && !GetEnvironmentVariableW(L"MEADOW_DISABLE_TILES", nullptr, 0))
+         {
+@@ -3472,7 +3492,7 @@
+     const auto densityBytes = volume.density.size() * sizeof(XMFLOAT4);
+     probeDensity_ = createProbeBuffer(densityBytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+     diffuseProbes_ = createProbeBuffer(static_cast<UINT64>(probeCount()) * 6 * 16,
+-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+     const auto groundCells = ((volume.size.x + 1) / 2) * ((volume.size.z + 1) / 2);
+     probeGroundLight_ = createProbeBuffer(static_cast<UINT64>(groundCells) * sizeof(XMFLOAT4),
+             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+@@ -3590,7 +3610,7 @@
+         toSun_, scene.captureLighting == CaptureLighting::SkyOnly ? 0.0f : 0.65f, groundColor, extent.x,
+         openSkyGround_, extent.z, wind, windStart_, inverseWindHeight_, groundStride, groundRow,
+         UINT(scene.groundMaterial.colorTexture.has_value() && !GetEnvironmentVariableW(L"MEADOW_UNIFORM_BOUNCE",nullptr,0))};
+-    transitionResource(commands_.Get(), diffuseProbes_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
++    transitionResource(commands_.Get(), diffuseProbes_.Get(), (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+     commands_->SetComputeRootSignature(probeRoot_.Get());
+     commands_->SetComputeRoot32BitConstants(0, sizeof(constants) / sizeof(UINT), &constants, 0);
+@@ -3627,7 +3647,7 @@
+     commands_->SetPipelineState(probePipeline_.Get());
+     commands_->Dispatch((count + 31) / 32, 1, 1);
+     transitionResource(commands_.Get(), diffuseProbes_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+-                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++                       (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+     probesDirty_ = false;
+     probeCursor_ = (probeCursor_ + count) % probeCount();
+     probesPending_ -= std::min(probesPending_, count);
+@@ -5182,6 +5202,9 @@
+                           scene.treeOcclusion && scene.sprayLods[1] &&
+                           treeParts_[scene.sprayLods[1]->meshIndex].gpuNodes
+         ? static_cast<std::size_t>(scene.sprayLods[1]->meshIndex) : meshes_.size();
++    std::vector<std::size_t> farReceivers;
++    static const bool vertexProbes=GetEnvironmentVariableW(L"MEADOW_FAR_VERTEX_PROBES",nullptr,0)!=0;
++    static const bool sharedDepth=GetEnvironmentVariableW(L"MEADOW_FAR_SHARED_DEPTH",nullptr,0)!=0;
+     for (std::size_t slot = 0; slot < meshes_.size(); ++slot)
+     {
+         std::size_t i = slot;
+@@ -5206,7 +5229,8 @@
+             pilot && tuftName.starts_with("Near tuft | pilot") || ribbons && tuftName.starts_with("Near tuft | ribbons")))) continue;
+         if (!shadowPass && (slices || pilot || ribbons || cardsToRoot) &&
+             (tuftName.starts_with("Full grass strip") || tuftName.starts_with("Short grass"))) continue;
+-        if (meshes_[i].tuftCard && (shadowPass || !drawCards)) continue;
++        static const bool hideFar=GetEnvironmentVariableW(L"MEADOW_HIDE_FAR_CARDS",nullptr,0)!=0;
++        if (meshes_[i].tuftCard && (shadowPass || !drawCards || hideFar)) continue;
+         static const bool contactGrass=GetEnvironmentVariableW(L"MEADOW_CONTACT_GRASS_ONLY",nullptr,0)!=0;
+         static const bool nearGrass=GetEnvironmentVariableW(L"MEADOW_NEAR_GRASS_ONLY",nullptr,0)!=0;
+         if (shadowPass && (contactGrass || (nearGrass && shadowSlice && *shadowSlice>0)))
+@@ -5271,6 +5295,24 @@
+         {
+             if ((mesh.tuftCard || (nearProxy && material.alphaCutoff >= 0)) && msaaEnabled_)
+                 commands_->SetPipelineState(cameraMode.coverageMesh.get(encodedCamera_));
++            const bool farPass = mesh.tuftCard && !shadowPass && msaaEnabled_ && !captureGeometryMask_ &&
++                                 !boughDepth_ && !boughMaterials_ && oakRaster_==OakRaster::Live;
++            if (vertexProbes && farPass)
++                commands_->SetPipelineState(cameraMode.farGrass.get(encodedCamera_));
++            static const bool depthFirst=GetEnvironmentVariableW(L"MEADOW_FAR_DEPTH",nullptr,0)!=0;
++            if (depthFirst && farPass)
++            {
++                commands_->SetPipelineState(cameraMode.grassDepth.get(encodedCamera_));
++                drawInstancedMesh(scene,i,visibility,shadowPass,shadowSlice,stats);
++                if (sharedDepth)
++                {
++                    farReceivers.push_back(i);
++                    commands_->SetPipelineState(cameraMode.mesh.get(encodedCamera_));
++                    commands_->IASetVertexBuffers(1,1,&instanceView_);
++                    continue;
++                }
++                commands_->SetPipelineState((vertexProbes ? cameraMode.farEqual : cameraMode.grassEqual).get(encodedCamera_));
++            }
+             drawInstancedMesh(scene, i, visibility, shadowPass, shadowSlice, stats);
+             if ((mesh.tuftCard || (nearProxy && material.alphaCutoff >= 0)) && msaaEnabled_)
+                 commands_->SetPipelineState(cameraMode.mesh.get(encodedCamera_));
+@@ -5432,6 +5474,24 @@
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+         treeDepthReady_ = false;
+     }
++    bool drewTerrain=false;
++    if (!farReceivers.empty())
++    {
++        // Resolve terrain into the same sample depths as all three grass layers.
++        // This also rejects distant plants hidden by the crest before lighting.
++        if (!captureGeometryMask_)
++        {
++            commands_->SetPipelineState(cameraMode.mesh.get(encodedCamera_));
++            stats.triangles += drawMesh(ground_,scene.groundMaterial,false,scene.groundShadows.receive,1,0);
++            ++stats.draws;
++            drewTerrain=true;
++        }
++        commands_->SetPipelineState((vertexProbes ? cameraMode.farEqual : cameraMode.grassEqual).get(encodedCamera_));
++        for (auto i : farReceivers)
++            drawInstancedMesh(scene,i,visibility,false,{},stats);
++        commands_->IASetVertexBuffers(1,1,&instanceView_);
++        commands_->SetPipelineState(cameraMode.mesh.get(encodedCamera_));
++    }
+     if (materialCull) commands_->SetPipelineState(cameraMode.mesh.get(encodedCamera_));
+     if (!shadowPass && timestampQueries_)
+         commands_->EndQuery(timestampQueries_.Get(),D3D12_QUERY_TYPE_TIMESTAMP,AssetEnd);
+@@ -5450,7 +5510,7 @@
+         commands_->OMSetRenderTargets(1, &sceneTarget_, FALSE, &cameraMode.depthTarget);
+         commands_->SetPipelineState(cameraMode.mesh.linear.Get());
+     }
+-    if (shadowPass ? scene.groundShadows.cast : !captureGeometryMask_)
++    if (!drewTerrain && (shadowPass ? scene.groundShadows.cast : !captureGeometryMask_))
+     {
+         stats.triangles += drawMesh(ground_, scene.groundMaterial, false, scene.groundShadows.receive, 1, 0);
+         ++stats.draws;
+@@ -5535,6 +5595,8 @@
+     {
+         bladeNormal=material.bladeNormal->index;
+         constants.transmissionFlags |= slices ? 262144u : 32768u;
++        static const bool outline=GetEnvironmentVariableW(L"MEADOW_FAR_OUTLINE",nullptr,0)!=0;
++        if (outline && mesh.hasCardOutline) constants.transmissionFlags |= 524288u;
+         if (msaaEnabled_) constants.transmissionFlags |= 65536u;
+     }
+     else if (bladeSurface && material.bladeNormal)
+--- a/src/D3D12Renderer.h
++++ b/src/D3D12Renderer.h
+@@ -214,6 +214,7 @@
+         };
+         std::vector<GrassTile> grassTiles;
+         bool tuftCard = false;
++        bool hasCardOutline = false;
+         std::vector<DirectX::XMFLOAT3> grassRootSwitch; // asset X, Z and switch distance in metres
+         std::vector<DirectX::BoundingBox> oakCameraBounds;
+         DirectX::BoundingBox oakCameraEnvelope;
+@@ -448,6 +449,10 @@
+         CameraPipeline mesh;
+         CameraPipeline oneSidedMesh;
+         CameraPipeline coverageMesh;
++        CameraPipeline grassDepth;
++        CameraPipeline grassEqual;
++        CameraPipeline farEqual;
++        CameraPipeline farGrass;
+         CameraPipeline sky;
+         CameraPipeline voxel;
+     };

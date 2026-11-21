@@ -193,10 +193,13 @@ struct ViewerScene
     SprayTraversal sprayTraversal = SprayTraversal::Grouped;
     TreeSubmission treeSubmission = TreeSubmission::Direct;
     std::filesystem::path boughVoxelBake;
+    bool softwareBoughRaster = false;
     std::filesystem::path liveCut;
+    bool liveCutGpu = false;
     bool liveCutUnbatched = false;
     bool liveCutPackAssembly = false;
     bool cameraPipelineStats = false;
+    bool profileOakRaster = false;
     float liveCutPixelError = 1.0f;
     bool treeOcclusion = false;
     bool treeClusterCulling = false;

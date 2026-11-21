@@ -1,5 +1,7 @@
 # White oak live triangle selection
 
+The follow-up moves traversal and draw generation to the GPU and compares one oak and a four-oak grove at 24, 41 and 100 m. [GPU traversal benchmark](OAK_GPU_TRAVERSAL.md)
+
 **Use the individually selected reusable sprays for the fastest complete frame on this renderer. Use the complete native cut as the GPU and triangle reference.** The reusable canopy with a native trunk brings whole-crown geometry within 5.8% of native at 41 m and 2.4% at 100 m. Both reusable combinations in the table met both strict silhouette gates at all 26 crown poses. [Quality by view](../build/oak-live-selection/quality-summary.csv) · [Silhouette detail](../build/oak-live-selection/crown-comparison.png)
 
 The table gives camera triangles, shaded camera GPU milliseconds and wall milliseconds through the GPU fence. The viewer submits one frame at a time. Wall time covers the render call, GPU completion and timing readback. The PNG capture runs outside the samples. Each entry is the median of four 61-frame run medians. [Frame timing samples](../build/oak-live-selection/fenced-timing.csv) · [Run ranges and full-frame GPU times](../build/oak-live-selection/performance-summary.csv)
